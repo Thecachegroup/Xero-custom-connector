@@ -1,0 +1,8 @@
+{
+  "_comment": "Item codes that are cost-only by design - directors' drawings, internal staff, overheads. They are never invoiced to a client, so cost_without_sales must not flag them. Codes are matched on the normalised key (leading z stripped, lowercased).",
+  "no_sales_expected": [
+    "tcg - ah",
+    "tcg - nuria carricondo",
+    "novated lease"
+  ]
+}

@@ -287,8 +287,15 @@ class XeroClient:
             if not batch:
                 break
             for run in batch:
-                end = self._xero_date(run.get("PayRunPeriodEndDate"))
-                if end and date_from <= end <= date_to:
+                # Filter on PAYMENT date, not period end. TCG books everything on
+                # transaction date, and for payroll that is the payment date. A
+                # run ending 30 Jun but paid 1 Jul belongs to July and to the NEW
+                # financial year - filtering on period end pulled it into the old
+                # one and then dated it into the new, which is how Jul-26 rows
+                # appeared inside an FY26 check.
+                paid = self._xero_date(run.get("PaymentDate")) or \
+                       self._xero_date(run.get("PayRunPeriodEndDate"))
+                if paid and date_from <= paid <= date_to:
                     out.append(run)
             if len(batch) < 100:
                 break

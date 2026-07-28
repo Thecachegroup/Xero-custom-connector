@@ -52,6 +52,7 @@ def rate_vs_rate_card(data: pd.DataFrame, items: pd.DataFrame) -> list[dict]:
             .drop_duplicates("_key", keep="last")
             .set_index("_key")[["SalesUnitPrice", "PurchasesUnitPrice"]])
     out = []
+    mismatches: list[dict] = []
     seen_unknown: set[str] = set()
     for _, r in data[data["Inventory code"].notna()].iterrows():
         key = normalise_code(r["Inventory code"])
@@ -72,10 +73,51 @@ def rate_vs_rate_card(data: pd.DataFrame, items: pd.DataFrame) -> list[dict]:
             continue
         expected = ref["SalesUnitPrice"] if r["Source"] == "Sales" else ref["PurchasesUnitPrice"]
         if pd.notna(expected) and pd.notna(r["Rate"]) and r["Units"] and abs(float(r["Rate"]) - float(expected)) > 0.005:
-            out.append(_ex(contractor=r["Description"], period=r["Month"], severity=HIGH,
-                           rule="rate_mismatch",
-                           detail=f"{r['Source']} rate {r['Rate']} vs rate card {expected}",
-                           amount=r["Amount"]))
+            mismatches.append({"key": key, "contractor": r["Description"],
+                               "source": r["Source"], "rate": float(r["Rate"]),
+                               "expected": float(expected), "month": r["Month"],
+                               "amount": float(r["Amount"] or 0)})
+
+    # One row per distinct (code, source, rate, card rate). The rate card is
+    # point-in-time: a rate that rose in March flags every month it ever applied,
+    # which previously produced ~218 rows saying about a dozen things. Collapsing
+    # them keeps the signal and shows how long the gap has been running.
+    if mismatches:
+        m = pd.DataFrame(mismatches)
+        for (key, src, rate, exp), g in m.groupby(["key", "source", "rate", "expected"]):
+            months = sorted(set(g["month"].dropna()))
+            direction = "under" if rate < exp else "over"
+            out.append(_ex(
+                contractor=str(g["contractor"].iloc[0]), period=f"{len(months)} months",
+                severity=HIGH, rule="rate_mismatch",
+                detail=(f"{src} rate {rate:,.2f} vs rate card {exp:,.2f} "
+                        f"({direction} by {abs(rate-exp):,.2f}) across {len(g)} lines"),
+                amount=round(float(g["amount"].sum()), 2)))
+    return out
+
+
+def _load_cfg(path: str, key: str, default):
+    import json, os
+    try:
+        with open(os.environ.get(f"TCG_{key.upper()}", path)) as fh:
+            return json.load(fh)
+    except Exception:
+        return default
+
+
+def no_sales_expected() -> set:
+    cfg = _load_cfg("config/internal_codes.json", "internal_codes", {})
+    return {str(c).strip().lower() for c in cfg.get("no_sales_expected", [])}
+
+
+def payrolling_cost_codes() -> set:
+    """Cost-side item codes belonging to payrolling customers. Their revenue sits
+    on uncoded invoice lines, so a code-level match will always show cost with no
+    sales. Netting happens at customer level via uncoded_sales instead."""
+    cfg = _load_cfg("config/payrolling_customers.json", "payrolling_customers", {})
+    out = set()
+    for codes in (cfg.get("customers") or {}).values():
+        out |= {str(c).strip().lower() for c in codes}
     return out
 
 
@@ -96,8 +138,14 @@ def sales_without_bill(data: pd.DataFrame) -> list[dict]:
     piv = (d.pivot_table(index=[key, "Month"], columns="Side",
                          values="Amount", aggfunc="sum")
             .fillna(0))
+    exempt = no_sales_expected() | payrolling_cost_codes()
     out = []
     for (code, month), row in piv.iterrows():
+        if str(code).strip().lower() in exempt:
+            # Directors' drawings, internal staff and payrolling cost codes are
+            # cost-only by design. Flagging them every month buried the real
+            # one-sided contractors under ~50 rows of noise.
+            continue
         sales, bills = row.get("Sales", 0), row.get("Cost", 0)
         if sales > 0 and bills == 0:
             out.append(_ex(contractor=code, period=month, severity=HIGH,

@@ -1,0 +1,6 @@
+{
+  "_comment": "Customers billed as an employer-of-record / payrolling arrangement. Each cost component (base salary, super, payroll tax, workcover, insurance, admin fee) is invoiced as its own line, so those sales lines carry NO item code and can never match a contractor code. Netting is done at customer level instead: the listed item codes are the cost side for that customer.",
+  "customers": {
+    "Xenon Media": ["xenon - sf", "xenon - sb"]
+  }
+}

@@ -155,14 +155,35 @@ def run_invoice_check(fy: str = "current") -> str:
     """
     data, items, *_ = _load(fy)
     ex = checks.run_all(data, items)
+
+    # Totals every run, so reconciling against the workbook is automatic rather
+    # than a separate manual step. PAYG withheld is shown but excluded from cost:
+    # it is carved out of gross wages and remitted to the ATO, not paid on top.
+    is_ignore = data["Wages type with Super"].astype(str).str.lower() == "ignore"
+    rev = float(data.loc[data["Source"] == "Sales", "Amount"].sum())
+    cost = float(data.loc[data["Source"].isin(["Bills", "Payroll"]) & ~is_ignore,
+                          "Amount"].sum())
+    paygw = float(data.loc[is_ignore, "Amount"].sum())
+    margin = rev - cost
+    totals = [
+        "",
+        f"TOTALS {fy}",
+        f"  Invoiced          ${rev:>14,.2f}",
+        f"  Contractor cost   ${cost:>14,.2f}",
+        f"  Gross margin      ${margin:>14,.2f}"
+        + (f"   ({margin / rev * 100:.1f}%)" if rev else ""),
+        f"  PAYG withheld     ${paygw:>14,.2f}   (remit to ATO - not a cost)",
+        "",
+    ]
+
     if ex.empty:
-        return f"Invoice check for {fy}: {len(data)} lines, no exceptions."
+        return "\n".join([f"Invoice check for {fy}: {len(data)} lines, no exceptions."] + totals)
 
     summary = ex["severity"].value_counts().to_dict()
     lines = [
         f"Invoice check for {fy}: {len(data)} lines, {len(ex)} exceptions "
         f"({summary.get('HIGH',0)} HIGH / {summary.get('MEDIUM',0)} MEDIUM / {summary.get('LOW',0)} LOW)",
-        "",
+        *totals,
         ex.to_markdown(index=False),
     ]
     return "\n".join(lines)

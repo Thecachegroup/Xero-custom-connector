@@ -291,6 +291,54 @@ def normalise_code(code) -> str:
     return _Z_PREFIX.sub("", c).strip().lower()
 
 
+def _name_key(v) -> str:
+    return re.sub(r"[^a-z ]", "", str(v or "").strip().lower()).strip()
+
+
+def build_employee_code_map(items: pd.DataFrame) -> dict:
+    """Map a payroll employee name to their inventory item code.
+
+    PAYG contractors carry their cost in payroll, not in a bill, so without this
+    every PAYG person reads as invoiced-but-never-costed AND as cost with no
+    contractor attached. Exact matching on the item Name is too brittle: names
+    are entered as "Dat Le", "Le, Dat", "Dat Le - Test Analyst" and so on.
+
+    Resolution order, stopping at the first hit:
+      1. exact normalised name
+      2. reversed "Surname, First" form
+      3. the item name starts with the employee name (trailing role titles)
+      4. every word of the employee name appears in the item name
+    Ambiguous matches are dropped rather than guessed - a wrong mapping puts one
+    contractor's cost against another's revenue, which is worse than no match.
+    """
+    named = items.dropna(subset=["Name"]).copy()
+    named["_k"] = named["Name"].map(_name_key)
+    named = named[named["_k"] != ""]
+    exact = dict(zip(named["_k"], named["*ItemCode"]))
+
+    def resolve(employee: str):
+        k = _name_key(employee)
+        if not k:
+            return None
+        if k in exact:
+            return exact[k]
+        parts = k.split()
+        if len(parts) >= 2:
+            rev = " ".join(reversed(parts))
+            if rev in exact:
+                return exact[rev]
+        starts = [c for kk, c in exact.items() if kk.startswith(k + " ")]
+        if len(set(starts)) == 1:
+            return starts[0]
+        words = set(parts)
+        contains = [c for kk, c in exact.items() if words and words <= set(kk.split())]
+        if len(set(contains)) == 1:
+            return contains[0]
+        return None
+
+    return {"_resolve": resolve}
+
+
 def fy_label(d: date, current_fy_start: date) -> str:
     """AU financial year: 1 Jul - 30 Jun."""
     if d is None or pd.isna(d):
@@ -353,12 +401,7 @@ def build_data_frame(
         # employee name back to their item code so payroll joins to sales the
         # same way bills do - otherwise every PAYG contractor reads as
         # "invoiced but never costed".
-        name_to_code = (items.dropna(subset=["Name"])
-                             .drop_duplicates("Name", keep="last")
-                             .set_index(items.dropna(subset=["Name"])
-                                        .drop_duplicates("Name", keep="last")["Name"]
-                                        .str.strip().str.lower())["*ItemCode"]
-                             .to_dict())
+        resolver = build_employee_code_map(items)["_resolve"]
         # PAYG withholding is money carved OUT of gross wages and remitted to
         # the ATO - it is not additional employer cost. It rides along in the
         # frame so the withholding total can be reported, but it is marked
@@ -372,7 +415,7 @@ def build_data_frame(
             "Source": "Payroll",
             "Invoiced/Billed": "Paid",
             "Description": payroll["Employee"],
-            "Inventory code": payroll["Employee"].str.strip().str.lower().map(name_to_code),
+            "Inventory code": payroll["Employee"].map(resolver),
             "Vendor": payroll["Employee"],
             "Customer": None,
             "Date": pd.to_datetime(payroll["Date"]),
