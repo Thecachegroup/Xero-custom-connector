@@ -1,349 +1,183 @@
 """
-TCG Xero Invoice Checker - MCP server.
+Write operations against Xero.
 
-Transports:
-  stdio           -> Claude Desktop / Cowork (local)
-  streamable-http -> claude.ai + Android app (deployed on Render)
+Everything here creates DRAFT records only. Nothing is approved, posted, or paid
+by this code. Andrew reviews in Xero and clicks the button himself.
 
-Run local:   python -m src.server
-Run remote:  MCP_TRANSPORT=http python -m src.server
+That is deliberate and it is not negotiable in the code: a timesheet where 7.5
+was read as 75 is real money out the door, and the review step is the only thing
+standing between a bad number and a bank transfer.
 
-SECURITY. In http mode the endpoint is served at /mcp/<MCP_SHARED_SECRET>. That
-secret IS the lock on the front door: anyone holding the full URL can read the
-entire TCG ledger and payroll history. The server refuses to start in http mode
-without one. Treat the URL like a password - never paste it into a document,
-an email, a ticket, or a public repo.
+Writes are OFF unless TCG_WRITE_ENABLED=true. Without it every function here
+refuses and explains why.
+
+Scope requirements - these must be added to the Custom Connection in Xero, and
+adding them deactivates the connection until it is re-authorised:
+    payroll.timesheets      (was payroll.timesheets.read)
+    accounting.settings     (was accounting.settings.read)  - item rate card
+    accounting.transactions (was accounting.invoices.read)  - draft invoices
 """
 
 from __future__ import annotations
 
 import os
-import json
-import time
-from datetime import date, datetime
-from functools import lru_cache
+import logging
 
-import pandas as pd
-from mcp.server.fastmcp import FastMCP
+log = logging.getLogger(__name__)
 
-from .xero_client import XeroClient
-from . import mappers, checks, writes
+API_BASE = "https://api.xero.com/api.xro/2.0"
 
-TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
-OUTPUT_DIR = os.environ.get("TCG_OUTPUT_DIR", "./output")
+# AU timesheets moved to the 2.0 payroll path while AU pay runs remain on 1.0.
+# Override if Xero returns 404 on the first live call.
+TIMESHEET_BASE = os.environ.get(
+    "XERO_TIMESHEET_BASE", "https://api.xero.com/payroll.xro/2.0"
+)
 
-# Cache a full pull for this many seconds. A whole-FY pull is hundreds of Xero
-# calls and several minutes; without this, every tool call repeats it and burns
-# through the 5,000/day API limit.
-CACHE_TTL = int(os.environ.get("TCG_CACHE_TTL", "900"))
 
-if TRANSPORT == "http":
-    _secret = os.environ.get("MCP_SHARED_SECRET", "").strip()
-    if len(_secret) < 24:
-        raise SystemExit(
-            "MCP_SHARED_SECRET must be set to a random string of at least 24 "
-            "characters before the server will accept HTTP traffic. Without it "
-            "the endpoint would expose the TCG ledger to anyone who finds it."
+class WritesDisabled(RuntimeError):
+    pass
+
+
+def _guard() -> None:
+    if os.environ.get("TCG_WRITE_ENABLED", "").strip().lower() != "true":
+        raise WritesDisabled(
+            "Writes are disabled. Set TCG_WRITE_ENABLED=true in Render to turn them "
+            "on, and make sure the Custom Connection has the write scopes "
+            "(payroll.timesheets, accounting.settings, accounting.transactions). "
+            "Nothing has been sent to Xero."
         )
-    mcp = FastMCP(
-        "tcg-xero-invoice-checker",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "8000")),   # Render supplies PORT
-        streamable_http_path=f"/mcp/{_secret}",
-        stateless_http=True,
+
+
+def _post(client, url: str, payload: dict) -> dict:
+    """POST through the same rate limiter the read path uses."""
+    client._limiter.acquire()
+    resp = client._session.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {client._access_token()}",
+            "Xero-tenant-id": client.tenant_id,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=60,
     )
-else:
-    mcp = FastMCP("tcg-xero-invoice-checker")
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"Xero rejected the write ({resp.status_code}). Nothing was changed. "
+            f"Xero said: {resp.text[:500]}"
+        )
+    return resp.json()
 
 
-@mcp.custom_route("/healthz", methods=["GET"])
-async def healthz(request):
-    """Unauthenticated liveness probe for Render. Returns no business data."""
-    from starlette.responses import PlainTextResponse
-    return PlainTextResponse("ok")
+# ------------------------------------------------------------------ payroll
 
 
-@lru_cache(maxsize=1)
-def client() -> XeroClient:
-    return XeroClient()
-
-
-def _fy_bounds(fy: str | None) -> tuple[str, str, date]:
-    """fy='FY26' -> 1 Jul 2025 to 30 Jun 2026. None -> current FY."""
-    today = date.today()
-    current_start = date(today.year if today.month >= 7 else today.year - 1, 7, 1)
-    if not fy or fy.lower() in ("current", "current fy"):
-        start = current_start
-    else:
-        yy = int(str(fy).upper().replace("FY", ""))
-        start = date(2000 + yy - 1, 7, 1)
-    end = date(start.year + 1, 6, 30)
-    return start.isoformat(), end.isoformat(), current_start
-
-
-_cache: dict[str, tuple[float, tuple]] = {}
-
-
-def _load(fy: str | None):
-    key = (fy or "current").lower()
-    hit = _cache.get(key)
-    if hit and (time.time() - hit[0]) < CACHE_TTL:
-        return hit[1]
-    result = _pull(fy)
-    _cache[key] = (time.time(), result)
-    return result
-
-
-def _pull(fy: str | None):
-    c = client()
-    start, end, current_start = _fy_bounds(fy)
-    sales = mappers.invoices_to_rows(list(c.iter_invoices("ACCREC", start, end)))
-    bills = mappers.invoices_to_rows(list(c.iter_invoices("ACCPAY", start, end)))
-    items = mappers.items_to_rows(c.items())
-
-    payslips = []
-    for run in c.pay_runs(start, end):
-        for ps in run.get("Payslips", []) or []:
-            payslips.append(c.payslip(ps["PayslipID"]))
-    payroll = mappers.payslips_to_rows(payslips)
-
-    data = mappers.build_data_frame(
-        sales, bills, payroll, items,
-        customer_lookup=_customer_lookup(),
-        no_payroll_tax=_no_payroll_tax(),
-        current_fy_start=current_start,
-    )
-    return data, items, sales, bills, payroll
-
-
-@mcp.tool()
-def refresh_cache() -> str:
-    """Discard cached Xero data so the next check re-pulls live figures.
-    Use after raising or paying invoices, or after a pay run."""
-    n = len(_cache)
-    _cache.clear()
-    return f"Cache cleared ({n} cached pull(s) discarded). Next check will re-pull from Xero."
-
-
-def _customer_lookup() -> dict[str, str]:
-    path = os.environ.get("TCG_CUSTOMER_LOOKUP", "config/customer_lookup.json")
-    return json.load(open(path)) if os.path.exists(path) else {}
-
-
-def _no_payroll_tax() -> set[str]:
-    path = os.environ.get("TCG_NO_PAYROLL_TAX", "config/no_payroll_tax.json")
-    return set(json.load(open(path))) if os.path.exists(path) else set()
-
-
-# ---------------------------------------------------------------- tools
-
-@mcp.tool()
-def run_invoice_check(fy: str = "current") -> str:
-    """Run the full invoice check for a financial year and return the exception
-    report. This is the primary tool - it replaces the manual monthly scan.
-
-    Args:
-        fy: 'current', or 'FY26', 'FY25' etc.
-    """
-    data, items, *_ = _load(fy)
-    ex = checks.run_all(data, items)
-    if ex.empty:
-        return f"Invoice check for {fy}: {len(data)} lines, no exceptions."
-
-    summary = ex["severity"].value_counts().to_dict()
-    lines = [
-        f"Invoice check for {fy}: {len(data)} lines, {len(ex)} exceptions "
-        f"({summary.get('HIGH',0)} HIGH / {summary.get('MEDIUM',0)} MEDIUM / {summary.get('LOW',0)} LOW)",
-        "",
-        ex.to_markdown(index=False),
+def find_employee(client, name: str) -> dict:
+    """Resolve a name fragment to exactly one employee. Refuses on ambiguity."""
+    people = client.employees()
+    hits = [
+        e for e in people
+        if name.strip().lower() in f"{e.get('FirstName','')} {e.get('LastName','')}".lower()
     ]
-    return "\n".join(lines)
+    if not hits:
+        raise RuntimeError(f"No Xero employee matches {name!r}.")
+    if len(hits) > 1:
+        listed = ", ".join(f"{h.get('FirstName')} {h.get('LastName')}" for h in hits)
+        raise RuntimeError(
+            f"{name!r} matches more than one employee ({listed}). "
+            "Use a fuller name - I will not guess which person to pay."
+        )
+    return hits[0]
 
 
-@mcp.tool()
-def get_contractor_ledger(contractor: str, fy: str = "current") -> str:
-    """Every sales line, bill line and pay line for one contractor in a FY,
-    side by side with the margin. Use when a specific contractor looks wrong."""
-    data, *_ = _load(fy)
-    mask = data["Description"].str.contains(contractor, case=False, na=False) | \
-           data["Inventory code"].fillna("").str.contains(contractor, case=False, na=False)
-    sub = data[mask].sort_values("Date")
-    if sub.empty:
-        return f"No lines found for {contractor!r} in {fy}."
-
-    cols = ["Date", "Source", "Inventory code", "Description", "Units", "Rate", "Amount", "Status"]
-    margin = (sub[sub["Source"] == "Sales"]["Amount"].sum()
-              - sub[sub["Source"].isin(["Bills", "Payroll"])]["Amount"].sum())
-    return (f"{contractor} - {fy}\nGross margin: ${margin:,.2f}\n\n"
-            + sub[[c for c in cols if c in sub.columns]].to_markdown(index=False))
+def earnings_rates(client) -> list[dict]:
+    """Earnings rate IDs, needed to build timesheet lines. Read-only."""
+    data = client.get(f"{TIMESHEET_BASE}/payItems")
+    return data.get("payItems", {}).get("earningsRates", [])
 
 
-@mcp.tool()
-def get_rate_card() -> str:
-    """The Xero item rate card: what each contractor should cost and sell for."""
-    items = mappers.items_to_rows(client().items())
-    cols = ["*ItemCode", "ItemName", "PurchasesUnitPrice", "SalesUnitPrice", "Status"]
-    items["Margin"] = items["SalesUnitPrice"] - items["PurchasesUnitPrice"]
-    return items[cols + ["Margin"]].to_markdown(index=False)
+def payroll_calendars(client) -> list[dict]:
+    """Payroll calendar IDs, needed to create a timesheet. Read-only."""
+    return client.get(
+        "https://api.xero.com/payroll.xro/1.0/PayrollCalendars"
+    ).get("PayrollCalendars", [])
 
 
-@mcp.tool()
-def export_workbook(fy: str = "current") -> str:
-    """Write the drop sheets + Data + Exceptions to an xlsx, ready to drop into
-    the existing Invoice Checker workbook."""
-    data, items, sales, bills, payroll = _load(fy)
-    ex = checks.run_all(data, items)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    path = os.path.join(OUTPUT_DIR, f"Invoice_Checker_{fy}_{datetime.now():%Y%m%d}.xlsx")
-    with pd.ExcelWriter(path, engine="openpyxl") as xw:
-        ex.to_excel(xw, sheet_name="Exceptions", index=False)
-        data.to_excel(xw, sheet_name="Data", index=False)
-        sales.drop(columns=["InvoiceID"], errors="ignore").to_excel(xw, sheet_name="Sales Invoices drop", index=False)
-        bills.drop(columns=["InvoiceID"], errors="ignore").to_excel(xw, sheet_name="Bills Drop", index=False)
-        payroll.to_excel(xw, sheet_name="Pay Details drop (formatted)", index=False)
-        items.to_excel(xw, sheet_name="Inventory Drop", index=False)
-    return f"Written: {path} ({len(data)} data rows, {len(ex)} exceptions)"
-
-
-@mcp.tool()
-def cash_and_receivables() -> str:
-    """Outstanding and overdue totals - who owes TCG and how much."""
-    c = client()
-    today = date.today().isoformat()
-    inv = list(c.iter_invoices("ACCREC", "2000-01-01", today, statuses=["AUTHORISED"]))
-    df = mappers.invoices_to_rows(inv)
-    if df.empty:
-        return "Nothing outstanding."
-    head = df.drop_duplicates("InvoiceID")
-    out = head[head["InvoiceAmountDue"] > 0]
-    overdue = out[pd.to_datetime(out["DueDate"]) < pd.Timestamp(today)]
-    return (f"Outstanding: ${out['InvoiceAmountDue'].sum():,.2f} across {len(out)} invoices\n"
-            f"Overdue:     ${overdue['InvoiceAmountDue'].sum():,.2f} across {len(overdue)} invoices\n\n"
-            + overdue.nlargest(10, "InvoiceAmountDue")[
-                ["ContactName", "InvoiceNumber", "DueDate", "InvoiceAmountDue"]
-            ].to_markdown(index=False))
-
-
-# ---------------------------------------------------------------- write tools
-# Every one of these creates a DRAFT. Andrew approves in Xero.
-
-
-@mcp.tool()
-def payroll_entry_plan(days_worked: str, period_start: str, period_end: str) -> str:
-    """Turn 'name: days' lines into the exact payroll and sales figures for a
-    fortnight, using each person's current Xero rate card. Read-only - it
-    calculates and shows, it does not send anything.
-
-    Args:
-        days_worked: one per line, e.g. 'Jay Jhala: 10' / 'Bhasker Veela: 9.5'
-        period_start: YYYY-MM-DD
-        period_end: YYYY-MM-DD
+def create_draft_timesheet(
+    client,
+    employee_id: str,
+    payroll_calendar_id: str,
+    start_date: str,
+    end_date: str,
+    lines: list[dict],
+) -> dict:
     """
-    items = mappers.items_to_rows(client().items())
-    rows, problems = [], []
-    for raw in days_worked.strip().splitlines():
-        if not raw.strip():
-            continue
-        if ":" not in raw:
-            problems.append(f"Could not read {raw!r} - expected 'Name: days'.")
-            continue
-        name, dstr = raw.rsplit(":", 1)
-        try:
-            days = float(dstr.strip())
-        except ValueError:
-            problems.append(f"Could not read the days in {raw!r}.")
-            continue
-        name = name.strip()
-        hit = items[items["ItemName"].str.contains(name, case=False, na=False) |
-                    items["*ItemCode"].str.contains(name, case=False, na=False)]
-        if len(hit) != 1:
-            problems.append(
-                f"{name}: {'no' if hit.empty else len(hit)} rate card matches - "
-                "resolve in Xero before entering this person."
-            )
-            continue
-        r = hit.iloc[0]
-        cost, sell = float(r["PurchasesUnitPrice"]), float(r["SalesUnitPrice"])
-        rows.append({
-            "Person": name, "Code": r["*ItemCode"], "Days": days,
-            "Pay (cost)": round(days * cost, 2),
-            "Invoice (sell)": round(days * sell, 2),
-            "Margin": round(days * (sell - cost), 2),
-        })
+    Create a DRAFT timesheet.
 
-    if not rows and problems:
-        return "Nothing calculated.\n" + "\n".join(problems)
-    df = pd.DataFrame(rows)
-    out = [f"Pay period {period_start} to {period_end}", "", df.to_markdown(index=False), "",
-           f"Total to pay:    ${df['Pay (cost)'].sum():,.2f}",
-           f"Total to invoice: ${df['Invoice (sell)'].sum():,.2f}",
-           f"Margin:           ${df['Margin'].sum():,.2f}",
-           f"Days:             {df['Days'].sum():g}"]
-    if problems:
-        out += ["", "NOT INCLUDED:"] + [f"  - {p}" for p in problems]
-    out += ["", "Nothing has been sent to Xero. Say 'post these as drafts' to create "
-            "draft timesheets and a draft invoice for you to approve."]
-    return "\n".join(out)
+    lines: [{"date": "2026-07-06", "earningsRateID": "...", "numberOfUnits": 7.6}, ...]
 
-
-@mcp.tool()
-def post_draft_timesheet(employee_name: str, payroll_calendar_id: str,
-                         period_start: str, period_end: str,
-                         earnings_rate_id: str, units_by_date: str) -> str:
-    """Create a DRAFT timesheet in Xero. It is not approved and does not pay
-    anyone until you approve it in Xero yourself.
-
-    Args:
-        employee_name: enough of the name to match exactly one employee
-        payroll_calendar_id: from list_payroll_setup
-        period_start / period_end: YYYY-MM-DD
-        earnings_rate_id: from list_payroll_setup
-        units_by_date: one per line, 'YYYY-MM-DD: hours'
+    Returns the created timesheet. Status stays Draft - it must be approved in
+    Xero before it feeds a pay run.
     """
-    c = client()
-    emp = writes.find_employee(c, employee_name)
-    lines = []
-    for raw in units_by_date.strip().splitlines():
-        if not raw.strip():
-            continue
-        d, u = raw.rsplit(":", 1)
-        lines.append({"date": d.strip(), "earningsRateID": earnings_rate_id,
-                      "numberOfUnits": float(u.strip())})
-    res = writes.create_draft_timesheet(
-        c, emp["EmployeeID"], payroll_calendar_id, period_start, period_end, lines)
-    total = sum(l["numberOfUnits"] for l in lines)
-    return (f"DRAFT timesheet created for {emp.get('FirstName')} {emp.get('LastName')}: "
-            f"{len(lines)} days, {total:g} units, {period_start} to {period_end}.\n"
-            f"It is a draft. Approve it in Xero (Payroll > Timesheets) before the pay run.\n"
-            f"Xero returned: {str(res)[:200]}")
+    _guard()
+    payload = {
+        "payrollCalendarID": payroll_calendar_id,
+        "employeeID": employee_id,
+        "startDate": start_date,
+        "endDate": end_date,
+        "timesheetLines": lines,
+    }
+    log.info("Creating draft timesheet for %s %s-%s", employee_id, start_date, end_date)
+    return _post(client, f"{TIMESHEET_BASE}/timesheets", payload)
 
 
-@mcp.tool()
-def list_payroll_setup() -> str:
-    """The payroll calendar IDs and earnings rate IDs needed to build a
-    timesheet. Read-only."""
-    c = client()
-    cals = writes.payroll_calendars(c)
-    rates = writes.earnings_rates(c)
-    out = ["Payroll calendars:"]
-    out += [f"  {x.get('Name')} ({x.get('CalendarType')}) -> {x.get('PayrollCalendarID')}"
-            for x in cals]
-    out += ["", "Earnings rates:"]
-    out += [f"  {x.get('name')} -> {x.get('earningsRateID')}" for x in rates]
-    return "\n".join(out)
+# ------------------------------------------------------------------ accounting
 
 
-@mcp.tool()
-def set_rate_card(item_code: str, cost_rate: float = None,
-                  sell_rate: float = None) -> str:
-    """Update a contractor's cost and/or sell rate on the Xero item rate card."""
-    res = writes.update_item_rates(client(), item_code, cost_rate, sell_rate)
-    _cache.clear()
-    return (f"Rate card updated for {item_code}: "
-            f"cost={cost_rate if cost_rate is not None else 'unchanged'}, "
-            f"sell={sell_rate if sell_rate is not None else 'unchanged'}. "
-            f"Xero returned: {str(res)[:200]}")
+def update_item_rates(
+    client,
+    item_code: str,
+    purchase_rate: float | None = None,
+    sell_rate: float | None = None,
+) -> dict:
+    """Update the cost and/or sell rate on one inventory item (the rate card)."""
+    _guard()
+    if purchase_rate is None and sell_rate is None:
+        raise ValueError("Give at least one of purchase_rate or sell_rate.")
+    item: dict = {"Code": item_code}
+    if purchase_rate is not None:
+        item["PurchaseDetails"] = {"UnitPrice": round(float(purchase_rate), 4)}
+    if sell_rate is not None:
+        item["SalesDetails"] = {"UnitPrice": round(float(sell_rate), 4)}
+    return _post(client, f"{API_BASE}/Items", {"Items": [item]})
 
 
-if __name__ == "__main__":
-    mcp.run(transport="streamable-http" if TRANSPORT == "http" else "stdio")
+def create_draft_invoice(
+    client,
+    contact_id: str,
+    line_items: list[dict],
+    date: str,
+    due_date: str,
+    reference: str = "",
+) -> dict:
+    """
+    Create a DRAFT sales invoice. Never AUTHORISED - it does not go to the
+    customer until Andrew approves it in Xero.
+
+    line_items: [{"ItemCode": "Linfox - JJ", "Quantity": 10, "UnitAmount": 1100,
+                  "Description": "Jay Jhala, 6-19 Jul 2026"}, ...]
+    """
+    _guard()
+    payload = {
+        "Invoices": [{
+            "Type": "ACCREC",
+            "Contact": {"ContactID": contact_id},
+            "Date": date,
+            "DueDate": due_date,
+            "Reference": reference,
+            "LineItems": line_items,
+            "Status": "DRAFT",
+        }]
+    }
+    return _post(client, f"{API_BASE}/Invoices", payload)
