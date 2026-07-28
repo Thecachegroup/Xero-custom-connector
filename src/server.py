@@ -340,7 +340,9 @@ def list_payroll_setup() -> str:
     out += [f"  {x.get('Name')} ({x.get('CalendarType')}) -> {x.get('PayrollCalendarID')}"
             for x in cals]
     out += ["", "Earnings rates:"]
-    out += [f"  {x.get('name')} -> {x.get('earningsRateID')}" for x in rates]
+    out += [f"  {x.get('Name') or x.get('name')} "
+            f"[{x.get('RateType') or x.get('EarningsType') or ''}] -> "
+            f"{x.get('EarningsRateID') or x.get('earningsRateID')}" for x in rates]
     return "\n".join(out)
 
 

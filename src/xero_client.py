@@ -302,5 +302,10 @@ class XeroClient:
     def payroll_calendars(self) -> list[dict]:
         return self.get(f"{PAYROLL_BASE}/PayrollCalendars").get("PayrollCalendars", [])
 
+    def payslip(self, payslip_id: str) -> dict:
+        """Full payslip detail: earnings, super and tax as separate typed
+        collections. The pay run list only carries payslip IDs."""
+        return self.get(f"{PAYROLL_BASE}/Payslips/{payslip_id}")["Payslips"][0]
+
     def employees(self) -> list[dict]:
         return self.get(f"{PAYROLL_BASE}/Employees").get("Employees", [])
