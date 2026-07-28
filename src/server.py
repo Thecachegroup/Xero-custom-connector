@@ -101,13 +101,19 @@ def _pull(fy: str | None):
     bills = mappers.invoices_to_rows(list(c.iter_invoices("ACCPAY", start, end)))
     items = mappers.items_to_rows(c.items())
 
-    payslips = []
+    # Pay run summaries carry Wages/Super/Tax per employee - the same figures as
+    # the Payroll Activity Details report, at ~36 calls a year instead of ~400.
+    # Set TCG_PAYSLIP_DETAIL=true only if per-pay-item breakdown is needed.
+    runs = []
     for run in c.pay_runs(start, end):
-        # The list endpoint omits payslips; the detail endpoint carries them.
-        detail = run if run.get("Payslips") else c.pay_run(run["PayRunID"])
-        for ps in detail.get("Payslips", []) or []:
-            payslips.append(c.payslip(ps["PayslipID"]))
-    payroll = mappers.payslips_to_rows(payslips)
+        runs.append(run if run.get("Payslips") else c.pay_run(run["PayRunID"]))
+
+    if os.environ.get("TCG_PAYSLIP_DETAIL", "").strip().lower() == "true":
+        payslips = [c.payslip(ps["PayslipID"])
+                    for run in runs for ps in run.get("Payslips", []) or []]
+        payroll = mappers.payslips_to_rows(payslips)
+    else:
+        payroll = mappers.payrun_summaries_to_rows(runs)
 
     data = mappers.build_data_frame(
         sales, bills, payroll, items,

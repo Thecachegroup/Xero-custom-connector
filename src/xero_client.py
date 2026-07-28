@@ -190,7 +190,12 @@ class XeroClient:
             if resp.status_code >= 500:
                 time.sleep(2 ** attempt)
                 continue
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                # Attach the URL - a bare "404 Not Found" tells you nothing about
+                # which of a dozen Xero endpoints was wrong.
+                raise requests.HTTPError(
+                    f"{resp.status_code} for {url}: {resp.text[:200]}", response=resp
+                )
             return resp.json()
         raise RuntimeError(f"Xero request failed after retries: {url}")
 
@@ -304,8 +309,25 @@ class XeroClient:
 
     def payslip(self, payslip_id: str) -> dict:
         """Full payslip detail: earnings, super and tax as separate typed
-        collections. The pay run list only carries payslip IDs."""
-        return self.get(f"{PAYROLL_BASE}/Payslips/{payslip_id}")["Payslips"][0]
+        collections. The pay run list only carries payslip IDs.
+
+        Payroll AU spells this endpoint SINGULAR in the path (/Payslip/{id})
+        while wrapping the response in a PLURAL key ("Payslips"). Plural in the
+        path returns 404. Both spellings are attempted so a future Xero change
+        doesn't silently lose the payroll again.
+        """
+        try:
+            data = self.get(f"{PAYROLL_BASE}/Payslip/{payslip_id}")
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", None) != 404:
+                raise
+            data = self.get(f"{PAYROLL_BASE}/Payslips/{payslip_id}")
+        slips = data.get("Payslips") or data.get("Payslip") or []
+        if isinstance(slips, dict):
+            return slips
+        if not slips:
+            raise RuntimeError(f"Xero returned no payslip body for {payslip_id}.")
+        return slips[0]
 
     def employees(self) -> list[dict]:
         return self.get(f"{PAYROLL_BASE}/Employees").get("Employees", [])
