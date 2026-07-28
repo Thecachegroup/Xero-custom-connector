@@ -1,0 +1,6 @@
+{
+  "_comment": "Explicit payroll-employee -> inventory item code mapping. Checked FIRST, before any automatic matching, so anything listed here is certain. Add a line whenever run_unmatched_employees reports someone. Names are matched case-insensitively and ignore punctuation, so 'Louis Soto' matches 'louis  soto'.",
+  "map": {
+    "Louis Soto": "Linfox - LSOTO"
+  }
+}

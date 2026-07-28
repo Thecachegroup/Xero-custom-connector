@@ -125,6 +125,37 @@ def _pull(fy: str | None):
 
 
 @mcp.tool()
+def unmatched_employees(fy: str = "current") -> str:
+    """List every payroll employee whose name does NOT resolve to an inventory
+    item code, with suggested codes for each. These are the people whose cost
+    is invisible to the invoice check - they show as 'nan' cost and make their
+    contractor look invoiced-but-never-paid.
+
+    Fix by adding the correct pairs to config/employee_codes.json, then
+    redeploy. Suggestions are ranked guesses based on the code's initials -
+    check each one before adding it.
+    """
+    data, items, *_ = _load(fy)
+    pay = data[(data["Source"] == "Payroll") & (data["Inventory code"].isna())]
+    if pay.empty:
+        return f"All payroll employees resolve to an item code for {fy}. Nothing to fix."
+
+    lines = [f"Unmatched payroll employees for {fy}:", ""]
+    for name, g in pay.groupby(pay["Description"].fillna("(no name)")):
+        total = float(g["Amount"].sum())
+        lines.append(f"{name}  -  ${total:,.2f} across {len(g)} rows")
+        for s_ in mappers.suggest_codes_for(str(name), items):
+            lines.append(f"     suggest: {s_['code']!r}"
+                         + (f"  (item name: {s_['name']})" if s_["name"] else ""))
+        if not mappers.suggest_codes_for(str(name), items):
+            lines.append("     no candidate found - check the item exists in Xero")
+        lines.append("")
+    lines += ["Add confirmed pairs to config/employee_codes.json under \"map\",",
+              'e.g.  "Louis Soto": "Linfox - LSOTO"', "then commit and redeploy."]
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def refresh_cache() -> str:
     """Discard cached Xero data so the next check re-pulls live figures.
     Use after raising or paying invoices, or after a pay run."""

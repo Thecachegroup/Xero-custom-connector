@@ -292,7 +292,34 @@ def normalise_code(code) -> str:
 
 
 def _name_key(v) -> str:
-    return re.sub(r"[^a-z ]", "", str(v or "").strip().lower()).strip()
+    """Normalised key for matching a person's name.
+
+    Collapses internal whitespace as well as stripping punctuation - dictated
+    and copy-pasted names arrive with double spaces, and 'louis  soto' must
+    match 'Louis Soto' or the lookup silently misses.
+    """
+    # Hyphens and punctuation become spaces (not nothing), so 'Louis-Soto' and
+    # "O'Brien" normalise the same way a human would read them.
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z]+", " ", str(v or "").lower())).strip()
+
+
+def load_employee_overrides(path: str | None = None) -> dict:
+    """Explicit employee-name -> item-code mappings from config.
+
+    An automatic matcher can only work when the Xero item Name resembles the
+    payroll employee name. Where it doesn't - 'Louis Soto' against an item coded
+    'Linfox - LSOTO' whose Name is blank or abbreviated - no amount of cleverness
+    will find it, and guessing would put one contractor's cost against another's
+    revenue. An explicit table is the honest answer, and it stays correct.
+    """
+    import json, os
+    path = path or os.environ.get("TCG_EMPLOYEE_CODES", "config/employee_codes.json")
+    try:
+        with open(path) as fh:
+            raw = (json.load(fh) or {}).get("map", {})
+    except Exception:
+        return {}
+    return {_name_key(k): v for k, v in raw.items() if k and v}
 
 
 def build_employee_code_map(items: pd.DataFrame) -> dict:
@@ -311,6 +338,7 @@ def build_employee_code_map(items: pd.DataFrame) -> dict:
     Ambiguous matches are dropped rather than guessed - a wrong mapping puts one
     contractor's cost against another's revenue, which is worse than no match.
     """
+    overrides = load_employee_overrides()
     named = items.dropna(subset=["Name"]).copy()
     named["_k"] = named["Name"].map(_name_key)
     named = named[named["_k"] != ""]
@@ -320,6 +348,8 @@ def build_employee_code_map(items: pd.DataFrame) -> dict:
         k = _name_key(employee)
         if not k:
             return None
+        if k in overrides:          # explicit table always wins
+            return overrides[k]
         if k in exact:
             return exact[k]
         parts = k.split()
@@ -334,9 +364,43 @@ def build_employee_code_map(items: pd.DataFrame) -> dict:
         contains = [c for kk, c in exact.items() if words and words <= set(kk.split())]
         if len(set(contains)) == 1:
             return contains[0]
+        # Last resort: ignore spacing entirely, so "Patrick OBrien" still finds
+        # "Patrick O'Brien". Only accepted when exactly one item matches.
+        flat = k.replace(" ", "")
+        squashed = [c for kk, c in exact.items() if kk.replace(" ", "") == flat]
+        if len(set(squashed)) == 1:
+            return squashed[0]
         return None
 
     return {"_resolve": resolve}
+
+
+def suggest_codes_for(employee: str, items: pd.DataFrame, limit: int = 3) -> list:
+    """Candidate item codes for an unmatched employee, scored on initials and
+    surname appearing in the code (TCG codes them 'Linfox - LSOTO' for Louis
+    Soto). These are SUGGESTIONS for the lookup table only - never applied
+    automatically, because a plausible-looking wrong match is worse than none.
+    """
+    parts = [p for p in _name_key(employee).split() if p]
+    if not parts:
+        return []
+    first, last = parts[0], parts[-1]
+    initials = "".join(p[0] for p in parts)
+    scored = []
+    for _, it in items.iterrows():
+        code = str(it.get("*ItemCode") or "")
+        tail = normalise_code(code).split("-")[-1].strip().replace(" ", "")
+        if not tail:
+            continue
+        score = 0
+        if tail == initials:                      score += 5
+        if tail == (first[0] + last):             score += 6
+        if last and last in tail:                 score += 4
+        if tail and tail in _name_key(it.get("Name") or ""): score += 1
+        if score:
+            scored.append((score, code, str(it.get("Name") or "")))
+    scored.sort(reverse=True)
+    return [{"code": c, "name": n, "score": s} for s, c, n in scored[:limit]]
 
 
 def fy_label(d: date, current_fy_start: date) -> str:
