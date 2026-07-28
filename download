@@ -1,0 +1,26 @@
+# Xero Custom Connection credentials - developer.xero.com/app/manage
+# The client secret is shown ONCE when generated. Store it in your password manager.
+XERO_CLIENT_ID=
+XERO_CLIENT_SECRET=
+
+# Optional. A Custom Connection is bound to one org, so the server can look this
+# up itself. Set it to save one API call on cold start.
+XERO_TENANT_ID=
+
+# Required in http mode only. Random string, 24+ characters. This is the lock on
+# the endpoint - anyone with the full URL can read the ledger.
+MCP_SHARED_SECRET=
+
+TCG_OUTPUT_DIR=./output
+TCG_CUSTOMER_LOOKUP=config/customer_lookup.json
+TCG_NO_PAYROLL_TAX=config/no_payroll_tax.json
+
+# stdio = local (Claude Desktop). http = deployed (Render, claude.ai + Android).
+MCP_TRANSPORT=stdio
+
+# Seconds to reuse a pulled dataset before hitting Xero again.
+TCG_CACHE_TTL=900
+
+# Writes are OFF unless this is exactly 'true'. Turning it on also requires the
+# write scopes on the Xero Custom Connection. Everything written is a DRAFT.
+TCG_WRITE_ENABLED=false
