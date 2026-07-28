@@ -1,26 +1,27 @@
-# Xero Custom Connection credentials - developer.xero.com/app/manage
-# The client secret is shown ONCE when generated. Store it in your password manager.
-XERO_CLIENT_ID=
-XERO_CLIENT_SECRET=
-
-# Optional. A Custom Connection is bound to one org, so the server can look this
-# up itself. Set it to save one API call on cold start.
-XERO_TENANT_ID=
-
-# Required in http mode only. Random string, 24+ characters. This is the lock on
-# the endpoint - anyone with the full URL can read the ledger.
-MCP_SHARED_SECRET=
-
-TCG_OUTPUT_DIR=./output
-TCG_CUSTOMER_LOOKUP=config/customer_lookup.json
-TCG_NO_PAYROLL_TAX=config/no_payroll_tax.json
-
-# stdio = local (Claude Desktop). http = deployed (Render, claude.ai + Android).
-MCP_TRANSPORT=stdio
-
-# Seconds to reuse a pulled dataset before hitting Xero again.
-TCG_CACHE_TTL=900
-
-# Writes are OFF unless this is exactly 'true'. Turning it on also requires the
-# write scopes on the Xero Custom Connection. Everything written is a DRAFT.
-TCG_WRITE_ENABLED=false
+# Render blueprint for the TCG Xero Invoice Checker MCP server.
+# Render reads this on first deploy and provisions the service to match.
+services:
+  - type: web
+    name: tcg-xero-invoice-checker
+    runtime: python
+    plan: starter          # NOT free - the free plan sleeps and the first call times out
+    region: singapore      # closest Render region to Melbourne
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.server
+    healthCheckPath: /healthz
+    envVars:
+      - key: MCP_TRANSPORT
+        value: http
+      - key: PYTHON_VERSION
+        value: "3.12.6"
+      # Set these in the Render dashboard, never in this file:
+      - key: XERO_CLIENT_ID
+        sync: false
+      - key: XERO_CLIENT_SECRET
+        sync: false
+      - key: XERO_TENANT_ID
+        sync: false
+      - key: MCP_SHARED_SECRET
+        sync: false
+      - key: TCG_WRITE_ENABLED
+        value: "false"      # set to true in the dashboard when you want writes
