@@ -22,6 +22,7 @@ This client self-throttles and honours the Retry-After header on 429.
 from __future__ import annotations
 
 import os
+import re
 import time
 import threading
 import logging
@@ -252,15 +253,54 @@ class XeroClient:
 
     # ---------- payroll (AU) ----------
 
-    def pay_runs(self, date_from: str, date_to: str) -> list[dict]:
-        where = (
-            f'PayRunPeriodEndDate>=DateTime({date_from.replace("-", ",")})'
-            f' AND PayRunPeriodEndDate<=DateTime({date_to.replace("-", ",")})'
-        )
-        return self.get(f"{PAYROLL_BASE}/PayRuns", params={"where": where}).get("PayRuns", [])
+    @staticmethod
+    def _xero_date(val) -> str | None:
+        """Xero payroll returns /Date(1585699200000+0000)/. Convert to YYYY-MM-DD."""
+        if not val:
+            return None
+        m = re.search(r"/Date\((-?\d+)", str(val))
+        if not m:
+            return str(val)[:10]
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(
+            int(m.group(1)) / 1000, tz=timezone.utc
+        ).date().isoformat()
 
-    def payslip(self, payslip_id: str) -> dict:
-        return self.get(f"{PAYROLL_BASE}/Payslips/{payslip_id}")["Payslips"][0]
+    def pay_runs(self, date_from: str, date_to: str) -> list[dict]:
+        """All pay runs whose period ends inside the window.
+
+        The Payroll AU API does not honour the Accounting API's
+        DateTime(y,m,d) where-syntax - passing it returns an empty set rather
+        than an error, which silently loses the entire payroll. So page the
+        endpoint and filter here instead.
+        """
+        out, page = [], 1
+        while True:
+            batch = self.get(
+                f"{PAYROLL_BASE}/PayRuns", params={"page": page}
+            ).get("PayRuns", [])
+            if not batch:
+                break
+            for run in batch:
+                end = self._xero_date(run.get("PayRunPeriodEndDate"))
+                if end and date_from <= end <= date_to:
+                    out.append(run)
+            if len(batch) < 100:
+                break
+            page += 1
+        log.info("pay_runs: %d in %s..%s", len(out), date_from, date_to)
+        return out
+
+    def pay_run(self, pay_run_id: str) -> dict:
+        """A single pay run, which carries its payslip list."""
+        return self.get(f"{PAYROLL_BASE}/PayRuns/{pay_run_id}")["PayRuns"][0]
+
+    def pay_items(self) -> dict:
+        """Earnings rates, deduction types etc. Payroll AU is on 1.0."""
+        return self.get(f"{PAYROLL_BASE}/PayItems").get("PayItems", {})
+
+    def payroll_calendars(self) -> list[dict]:
+        return self.get(f"{PAYROLL_BASE}/PayrollCalendars").get("PayrollCalendars", [])
 
     def employees(self) -> list[dict]:
         return self.get(f"{PAYROLL_BASE}/Employees").get("Employees", [])

@@ -103,7 +103,9 @@ def _pull(fy: str | None):
 
     payslips = []
     for run in c.pay_runs(start, end):
-        for ps in run.get("Payslips", []) or []:
+        # The list endpoint omits payslips; the detail endpoint carries them.
+        detail = run if run.get("Payslips") else c.pay_run(run["PayRunID"])
+        for ps in detail.get("Payslips", []) or []:
             payslips.append(c.payslip(ps["PayslipID"]))
     payroll = mappers.payslips_to_rows(payslips)
 
@@ -287,9 +289,9 @@ def payroll_entry_plan(days_worked: str, period_start: str, period_end: str) -> 
 
 
 @mcp.tool()
-def post_draft_timesheet(employee_name: str, payroll_calendar_id: str,
-                         period_start: str, period_end: str,
-                         earnings_rate_id: str, units_by_date: str) -> str:
+def post_draft_timesheet(employee_name: str, period_start: str, period_end: str,
+                         earnings_rate_id: str, units_by_date: str,
+                         payroll_calendar_id: str = "") -> str:
     """Create a DRAFT timesheet in Xero. It is not approved and does not pay
     anyone until you approve it in Xero yourself.
 
@@ -300,21 +302,30 @@ def post_draft_timesheet(employee_name: str, payroll_calendar_id: str,
         earnings_rate_id: from list_payroll_setup
         units_by_date: one per line, 'YYYY-MM-DD: hours'
     """
+    from datetime import timedelta
     c = client()
     emp = writes.find_employee(c, employee_name)
-    lines = []
+    by_date = {}
     for raw in units_by_date.strip().splitlines():
         if not raw.strip():
             continue
         d, u = raw.rsplit(":", 1)
-        lines.append({"date": d.strip(), "earningsRateID": earnings_rate_id,
-                      "numberOfUnits": float(u.strip())})
+        by_date[d.strip()] = float(u.strip())
+
+    d0, d1 = date.fromisoformat(period_start), date.fromisoformat(period_end)
+    span = [(d0 + timedelta(days=i)).isoformat() for i in range((d1 - d0).days + 1)]
+    stray = sorted(set(by_date) - set(span))
+    if stray:
+        return (f"NOTHING POSTED. These dates fall outside {period_start} to "
+                f"{period_end}: {', '.join(stray)}. Fix the dates or the period.")
+    units = [by_date.get(day, 0.0) for day in span]
+
     res = writes.create_draft_timesheet(
-        c, emp["EmployeeID"], payroll_calendar_id, period_start, period_end, lines)
-    total = sum(l["numberOfUnits"] for l in lines)
+        c, emp["EmployeeID"], period_start, period_end, earnings_rate_id, units)
     return (f"DRAFT timesheet created for {emp.get('FirstName')} {emp.get('LastName')}: "
-            f"{len(lines)} days, {total:g} units, {period_start} to {period_end}.\n"
-            f"It is a draft. Approve it in Xero (Payroll > Timesheets) before the pay run.\n"
+            f"{sum(units):g} units across {len([u for u in units if u])} worked days, "
+            f"{period_start} to {period_end} ({len(span)} day period).\n"
+            f"It is a DRAFT. Approve it in Xero (Payroll > Timesheets) before the pay run.\n"
             f"Xero returned: {str(res)[:200]}")
 
 
@@ -386,10 +397,12 @@ def post_pay_period(days_worked: str, period_start: str, period_end: str,
     ts_done, inv_lines, log_lines = [], [], []
     for name, days, r in parsed:
         emp = writes.find_employee(c, name)
+        d0, d1 = date.fromisoformat(period_start), date.fromisoformat(period_end)
+        span = (d1 - d0).days + 1
+        units = [0.0] * span
+        units[-1] = days          # booked to the period end date
         res = writes.create_draft_timesheet(
-            c, emp["EmployeeID"], payroll_calendar_id, period_start, period_end,
-            [{"date": period_end, "earningsRateID": earnings_rate_id,
-              "numberOfUnits": days}])
+            c, emp["EmployeeID"], period_start, period_end, earnings_rate_id, units)
         ts_done.append(name)
         inv_lines.append({
             "ItemCode": r["*ItemCode"],
