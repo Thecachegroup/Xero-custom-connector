@@ -1,4 +1,4 @@
-mcp[cli]>=1.2.0
+mcp==1.9.4
 requests>=2.32
 pandas>=2.2
 openpyxl>=3.1
