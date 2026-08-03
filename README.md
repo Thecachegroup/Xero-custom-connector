@@ -250,20 +250,6 @@ matches more than one item code.
 
 ---
 
-## Tests
-
-```
-python3 tests/test_static.py      # syntax, contracts, endpoint versions, security guards
-python3 tests/test_pipeline.py    # full pipeline against Xero-shaped fixtures
-```
-
-No credentials needed - the fixtures are Xero-shaped JSON. Run both after any
-change to mappers or checks. The pipeline test deliberately includes a duplicate
-item code, a z-prefixed code split across sales and cost, and a payrolling
-invoice with no item code, so the rules that handle those stay honest.
-
----
-
 ## Known gaps
 
 Tools for **PAYG withholding**, **payroll tax** and the **quarterly BAS** are not

@@ -30,6 +30,7 @@ from .xero_client import XeroClient
 from . import mappers, checks, writes
 
 TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
+OUTPUT_DIR = os.environ.get("TCG_OUTPUT_DIR", "./output")
 
 # Cache a full pull for this many seconds. A whole-FY pull is hundreds of Xero
 # calls and several minutes; without this, every tool call repeats it and burns
@@ -100,19 +101,11 @@ def _pull(fy: str | None):
     bills = mappers.invoices_to_rows(list(c.iter_invoices("ACCPAY", start, end)))
     items = mappers.items_to_rows(c.items())
 
-    # Pay run summaries carry Wages/Super/Tax per employee - the same figures as
-    # the Payroll Activity Details report, at ~36 calls a year instead of ~400.
-    # Set TCG_PAYSLIP_DETAIL=true only if per-pay-item breakdown is needed.
-    runs = []
+    payslips = []
     for run in c.pay_runs(start, end):
-        runs.append(run if run.get("Payslips") else c.pay_run(run["PayRunID"]))
-
-    if os.environ.get("TCG_PAYSLIP_DETAIL", "").strip().lower() == "true":
-        payslips = [c.payslip(ps["PayslipID"])
-                    for run in runs for ps in run.get("Payslips", []) or []]
-        payroll = mappers.payslips_to_rows(payslips)
-    else:
-        payroll = mappers.payrun_summaries_to_rows(runs)
+        for ps in run.get("Payslips", []) or []:
+            payslips.append(c.payslip(ps["PayslipID"]))
+    payroll = mappers.payslips_to_rows(payslips)
 
     data = mappers.build_data_frame(
         sales, bills, payroll, items,
@@ -121,37 +114,6 @@ def _pull(fy: str | None):
         current_fy_start=current_start,
     )
     return data, items, sales, bills, payroll
-
-
-@mcp.tool()
-def unmatched_employees(fy: str = "current") -> str:
-    """List every payroll employee whose name does NOT resolve to an inventory
-    item code, with suggested codes for each. These are the people whose cost
-    is invisible to the invoice check - they show as 'nan' cost and make their
-    contractor look invoiced-but-never-paid.
-
-    Fix by adding the correct pairs to config/employee_codes.json, then
-    redeploy. Suggestions are ranked guesses based on the code's initials -
-    check each one before adding it.
-    """
-    data, items, *_ = _load(fy)
-    pay = data[(data["Source"] == "Payroll") & (data["Inventory code"].isna())]
-    if pay.empty:
-        return f"All payroll employees resolve to an item code for {fy}. Nothing to fix."
-
-    lines = [f"Unmatched payroll employees for {fy}:", ""]
-    for name, g in pay.groupby(pay["Description"].fillna("(no name)")):
-        total = float(g["Amount"].sum())
-        lines.append(f"{name}  -  ${total:,.2f} across {len(g)} rows")
-        for s_ in mappers.suggest_codes_for(str(name), items):
-            lines.append(f"     suggest: {s_['code']!r}"
-                         + (f"  (item name: {s_['name']})" if s_["name"] else ""))
-        if not mappers.suggest_codes_for(str(name), items):
-            lines.append("     no candidate found - check the item exists in Xero")
-        lines.append("")
-    lines += ["Add confirmed pairs to config/employee_codes.json under \"map\",",
-              'e.g.  "Louis Soto": "Linfox - LSOTO"', "then commit and redeploy."]
-    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -185,35 +147,14 @@ def run_invoice_check(fy: str = "current") -> str:
     """
     data, items, *_ = _load(fy)
     ex = checks.run_all(data, items)
-
-    # Totals every run, so reconciling against the workbook is automatic rather
-    # than a separate manual step. PAYG withheld is shown but excluded from cost:
-    # it is carved out of gross wages and remitted to the ATO, not paid on top.
-    is_ignore = data["Wages type with Super"].astype(str).str.lower() == "ignore"
-    rev = float(data.loc[data["Source"] == "Sales", "Amount"].sum())
-    cost = float(data.loc[data["Source"].isin(["Bills", "Payroll"]) & ~is_ignore,
-                          "Amount"].sum())
-    paygw = float(data.loc[is_ignore, "Amount"].sum())
-    margin = rev - cost
-    totals = [
-        "",
-        f"TOTALS {fy}",
-        f"  Invoiced          ${rev:>14,.2f}",
-        f"  Contractor cost   ${cost:>14,.2f}",
-        f"  Gross margin      ${margin:>14,.2f}"
-        + (f"   ({margin / rev * 100:.1f}%)" if rev else ""),
-        f"  PAYG withheld     ${paygw:>14,.2f}   (remit to ATO - not a cost)",
-        "",
-    ]
-
     if ex.empty:
-        return "\n".join([f"Invoice check for {fy}: {len(data)} lines, no exceptions."] + totals)
+        return f"Invoice check for {fy}: {len(data)} lines, no exceptions."
 
     summary = ex["severity"].value_counts().to_dict()
     lines = [
         f"Invoice check for {fy}: {len(data)} lines, {len(ex)} exceptions "
         f"({summary.get('HIGH',0)} HIGH / {summary.get('MEDIUM',0)} MEDIUM / {summary.get('LOW',0)} LOW)",
-        *totals,
+        "",
         ex.to_markdown(index=False),
     ]
     return "\n".join(lines)
@@ -249,47 +190,19 @@ def get_rate_card() -> str:
 @mcp.tool()
 def export_workbook(fy: str = "current") -> str:
     """Write the drop sheets + Data + Exceptions to an xlsx, ready to drop into
-    the existing Invoice Checker workbook.
-
-    Returns the workbook as a base64-encoded string. The caller decodes and saves
-    it locally. Vercel's serverless filesystem is read-only except /tmp, so the
-    file is staged there and read back immediately — it is not left on disk.
-    """
-    import base64
-    import tempfile
-
+    the existing Invoice Checker workbook."""
     data, items, sales, bills, payroll = _load(fy)
     ex = checks.run_all(data, items)
-
-    filename = f"Invoice_Checker_{fy}_{datetime.now():%Y%m%d}.xlsx"
-    # tempfile.mkstemp gives a unique path safe under concurrent lambda invocations.
-    fd, path = tempfile.mkstemp(suffix=".xlsx", dir="/tmp")
-    os.close(fd)
-    try:
-        with pd.ExcelWriter(path, engine="openpyxl") as xw:
-            ex.to_excel(xw, sheet_name="Exceptions", index=False)
-            data.to_excel(xw, sheet_name="Data", index=False)
-            sales.drop(columns=["InvoiceID"], errors="ignore").to_excel(
-                xw, sheet_name="Sales Invoices drop", index=False)
-            bills.drop(columns=["InvoiceID"], errors="ignore").to_excel(
-                xw, sheet_name="Bills Drop", index=False)
-            payroll.to_excel(xw, sheet_name="Pay Details drop (formatted)", index=False)
-            items.to_excel(xw, sheet_name="Inventory Drop", index=False)
-        with open(path, "rb") as fh:
-            encoded = base64.b64encode(fh.read()).decode("ascii")
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
-    size_kb = len(encoded) * 3 // 4 // 1024
-    return (
-        f"FILENAME:{filename}\n"
-        f"SIZE:{size_kb}KB\n"
-        f"ROWS:{len(data)} data rows, {len(ex)} exceptions\n"
-        f"BASE64:{encoded}"
-    )
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    path = os.path.join(OUTPUT_DIR, f"Invoice_Checker_{fy}_{datetime.now():%Y%m%d}.xlsx")
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
+        ex.to_excel(xw, sheet_name="Exceptions", index=False)
+        data.to_excel(xw, sheet_name="Data", index=False)
+        sales.drop(columns=["InvoiceID"], errors="ignore").to_excel(xw, sheet_name="Sales Invoices drop", index=False)
+        bills.drop(columns=["InvoiceID"], errors="ignore").to_excel(xw, sheet_name="Bills Drop", index=False)
+        payroll.to_excel(xw, sheet_name="Pay Details drop (formatted)", index=False)
+        items.to_excel(xw, sheet_name="Inventory Drop", index=False)
+    return f"Written: {path} ({len(data)} data rows, {len(ex)} exceptions)"
 
 
 @mcp.tool()
@@ -374,9 +287,9 @@ def payroll_entry_plan(days_worked: str, period_start: str, period_end: str) -> 
 
 
 @mcp.tool()
-def post_draft_timesheet(employee_name: str, period_start: str, period_end: str,
-                         earnings_rate_id: str, units_by_date: str,
-                         payroll_calendar_id: str = "") -> str:
+def post_draft_timesheet(employee_name: str, payroll_calendar_id: str,
+                         period_start: str, period_end: str,
+                         earnings_rate_id: str, units_by_date: str) -> str:
     """Create a DRAFT timesheet in Xero. It is not approved and does not pay
     anyone until you approve it in Xero yourself.
 
@@ -387,30 +300,21 @@ def post_draft_timesheet(employee_name: str, period_start: str, period_end: str,
         earnings_rate_id: from list_payroll_setup
         units_by_date: one per line, 'YYYY-MM-DD: hours'
     """
-    from datetime import timedelta
     c = client()
     emp = writes.find_employee(c, employee_name)
-    by_date = {}
+    lines = []
     for raw in units_by_date.strip().splitlines():
         if not raw.strip():
             continue
         d, u = raw.rsplit(":", 1)
-        by_date[d.strip()] = float(u.strip())
-
-    d0, d1 = date.fromisoformat(period_start), date.fromisoformat(period_end)
-    span = [(d0 + timedelta(days=i)).isoformat() for i in range((d1 - d0).days + 1)]
-    stray = sorted(set(by_date) - set(span))
-    if stray:
-        return (f"NOTHING POSTED. These dates fall outside {period_start} to "
-                f"{period_end}: {', '.join(stray)}. Fix the dates or the period.")
-    units = [by_date.get(day, 0.0) for day in span]
-
+        lines.append({"date": d.strip(), "earningsRateID": earnings_rate_id,
+                      "numberOfUnits": float(u.strip())})
     res = writes.create_draft_timesheet(
-        c, emp["EmployeeID"], period_start, period_end, earnings_rate_id, units)
+        c, emp["EmployeeID"], payroll_calendar_id, period_start, period_end, lines)
+    total = sum(l["numberOfUnits"] for l in lines)
     return (f"DRAFT timesheet created for {emp.get('FirstName')} {emp.get('LastName')}: "
-            f"{sum(units):g} units across {len([u for u in units if u])} worked days, "
-            f"{period_start} to {period_end} ({len(span)} day period).\n"
-            f"It is a DRAFT. Approve it in Xero (Payroll > Timesheets) before the pay run.\n"
+            f"{len(lines)} days, {total:g} units, {period_start} to {period_end}.\n"
+            f"It is a draft. Approve it in Xero (Payroll > Timesheets) before the pay run.\n"
             f"Xero returned: {str(res)[:200]}")
 
 
@@ -425,9 +329,7 @@ def list_payroll_setup() -> str:
     out += [f"  {x.get('Name')} ({x.get('CalendarType')}) -> {x.get('PayrollCalendarID')}"
             for x in cals]
     out += ["", "Earnings rates:"]
-    out += [f"  {x.get('Name') or x.get('name')} "
-            f"[{x.get('RateType') or x.get('EarningsType') or ''}] -> "
-            f"{x.get('EarningsRateID') or x.get('earningsRateID')}" for x in rates]
+    out += [f"  {x.get('name')} -> {x.get('earningsRateID')}" for x in rates]
     return "\n".join(out)
 
 
@@ -484,12 +386,10 @@ def post_pay_period(days_worked: str, period_start: str, period_end: str,
     ts_done, inv_lines, log_lines = [], [], []
     for name, days, r in parsed:
         emp = writes.find_employee(c, name)
-        d0, d1 = date.fromisoformat(period_start), date.fromisoformat(period_end)
-        span = (d1 - d0).days + 1
-        units = [0.0] * span
-        units[-1] = days          # booked to the period end date
         res = writes.create_draft_timesheet(
-            c, emp["EmployeeID"], period_start, period_end, earnings_rate_id, units)
+            c, emp["EmployeeID"], payroll_calendar_id, period_start, period_end,
+            [{"date": period_end, "earningsRateID": earnings_rate_id,
+              "numberOfUnits": days}])
         ts_done.append(name)
         inv_lines.append({
             "ItemCode": r["*ItemCode"],
@@ -515,17 +415,14 @@ def post_pay_period(days_worked: str, period_start: str, period_end: str,
 
 
 @mcp.tool()
-def set_rate_card(item_code: str, cost_rate: float = 0.0,
-                  sell_rate: float = 0.0) -> str:
-    """Update a contractor's cost and/or sell rate on the Xero item rate card.
-    Pass 0.0 to leave a rate unchanged."""
-    _cost = cost_rate if cost_rate != 0.0 else None
-    _sell = sell_rate if sell_rate != 0.0 else None
-    res = writes.update_item_rates(client(), item_code, _cost, _sell)
+def set_rate_card(item_code: str, cost_rate: float = None,
+                  sell_rate: float = None) -> str:
+    """Update a contractor's cost and/or sell rate on the Xero item rate card."""
+    res = writes.update_item_rates(client(), item_code, cost_rate, sell_rate)
     _cache.clear()
     return (f"Rate card updated for {item_code}: "
-            f"cost={_cost if _cost is not None else 'unchanged'}, "
-            f"sell={_sell if _sell is not None else 'unchanged'}. "
+            f"cost={cost_rate if cost_rate is not None else 'unchanged'}, "
+            f"sell={sell_rate if sell_rate is not None else 'unchanged'}. "
             f"Xero returned: {str(res)[:200]}")
 
 

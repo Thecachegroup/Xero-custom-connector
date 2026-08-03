@@ -22,7 +22,6 @@ This client self-throttles and honours the Retry-After header on 429.
 from __future__ import annotations
 
 import os
-import re
 import time
 import threading
 import logging
@@ -190,12 +189,7 @@ class XeroClient:
             if resp.status_code >= 500:
                 time.sleep(2 ** attempt)
                 continue
-            if resp.status_code >= 400:
-                # Attach the URL - a bare "404 Not Found" tells you nothing about
-                # which of a dozen Xero endpoints was wrong.
-                raise requests.HTTPError(
-                    f"{resp.status_code} for {url}: {resp.text[:200]}", response=resp
-                )
+            resp.raise_for_status()
             return resp.json()
         raise RuntimeError(f"Xero request failed after retries: {url}")
 
@@ -258,83 +252,15 @@ class XeroClient:
 
     # ---------- payroll (AU) ----------
 
-    @staticmethod
-    def _xero_date(val) -> str | None:
-        """Xero payroll returns /Date(1585699200000+0000)/. Convert to YYYY-MM-DD."""
-        if not val:
-            return None
-        m = re.search(r"/Date\((-?\d+)", str(val))
-        if not m:
-            return str(val)[:10]
-        from datetime import datetime, timezone
-        return datetime.fromtimestamp(
-            int(m.group(1)) / 1000, tz=timezone.utc
-        ).date().isoformat()
-
     def pay_runs(self, date_from: str, date_to: str) -> list[dict]:
-        """All pay runs whose period ends inside the window.
-
-        The Payroll AU API does not honour the Accounting API's
-        DateTime(y,m,d) where-syntax - passing it returns an empty set rather
-        than an error, which silently loses the entire payroll. So page the
-        endpoint and filter here instead.
-        """
-        out, page = [], 1
-        while True:
-            batch = self.get(
-                f"{PAYROLL_BASE}/PayRuns", params={"page": page}
-            ).get("PayRuns", [])
-            if not batch:
-                break
-            for run in batch:
-                # Filter on PAYMENT date, not period end. TCG books everything on
-                # transaction date, and for payroll that is the payment date. A
-                # run ending 30 Jun but paid 1 Jul belongs to July and to the NEW
-                # financial year - filtering on period end pulled it into the old
-                # one and then dated it into the new, which is how Jul-26 rows
-                # appeared inside an FY26 check.
-                paid = self._xero_date(run.get("PaymentDate")) or \
-                       self._xero_date(run.get("PayRunPeriodEndDate"))
-                if paid and date_from <= paid <= date_to:
-                    out.append(run)
-            if len(batch) < 100:
-                break
-            page += 1
-        log.info("pay_runs: %d in %s..%s", len(out), date_from, date_to)
-        return out
-
-    def pay_run(self, pay_run_id: str) -> dict:
-        """A single pay run, which carries its payslip list."""
-        return self.get(f"{PAYROLL_BASE}/PayRuns/{pay_run_id}")["PayRuns"][0]
-
-    def pay_items(self) -> dict:
-        """Earnings rates, deduction types etc. Payroll AU is on 1.0."""
-        return self.get(f"{PAYROLL_BASE}/PayItems").get("PayItems", {})
-
-    def payroll_calendars(self) -> list[dict]:
-        return self.get(f"{PAYROLL_BASE}/PayrollCalendars").get("PayrollCalendars", [])
+        where = (
+            f'PayRunPeriodEndDate>=DateTime({date_from.replace("-", ",")})'
+            f' AND PayRunPeriodEndDate<=DateTime({date_to.replace("-", ",")})'
+        )
+        return self.get(f"{PAYROLL_BASE}/PayRuns", params={"where": where}).get("PayRuns", [])
 
     def payslip(self, payslip_id: str) -> dict:
-        """Full payslip detail: earnings, super and tax as separate typed
-        collections. The pay run list only carries payslip IDs.
-
-        Payroll AU spells this endpoint SINGULAR in the path (/Payslip/{id})
-        while wrapping the response in a PLURAL key ("Payslips"). Plural in the
-        path returns 404. Both spellings are attempted so a future Xero change
-        doesn't silently lose the payroll again.
-        """
-        try:
-            data = self.get(f"{PAYROLL_BASE}/Payslip/{payslip_id}")
-        except requests.HTTPError as e:
-            if getattr(e.response, "status_code", None) != 404:
-                raise
-            data = self.get(f"{PAYROLL_BASE}/Payslips/{payslip_id}")
-        slips = data.get("Payslips") or data.get("Payslip") or []
-        if isinstance(slips, dict):
-            return slips
-        if not slips:
-            raise RuntimeError(f"Xero returned no payslip body for {payslip_id}.")
-        return slips[0]
+        return self.get(f"{PAYROLL_BASE}/Payslips/{payslip_id}")["Payslips"][0]
 
     def employees(self) -> list[dict]:
         return self.get(f"{PAYROLL_BASE}/Employees").get("Employees", [])

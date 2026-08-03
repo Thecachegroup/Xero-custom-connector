@@ -27,10 +27,10 @@ log = logging.getLogger(__name__)
 
 API_BASE = "https://api.xero.com/api.xro/2.0"
 
-# Payroll AU lives on 1.0 throughout. (2.0 is UK/NZ - pointing AU at it returns
-# 404, which is exactly what happened on the first live run.)
-PAYROLL_BASE = os.environ.get(
-    "XERO_PAYROLL_BASE", "https://api.xero.com/payroll.xro/1.0"
+# AU timesheets moved to the 2.0 payroll path while AU pay runs remain on 1.0.
+# Override if Xero returns 404 on the first live call.
+TIMESHEET_BASE = os.environ.get(
+    "XERO_TIMESHEET_BASE", "https://api.xero.com/payroll.xro/2.0"
 )
 
 
@@ -93,59 +93,43 @@ def find_employee(client, name: str) -> dict:
 
 def earnings_rates(client) -> list[dict]:
     """Earnings rate IDs, needed to build timesheet lines. Read-only."""
-    return client.pay_items().get("EarningsRates", [])
+    data = client.get(f"{TIMESHEET_BASE}/payItems")
+    return data.get("payItems", {}).get("earningsRates", [])
 
 
 def payroll_calendars(client) -> list[dict]:
     """Payroll calendar IDs, needed to create a timesheet. Read-only."""
-    return client.payroll_calendars()
+    return client.get(
+        "https://api.xero.com/payroll.xro/1.0/PayrollCalendars"
+    ).get("PayrollCalendars", [])
 
 
 def create_draft_timesheet(
     client,
     employee_id: str,
+    payroll_calendar_id: str,
     start_date: str,
     end_date: str,
-    earnings_rate_id: str,
-    units_by_day: list[float],
+    lines: list[dict],
 ) -> dict:
     """
-    Create a DRAFT timesheet on the Payroll AU API.
+    Create a DRAFT timesheet.
 
-    AU expects NumberOfUnits as an ARRAY - one entry per day from StartDate to
-    EndDate inclusive, in order. A 14-day fortnight needs exactly 14 numbers,
-    zeros included. Getting the length wrong silently shifts everyone's days
-    onto the wrong dates, so it is checked here rather than trusted.
+    lines: [{"date": "2026-07-06", "earningsRateID": "...", "numberOfUnits": 7.6}, ...]
 
-    Status stays DRAFT. It must be approved in Xero before it feeds a pay run.
+    Returns the created timesheet. Status stays Draft - it must be approved in
+    Xero before it feeds a pay run.
     """
     _guard()
-    from datetime import date as _date, timedelta
-    d0, d1 = _date.fromisoformat(start_date), _date.fromisoformat(end_date)
-    span = (d1 - d0).days + 1
-    if span < 1:
-        raise ValueError("end_date is before start_date.")
-    if len(units_by_day) != span:
-        raise ValueError(
-            f"The period {start_date} to {end_date} is {span} days but "
-            f"{len(units_by_day)} unit values were given. They must match "
-            "exactly, including zeros for days not worked - otherwise Xero "
-            "records the hours against the wrong dates."
-        )
     payload = {
-        "Timesheets": [{
-            "EmployeeID": employee_id,
-            "StartDate": start_date,
-            "EndDate": end_date,
-            "Status": "DRAFT",
-            "TimesheetLines": [{
-                "EarningsRateID": earnings_rate_id,
-                "NumberOfUnits": [float(u) for u in units_by_day],
-            }],
-        }]
+        "payrollCalendarID": payroll_calendar_id,
+        "employeeID": employee_id,
+        "startDate": start_date,
+        "endDate": end_date,
+        "timesheetLines": lines,
     }
-    log.info("Draft timesheet %s %s..%s (%d days)", employee_id, start_date, end_date, span)
-    return _post(client, f"{PAYROLL_BASE}/Timesheets", payload)
+    log.info("Creating draft timesheet for %s %s-%s", employee_id, start_date, end_date)
+    return _post(client, f"{TIMESHEET_BASE}/timesheets", payload)
 
 
 # ------------------------------------------------------------------ accounting

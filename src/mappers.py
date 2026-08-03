@@ -208,200 +208,9 @@ def payslips_to_rows(payslips: list[dict]) -> pd.DataFrame:
     return df[df["Pay Item"].map(is_cost_pay_item)]
 
 
-def payrun_summaries_to_rows(pay_runs: list[dict]) -> pd.DataFrame:
-    """Payroll rows built from the pay run's own payslip summaries.
-
-    GET /PayRuns already returns, per employee: Wages, Deductions, Tax, Super,
-    Reimbursements and NetPay. That is the same information the Payroll Activity
-    Details report shows in the Xero UI - and the report itself is not exposed
-    through the API, so this is the closest equivalent.
-
-    Why this is the default path: fetching each payslip individually costs one
-    API call per person per pay run (roughly 400 for a financial year) against
-    Xero's 60-per-minute limit. Reading the summaries costs one call per pay run
-    (roughly 36). Same figures, an order of magnitude fewer calls, and no
-    serverless timeout.
-
-    Employer cost = Wages + Super. Tax and NetPay are carved OUT of wages, not
-    added to them - summing them would roughly double the apparent cost. Here
-    they are named fields rather than rows to be classified, so the trap the
-    workbook handles with its "Ignore" flag cannot be sprung.
-
-    Dates use the PAYMENT date (the transaction date), not the period end.
-    """
-    rows = []
-    for run in pay_runs:
-        pay_date = parse_xero_date(
-            run.get("PaymentDate") or run.get("PayRunPeriodEndDate")
-        )
-        period_end = parse_xero_date(run.get("PayRunPeriodEndDate"))
-        for ps in run.get("Payslips", []) or []:
-            employee = f"{ps.get('FirstName','')} {ps.get('LastName','')}".strip()
-            for label, amount, cost_class in (
-                ("Wages", ps.get("Wages"), "wages"),
-                ("Superannuation", ps.get("Super"), "super"),
-            ):
-                if not amount:
-                    continue
-                rows.append({
-                    "Employee": employee,
-                    "Pay Item": label,
-                    "Date": pay_date,
-                    "Period End": period_end,
-                    "Rate Per Unit": 0,
-                    "Units": 0,
-                    "Amount": float(amount),
-                    "Cost Class": cost_class,
-                })
-            # Withheld tax is NOT employer cost - carried separately so PAYG
-            # withholding can be reported without polluting the cost side.
-            if ps.get("Tax"):
-                rows.append({
-                    "Employee": employee, "Pay Item": "PAYG Withholding",
-                    "Date": pay_date, "Period End": period_end,
-                    "Rate Per Unit": 0, "Units": 0,
-                    "Amount": float(ps["Tax"]), "Cost Class": "paygw",
-                })
-    return pd.DataFrame(rows)
-
-
 # --------------------------------------------------------------------------
 # Unified Data frame - the thing the whole workbook actually runs on
 # --------------------------------------------------------------------------
-
-_Z_PREFIX = re.compile(r"^z+", re.IGNORECASE)
-
-
-def normalise_code(code) -> str:
-    """Matching key for an item code.
-
-    TCG historically renamed retired contractors with a leading z (or zz) to
-    push them to the bottom of Xero's alphabetical item list. The consequence is
-    that one person's sales sit under 'zLinfox - SJ' while their payroll sits
-    under 'Linfox - SJ', so any match on the raw code splits them into two
-    people - one apparently never paid, the other apparently never invoiced.
-
-    Strip any leading z's and casefold. Note the z may be followed by a digit
-    ('z4PL - JD'), so the pattern must not require a letter after it.
-
-    The displayed code is left untouched; this is only the join key. The durable
-    fix is Xero's archive function, which retires an item without renaming it.
-    """
-    c = str(code or "").strip()
-    return _Z_PREFIX.sub("", c).strip().lower()
-
-
-def _name_key(v) -> str:
-    """Normalised key for matching a person's name.
-
-    Collapses internal whitespace as well as stripping punctuation - dictated
-    and copy-pasted names arrive with double spaces, and 'louis  soto' must
-    match 'Louis Soto' or the lookup silently misses.
-    """
-    # Hyphens and punctuation become spaces (not nothing), so 'Louis-Soto' and
-    # "O'Brien" normalise the same way a human would read them.
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z]+", " ", str(v or "").lower())).strip()
-
-
-def load_employee_overrides(path: str | None = None) -> dict:
-    """Explicit employee-name -> item-code mappings from config.
-
-    An automatic matcher can only work when the Xero item Name resembles the
-    payroll employee name. Where it doesn't - 'Louis Soto' against an item coded
-    'Linfox - LSOTO' whose Name is blank or abbreviated - no amount of cleverness
-    will find it, and guessing would put one contractor's cost against another's
-    revenue. An explicit table is the honest answer, and it stays correct.
-    """
-    import json, os
-    path = path or os.environ.get("TCG_EMPLOYEE_CODES", "config/employee_codes.json")
-    try:
-        with open(path) as fh:
-            raw = (json.load(fh) or {}).get("map", {})
-    except Exception:
-        return {}
-    return {_name_key(k): v for k, v in raw.items() if k and v}
-
-
-def build_employee_code_map(items: pd.DataFrame) -> dict:
-    """Map a payroll employee name to their inventory item code.
-
-    PAYG contractors carry their cost in payroll, not in a bill, so without this
-    every PAYG person reads as invoiced-but-never-costed AND as cost with no
-    contractor attached. Exact matching on the item Name is too brittle: names
-    are entered as "Dat Le", "Le, Dat", "Dat Le - Test Analyst" and so on.
-
-    Resolution order, stopping at the first hit:
-      1. exact normalised name
-      2. reversed "Surname, First" form
-      3. the item name starts with the employee name (trailing role titles)
-      4. every word of the employee name appears in the item name
-    Ambiguous matches are dropped rather than guessed - a wrong mapping puts one
-    contractor's cost against another's revenue, which is worse than no match.
-    """
-    overrides = load_employee_overrides()
-    named = items.dropna(subset=["Name"]).copy()
-    named["_k"] = named["Name"].map(_name_key)
-    named = named[named["_k"] != ""]
-    exact = dict(zip(named["_k"], named["*ItemCode"]))
-
-    def resolve(employee: str):
-        k = _name_key(employee)
-        if not k:
-            return None
-        if k in overrides:          # explicit table always wins
-            return overrides[k]
-        if k in exact:
-            return exact[k]
-        parts = k.split()
-        if len(parts) >= 2:
-            rev = " ".join(reversed(parts))
-            if rev in exact:
-                return exact[rev]
-        starts = [c for kk, c in exact.items() if kk.startswith(k + " ")]
-        if len(set(starts)) == 1:
-            return starts[0]
-        words = set(parts)
-        contains = [c for kk, c in exact.items() if words and words <= set(kk.split())]
-        if len(set(contains)) == 1:
-            return contains[0]
-        # Last resort: ignore spacing entirely, so "Patrick OBrien" still finds
-        # "Patrick O'Brien". Only accepted when exactly one item matches.
-        flat = k.replace(" ", "")
-        squashed = [c for kk, c in exact.items() if kk.replace(" ", "") == flat]
-        if len(set(squashed)) == 1:
-            return squashed[0]
-        return None
-
-    return {"_resolve": resolve}
-
-
-def suggest_codes_for(employee: str, items: pd.DataFrame, limit: int = 3) -> list:
-    """Candidate item codes for an unmatched employee, scored on initials and
-    surname appearing in the code (TCG codes them 'Linfox - LSOTO' for Louis
-    Soto). These are SUGGESTIONS for the lookup table only - never applied
-    automatically, because a plausible-looking wrong match is worse than none.
-    """
-    parts = [p for p in _name_key(employee).split() if p]
-    if not parts:
-        return []
-    first, last = parts[0], parts[-1]
-    initials = "".join(p[0] for p in parts)
-    scored = []
-    for _, it in items.iterrows():
-        code = str(it.get("*ItemCode") or "")
-        tail = normalise_code(code).split("-")[-1].strip().replace(" ", "")
-        if not tail:
-            continue
-        score = 0
-        if tail == initials:                      score += 5
-        if tail == (first[0] + last):             score += 6
-        if last and last in tail:                 score += 4
-        if tail and tail in _name_key(it.get("Name") or ""): score += 1
-        if score:
-            scored.append((score, code, str(it.get("Name") or "")))
-    scored.sort(reverse=True)
-    return [{"code": c, "name": n, "score": s} for s, c, n in scored[:limit]]
-
 
 def fy_label(d: date, current_fy_start: date) -> str:
     """AU financial year: 1 Jul - 30 Jun."""
@@ -465,21 +274,18 @@ def build_data_frame(
         # employee name back to their item code so payroll joins to sales the
         # same way bills do - otherwise every PAYG contractor reads as
         # "invoiced but never costed".
-        resolver = build_employee_code_map(items)["_resolve"]
-        # PAYG withholding is money carved OUT of gross wages and remitted to
-        # the ATO - it is not additional employer cost. It rides along in the
-        # frame so the withholding total can be reported, but it is marked
-        # "Ignore" (the workbook's own convention) so nothing sums it as cost.
-        payroll = payroll.copy()
-        payroll["Cost Class"] = payroll.get("Cost Class", "wages")
-        payroll.loc[payroll["Cost Class"] == "paygw", "Cost Class"] = "Ignore"
-
+        name_to_code = (items.dropna(subset=["Name"])
+                             .drop_duplicates("Name", keep="last")
+                             .set_index(items.dropna(subset=["Name"])
+                                        .drop_duplicates("Name", keep="last")["Name"]
+                                        .str.strip().str.lower())["*ItemCode"]
+                             .to_dict())
         pay = pd.DataFrame({
             "Primary Source": "Payroll",
             "Source": "Payroll",
             "Invoiced/Billed": "Paid",
             "Description": payroll["Employee"],
-            "Inventory code": payroll["Employee"].map(resolver),
+            "Inventory code": payroll["Employee"].str.strip().str.lower().map(name_to_code),
             "Vendor": payroll["Employee"],
             "Customer": None,
             "Date": pd.to_datetime(payroll["Date"]),
@@ -504,6 +310,5 @@ def build_data_frame(
         else (r.get("Payroll Tax Payable") or "Payable"),
         axis=1,
     )
-    data["Match key"] = data["Inventory code"].map(normalise_code)
     data["Place"] = range(1, len(data) + 1)
     return data.reset_index(drop=True)

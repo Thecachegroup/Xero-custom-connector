@@ -1,25 +1,20 @@
 """
 Vercel serverless entrypoint.
 
-Vercel's Python runtime looks for an ASGI application called `app` here and
-routes every request to it. `vercel.json` rewrites all paths to this handler, so
-both /healthz and /mcp/<secret> land here.
+Vercel's Python runtime looks for an ASGI application called `app` in this file
+and routes every request to it. `vercel.json` rewrites all paths here so the
+MCP endpoint at /mcp/<secret> and the /healthz probe both land on this handler.
 
-SECURITY - why MCP_TRANSPORT is forced below.
+The server runs stateless (stateless_http=True) because serverless invocations
+share nothing between calls - there is no in-process session to hold onto.
 
-This file only ever runs in a web context. If MCP_TRANSPORT were left unset the
-server would fall back to stdio defaults and publish an UNPROTECTED /mcp
-endpoint, exposing the whole ledger to anyone who guessed the domain. Forcing
-http here means the shared-secret guard in src.server always applies and the
-function refuses to boot without a secret. It must be set before the import.
+For a persistent host (Render, Fly) use `python -m src.server` instead; that
+path is still supported and is the better fit for full-financial-year payroll
+pulls, which can outlast a serverless function.
 """
 
-import os
 import sys
 from pathlib import Path
-
-# Must come before importing src.server - the guard runs at import time.
-os.environ["MCP_TRANSPORT"] = "http"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
