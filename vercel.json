@@ -1,5 +1,6 @@
 {
-  "routes": [
-    { "src": "/(.*)", "dest": "/api/index" }
+  "installCommand": "pip install -r requirements.txt",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/index" }
   ]
 }
