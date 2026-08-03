@@ -1,6 +1,13 @@
 {
-  "_comment": "Explicit payroll-employee -> inventory item code mapping. Checked FIRST, before any automatic matching, so anything listed here is certain. Add a line whenever run_unmatched_employees reports someone. Names are matched case-insensitively and ignore punctuation, so 'Louis Soto' matches 'louis  soto'.",
+  "_comment": "Explicit payroll-employee -> inventory item code mapping. Checked FIRST, before any automatic matching, so anything listed here is certain. Add a line whenever unmatched_employees reports someone. Names are matched case-insensitively and punctuation/spacing is ignored, so 'Luis Guerrero Soto' matches 'louis  soto'. The Xero payroll name goes on the LEFT; the inventory item code goes on the RIGHT.",
   "map": {
-    "Louis Soto": "Linfox - LSOTO"
+    "Louis Soto": "Linfox - LSOTO",
+    "Luis Guerrero Soto": "Linfox - LSOTO",
+    "Bhasker Veerla": "Linfox - BV",
+    "Bhasker Veela": "Linfox - BV",
+    "Saeid Almaher": "Linfox - SA",
+    "Saied Almaher": "Linfox - SA",
+    "Naresh Gannavarapu": "Linfox - NG",
+    "Naresh Venkata": "Linfox - NG"
   }
 }

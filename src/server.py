@@ -30,7 +30,6 @@ from .xero_client import XeroClient
 from . import mappers, checks, writes
 
 TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
-OUTPUT_DIR = os.environ.get("TCG_OUTPUT_DIR", "./output")
 
 # Cache a full pull for this many seconds. A whole-FY pull is hundreds of Xero
 # calls and several minutes; without this, every tool call repeats it and burns
@@ -250,19 +249,47 @@ def get_rate_card() -> str:
 @mcp.tool()
 def export_workbook(fy: str = "current") -> str:
     """Write the drop sheets + Data + Exceptions to an xlsx, ready to drop into
-    the existing Invoice Checker workbook."""
+    the existing Invoice Checker workbook.
+
+    Returns the workbook as a base64-encoded string. The caller decodes and saves
+    it locally. Vercel's serverless filesystem is read-only except /tmp, so the
+    file is staged there and read back immediately — it is not left on disk.
+    """
+    import base64
+    import tempfile
+
     data, items, sales, bills, payroll = _load(fy)
     ex = checks.run_all(data, items)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    path = os.path.join(OUTPUT_DIR, f"Invoice_Checker_{fy}_{datetime.now():%Y%m%d}.xlsx")
-    with pd.ExcelWriter(path, engine="openpyxl") as xw:
-        ex.to_excel(xw, sheet_name="Exceptions", index=False)
-        data.to_excel(xw, sheet_name="Data", index=False)
-        sales.drop(columns=["InvoiceID"], errors="ignore").to_excel(xw, sheet_name="Sales Invoices drop", index=False)
-        bills.drop(columns=["InvoiceID"], errors="ignore").to_excel(xw, sheet_name="Bills Drop", index=False)
-        payroll.to_excel(xw, sheet_name="Pay Details drop (formatted)", index=False)
-        items.to_excel(xw, sheet_name="Inventory Drop", index=False)
-    return f"Written: {path} ({len(data)} data rows, {len(ex)} exceptions)"
+
+    filename = f"Invoice_Checker_{fy}_{datetime.now():%Y%m%d}.xlsx"
+    # tempfile.mkstemp gives a unique path safe under concurrent lambda invocations.
+    fd, path = tempfile.mkstemp(suffix=".xlsx", dir="/tmp")
+    os.close(fd)
+    try:
+        with pd.ExcelWriter(path, engine="openpyxl") as xw:
+            ex.to_excel(xw, sheet_name="Exceptions", index=False)
+            data.to_excel(xw, sheet_name="Data", index=False)
+            sales.drop(columns=["InvoiceID"], errors="ignore").to_excel(
+                xw, sheet_name="Sales Invoices drop", index=False)
+            bills.drop(columns=["InvoiceID"], errors="ignore").to_excel(
+                xw, sheet_name="Bills Drop", index=False)
+            payroll.to_excel(xw, sheet_name="Pay Details drop (formatted)", index=False)
+            items.to_excel(xw, sheet_name="Inventory Drop", index=False)
+        with open(path, "rb") as fh:
+            encoded = base64.b64encode(fh.read()).decode("ascii")
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    size_kb = len(encoded) * 3 // 4 // 1024
+    return (
+        f"FILENAME:{filename}\n"
+        f"SIZE:{size_kb}KB\n"
+        f"ROWS:{len(data)} data rows, {len(ex)} exceptions\n"
+        f"BASE64:{encoded}"
+    )
 
 
 @mcp.tool()
