@@ -515,14 +515,17 @@ def post_pay_period(days_worked: str, period_start: str, period_end: str,
 
 
 @mcp.tool()
-def set_rate_card(item_code: str, cost_rate: float = None,
-                  sell_rate: float = None) -> str:
-    """Update a contractor's cost and/or sell rate on the Xero item rate card."""
-    res = writes.update_item_rates(client(), item_code, cost_rate, sell_rate)
+def set_rate_card(item_code: str, cost_rate: float = 0.0,
+                  sell_rate: float = 0.0) -> str:
+    """Update a contractor's cost and/or sell rate on the Xero item rate card.
+    Pass 0.0 to leave a rate unchanged."""
+    _cost = cost_rate if cost_rate != 0.0 else None
+    _sell = sell_rate if sell_rate != 0.0 else None
+    res = writes.update_item_rates(client(), item_code, _cost, _sell)
     _cache.clear()
     return (f"Rate card updated for {item_code}: "
-            f"cost={cost_rate if cost_rate is not None else 'unchanged'}, "
-            f"sell={sell_rate if sell_rate is not None else 'unchanged'}. "
+            f"cost={_cost if _cost is not None else 'unchanged'}, "
+            f"sell={_sell if _sell is not None else 'unchanged'}. "
             f"Xero returned: {str(res)[:200]}")
 
 
