@@ -14,7 +14,6 @@ downstream actually depends on.
 
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime, date
 
@@ -64,134 +63,20 @@ def _addr(contact: dict, addr_type: str) -> dict:
     return {}
 
 
-# The tracking category carrying the payroll-tax exemption flag. Matched on
-# NAME, case-insensitively, never on position. Override if it is renamed in Xero.
-PAYROLL_TAX_CATEGORY = os.environ.get(
-    "TCG_PAYROLL_TAX_CATEGORY", "Payroll Tax"
-).strip().lower()
-
-# Optional hard pin for TrackingName1 / TrackingName2 column order, as a
-# comma-separated list of category names. Only needed if Xero's own category
-# order stops matching the order the CSV export writes (e.g. after a category is
-# archived). Leave unset to use whatever /TrackingCategories returns.
-TRACKING_ORDER_OVERRIDE = [
-    c.strip() for c in os.environ.get("TCG_TRACKING_ORDER", "").split(",") if c.strip()
-]
+def _tracking(line: dict, idx: int) -> tuple[str, str]:
+    tracks = line.get("Tracking", []) or []
+    if idx < len(tracks):
+        return tracks[idx].get("Name", ""), tracks[idx].get("Option", "")
+    return "", ""
 
 
-def _norm_cat(v) -> str:
-    return str(v or "").strip().lower()
-
-
-def _tracking_slots(line: dict, categories: list[str] | None) -> list[tuple[str, str]]:
-    """The (name, option) pair for each tracking slot on one line item.
-
-    Filed by CATEGORY NAME, never by position.
-
-    The bug this replaces: the old version indexed the line's own Tracking[]
-    array, which only carries the categories actually set on THAT line. Where a
-    line had only the second category populated it landed in the
-    TrackingName1 / TrackingOption1 columns - and the payroll-tax lookup, which
-    read TrackingOption1, returned blank for every row instead. Low volume, high
-    consequence: exempt lines were silently treated as payable.
-
-    The category name is written into its slot whenever the org defines that
-    category (matching the Xero CSV export, which names the column's category on
-    every row); the option is written only where the line actually carries one.
-    """
-    tracks = [t for t in (line.get("Tracking") or []) if t.get("Name")]
-    by_name = {_norm_cat(t.get("Name")): t for t in tracks}
-
-    order = list(TRACKING_ORDER_OVERRIDE or categories or [])
-    if not order:
-        # No category list available - fall back to the line's own order. Worse
-        # than keying by name, but better than dropping the data entirely.
-        order = [t.get("Name", "") for t in tracks]
-    # A category present on the line but missing from the org list (archived, or
-    # created since the list was fetched) goes on the end rather than vanishing.
-    known = {_norm_cat(c) for c in order}
-    for t in tracks:
-        if _norm_cat(t.get("Name")) not in known:
-            order.append(t.get("Name", ""))
-            known.add(_norm_cat(t.get("Name")))
-
-    slots = [(cat, (by_name.get(_norm_cat(cat)) or {}).get("Option", "")) for cat in order]
-    while len(slots) < 2:
-        slots.append(("", ""))
-    return slots
-
-
-def credit_note_to_invoice_shape(note: dict) -> dict:
-    """Recast a Xero CreditNote as an Invoice-shaped dict.
-
-    One mapper then handles both document kinds, so the drop tab cannot drift
-    between them.
-
-    SIGNS. A credit note reduces revenue, but Xero stores its amounts POSITIVE.
-    The workbook sums LineAmount without knowing what produced the row, so the
-    signs are flipped here: Quantity and every money field go negative while
-    UnitAmount stays positive. That keeps units x rate = amount true, so the
-    rate-card check still compares the right rate, and
-    checks.negative_or_reversal correctly flags the credit for confirmation
-    against its original.
-    """
-    def neg(v):
-        try:
-            return -float(v)
-        except (TypeError, ValueError):
-            return v
-
-    lines = []
-    for line in note.get("LineItems", []) or []:
-        line = dict(line)
-        line["Quantity"] = neg(line.get("Quantity", 0))
-        line["LineAmount"] = neg(line.get("LineAmount", 0))
-        line["TaxAmount"] = neg(line.get("TaxAmount", 0))
-        lines.append(line)
-
-    is_sales = note.get("Type") == "ACCRECCREDIT"
-    return {
-        "Contact": note.get("Contact", {}) or {},
-        "InvoiceNumber": note.get("CreditNoteNumber", ""),
-        "Reference": note.get("Reference", ""),
-        "Date": note.get("Date") or note.get("DateString"),
-        "DueDate": note.get("DueDate") or note.get("DueDateString"),
-        "PlannedPaymentDate": None,
-        "Total": neg(note.get("Total", 0)),
-        "TotalTax": neg(note.get("TotalTax", 0)),
-        # A credit note has no AmountPaid/AmountDue. AppliedAmount is the part
-        # already offset against invoices; RemainingCredit is what is still
-        # available to apply - the closest honest equivalents.
-        "AmountPaid": neg(note.get("AppliedAmount", 0)),
-        "AmountDue": neg(note.get("RemainingCredit", 0)),
-        "CurrencyCode": note.get("CurrencyCode", "AUD"),
-        "SentToContact": note.get("SentToContact"),
-        "Status": note.get("Status", ""),
-        "InvoiceID": note.get("CreditNoteID", ""),
-        "LineItems": lines,
-        "Type": note.get("Type", ""),
-        "_TypeLabel": "Sales credit note" if is_sales else "Bill credit note",
-    }
-
-
-def invoices_to_rows(
-    invoices: list[dict], tracking_categories: list[str] | None = None
-) -> pd.DataFrame:
-    """One row per line item, matching the Xero CSV export exactly.
-
-    Accepts invoices, credit notes recast by credit_note_to_invoice_shape(), or
-    a mix of both.
-
-    tracking_categories: the org's category names in order, from
-    XeroClient.tracking_categories(). Pass it wherever tracking matters -
-    without it tracking falls back to per-line order, which is what put the
-    payroll-tax flag in the wrong column.
-    """
+def invoices_to_rows(invoices: list[dict]) -> pd.DataFrame:
+    """One row per line item, matching the Xero CSV export exactly."""
     rows = []
     for inv in invoices:
         contact = inv.get("Contact", {}) or {}
         po, sa = _addr(contact, "POBOX"), _addr(contact, "STREET")
-        is_sales = inv.get("Type") in ("ACCREC", "ACCRECCREDIT")
+        is_sales = inv.get("Type") == "ACCREC"
 
         head = {
             "ContactName": contact.get("Name", ""),
@@ -222,17 +107,15 @@ def invoices_to_rows(
             "InvoiceAmountPaid": inv.get("AmountPaid", 0),
             "InvoiceAmountDue": inv.get("AmountDue", 0),
             "Currency": inv.get("CurrencyCode", "AUD"),
-            # Credit notes carry their own label so the drop distinguishes them
-            # exactly as the Xero export does.
-            "Type": inv.get("_TypeLabel") or ("Sales invoice" if is_sales else "Bill"),
+            "Type": "Sales invoice" if is_sales else "Bill",
             "Sent": "Sent" if inv.get("SentToContact") else ("Unsent" if is_sales else ""),
             "Status": (inv.get("Status", "") or "").title().replace("Awaitingpayment", "Awaiting Payment"),
             "InvoiceID": inv.get("InvoiceID", ""),  # kept for traceability, dropped on export
         }
 
         for line in inv.get("LineItems", []) or []:
-            slots = _tracking_slots(line, tracking_categories)
-            (t1n, t1o), (t2n, t2o) = slots[0], slots[1]
+            t1n, t1o = _tracking(line, 0)
+            t2n, t2o = _tracking(line, 1)
             rows.append({
                 **head,
                 "InventoryItemCode": line.get("ItemCode", ""),
@@ -520,37 +403,6 @@ def suggest_codes_for(employee: str, items: pd.DataFrame, limit: int = 3) -> lis
     return [{"code": c, "name": n, "score": s} for s, c, n in scored[:limit]]
 
 
-def payroll_tax_option(df: pd.DataFrame) -> pd.Series:
-    """The payroll-tax tracking option for each row, from whichever slot it is in.
-
-    THIS REPLACES A LIVE DEFECT. build_data_frame used to read TrackingOption1
-    unconditionally. In this org the payroll-tax category sits in slot 2, so the
-    lookup returned blank on every row and every line fell through to "Payable"
-    - including the ones explicitly marked "Payroll Tax NOT Payable" in Xero.
-    Low volume, high consequence: payroll tax liability overstated, silently.
-
-    Matching on the category NAME means it keeps working if Xero reorders the
-    categories, if one is archived, or if a third is added.
-    """
-    out = pd.Series([""] * len(df), index=df.index, dtype=object)
-    for name_col, opt_col in (("TrackingName1", "TrackingOption1"),
-                              ("TrackingName2", "TrackingOption2")):
-        if name_col not in df.columns or opt_col not in df.columns:
-            continue
-        is_cat = df[name_col].astype(str).str.strip().str.lower() == PAYROLL_TAX_CATEGORY
-        has_opt = df[opt_col].astype(str).str.strip() != ""
-        out = out.mask(is_cat & has_opt, df[opt_col])
-    # Xero's option reads "Payroll Tax NOT Payable"; the workbook's own
-    # convention - and the config-driven branch in build_data_frame - is
-    # "Not Payable" / "Payable". Normalise here so the two paths cannot produce
-    # two different spellings of the same fact. The raw option is untouched in
-    # the drop tab's TrackingOption columns.
-    return out.map(
-        lambda v: "Not Payable" if "not payable" in str(v).strip().lower()
-        else ("Payable" if str(v).strip() else "")
-    )
-
-
 def fy_label(d: date, current_fy_start: date) -> str:
     """AU financial year: 1 Jul - 30 Jun."""
     if d is None or pd.isna(d):
@@ -596,8 +448,7 @@ def build_data_frame(
             "Units": pd.to_numeric(df["Quantity"], errors="coerce"),
             "Rate": pd.to_numeric(df["UnitAmount"], errors="coerce"),
             "Amount": pd.to_numeric(df["LineAmount"], errors="coerce"),
-            # Name-keyed, not positional. See payroll_tax_option().
-            "Payroll Tax Payable": payroll_tax_option(df),
+            "Payroll Tax Payable": df["TrackingOption1"],
             "InvoiceNumber": df["InvoiceNumber"],
             "Status": df["Status"],
         })

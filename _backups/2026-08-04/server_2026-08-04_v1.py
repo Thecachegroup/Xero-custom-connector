@@ -18,13 +18,8 @@ an email, a ticket, or a public repo.
 from __future__ import annotations
 
 import os
-import io
 import json
 import time
-import base64
-import hmac
-import logging
-import tempfile
 from datetime import date, datetime
 from functools import lru_cache
 
@@ -34,17 +29,8 @@ from mcp.server.fastmcp import FastMCP
 from .xero_client import XeroClient
 from . import mappers, checks, writes
 
-log = logging.getLogger(__name__)
-
 TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
-
-# Serverless filesystems are read-only except the system temp directory, so the
-# old relative './output' failed with EROFS the moment it was deployed. Nothing
-# in this server writes to a repo-relative path any more. Even /tmp is
-# per-instance and vanishes, so the workbook is built in MEMORY and handed back
-# in the response or over the download route; a temp copy is written only when
-# TCG_OUTPUT_DIR is set explicitly, for local runs.
-OUTPUT_DIR = os.environ.get("TCG_OUTPUT_DIR") or tempfile.gettempdir()
+OUTPUT_DIR = os.environ.get("TCG_OUTPUT_DIR", "./output")
 
 # Cache a full pull for this many seconds. A whole-FY pull is hundreds of Xero
 # calls and several minutes; without this, every tool call repeats it and burns
@@ -95,85 +81,32 @@ def _fy_bounds(fy: str | None) -> tuple[str, str, date]:
     return start.isoformat(), end.isoformat(), current_start
 
 
-_cache: dict[str, tuple[float, object]] = {}
-
-
-def _stage(key: str, build):
-    """Memoise one stage of a pull.
-
-    A whole-FY pull can exceed the 60-second MCP timeout from a cold start. When
-    it does, every stage that HAD completed used to be thrown away, so the retry
-    started from zero and timed out in exactly the same place. Caching per stage
-    means a timed-out first call still leaves its finished work behind and the
-    retry picks up where it stopped.
-
-    This only helps when the retry lands on the same warm instance, which on
-    serverless is likely but not guaranteed. The durable fix for a genuinely
-    cold call is a longer function timeout (Vercel Settings > Functions > Max
-    Duration; >60s needs Pro).
-    """
-    hit = _cache.get(key)
-    if hit and (time.time() - hit[0]) < CACHE_TTL:
-        return hit[1]
-    val = build()
-    _cache[key] = (time.time(), val)
-    return val
+_cache: dict[str, tuple[float, tuple]] = {}
 
 
 def _load(fy: str | None):
     key = (fy or "current").lower()
-    return _stage(f"pull:{key}", lambda: _pull(fy))
-
-
-def _tracking_categories():
-    """The org's tracking category order, cached.
-
-    Threaded through both mappers so tracking columns are filed by CATEGORY
-    NAME rather than by position. One extra Xero call. If it fails the mapper
-    falls back to per-line order rather than losing the whole pull - but the
-    payroll-tax flag is only trustworthy with it, so the failure is logged loudly.
-    """
-    try:
-        return client().tracking_categories()
-    except Exception as e:                     # noqa: BLE001 - never fatal
-        log.warning("Could not read Xero tracking categories (%s). Tracking "
-                    "columns fall back to per-line order and the payroll-tax "
-                    "flag may be unreliable.", e)
-        return None
+    hit = _cache.get(key)
+    if hit and (time.time() - hit[0]) < CACHE_TTL:
+        return hit[1]
+    result = _pull(fy)
+    _cache[key] = (time.time(), result)
+    return result
 
 
 def _pull(fy: str | None):
     c = client()
     start, end, current_start = _fy_bounds(fy)
-    k = (fy or "current").lower()
-
-    categories = _stage("tracking-categories", _tracking_categories)
-
-    # Sales = ACCREC invoices + ACCRECCREDIT credit notes; bills likewise.
-    # Credit notes are a SEPARATE Xero endpoint, so pulling only /Invoices
-    # silently dropped every credit ever raised and overstated revenue.
-    def _docs(inv_type: str, credit_type: str):
-        return list(c.iter_invoices(inv_type, start, end)) + [
-            mappers.credit_note_to_invoice_shape(n)
-            for n in c.iter_credit_notes(credit_type, start, end)
-        ]
-
-    sales_docs = _stage(f"docs:ACCREC:{k}", lambda: _docs("ACCREC", "ACCRECCREDIT"))
-    bills_docs = _stage(f"docs:ACCPAY:{k}", lambda: _docs("ACCPAY", "ACCPAYCREDIT"))
-    sales = mappers.invoices_to_rows(sales_docs, categories)
-    bills = mappers.invoices_to_rows(bills_docs, categories)
-    items = mappers.items_to_rows(_stage("items", c.items))
+    sales = mappers.invoices_to_rows(list(c.iter_invoices("ACCREC", start, end)))
+    bills = mappers.invoices_to_rows(list(c.iter_invoices("ACCPAY", start, end)))
+    items = mappers.items_to_rows(c.items())
 
     # Pay run summaries carry Wages/Super/Tax per employee - the same figures as
     # the Payroll Activity Details report, at ~36 calls a year instead of ~400.
     # Set TCG_PAYSLIP_DETAIL=true only if per-pay-item breakdown is needed.
-    def _runs():
-        out = []
-        for run in c.pay_runs(start, end):
-            out.append(run if run.get("Payslips") else c.pay_run(run["PayRunID"]))
-        return out
-
-    runs = _stage(f"payruns:{k}", _runs)
+    runs = []
+    for run in c.pay_runs(start, end):
+        runs.append(run if run.get("Payslips") else c.pay_run(run["PayRunID"]))
 
     if os.environ.get("TCG_PAYSLIP_DETAIL", "").strip().lower() == "true":
         payslips = [c.payslip(ps["PayslipID"])
@@ -228,24 +161,7 @@ def refresh_cache() -> str:
     Use after raising or paying invoices, or after a pay run."""
     n = len(_cache)
     _cache.clear()
-    return f"Cache cleared ({n} cached stage(s) discarded). Next check will re-pull from Xero."
-
-
-@mcp.tool()
-def warm_cache(fy: str = "current") -> str:
-    """Pull a financial year into cache so the next real call returns instantly.
-
-    A cold whole-FY pull can exceed the 60-second MCP timeout. Run this first,
-    and re-run it if it times out - each attempt keeps whatever stages it
-    finished, so a second or third call gets progressively further before
-    completing.
-    """
-    t0 = time.time()
-    data, items, sales, bills, payroll = _load(fy)
-    return (f"Cache warm for {fy} in {time.time() - t0:.1f}s: "
-            f"{len(sales)} sales lines, {len(bills)} bill lines, "
-            f"{len(payroll)} pay lines, {len(items)} items, {len(data)} data rows. "
-            f"run_invoice_check and export_workbook will now return immediately.")
+    return f"Cache cleared ({n} cached pull(s) discarded). Next check will re-pull from Xero."
 
 
 def _customer_lookup() -> dict[str, str]:
@@ -331,198 +247,22 @@ def get_rate_card() -> str:
     return items[cols + ["Margin"]].to_markdown(index=False)
 
 
-XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-
-LOCAL_TZ = os.environ.get("TCG_TIMEZONE", "Australia/Melbourne")
-
-
-def _now_local() -> datetime:
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo(LOCAL_TZ))
-    except Exception:                           # noqa: BLE001 - naming only
-        return datetime.now()
-
-
-def _build_workbook(fy: str) -> tuple[bytes, str, dict]:
-    """Build the workbook entirely in memory. Returns (bytes, filename, stats).
-
-    Nothing touches the filesystem. That is deliberate: the previous version did
-    os.makedirs('./output') and died with EROFS on Vercel, and even a successful
-    write to /tmp is unreachable from the client and gone on the next instance.
-    """
+@mcp.tool()
+def export_workbook(fy: str = "current") -> str:
+    """Write the drop sheets + Data + Exceptions to an xlsx, ready to drop into
+    the existing Invoice Checker workbook."""
     data, items, sales, bills, payroll = _load(fy)
     ex = checks.run_all(data, items)
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    path = os.path.join(OUTPUT_DIR, f"Invoice_Checker_{fy}_{datetime.now():%Y%m%d}.xlsx")
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
         ex.to_excel(xw, sheet_name="Exceptions", index=False)
         data.to_excel(xw, sheet_name="Data", index=False)
-        sales.drop(columns=["InvoiceID"], errors="ignore").to_excel(
-            xw, sheet_name="Sales Invoices drop", index=False)
-        bills.drop(columns=["InvoiceID"], errors="ignore").to_excel(
-            xw, sheet_name="Bills Drop", index=False)
+        sales.drop(columns=["InvoiceID"], errors="ignore").to_excel(xw, sheet_name="Sales Invoices drop", index=False)
+        bills.drop(columns=["InvoiceID"], errors="ignore").to_excel(xw, sheet_name="Bills Drop", index=False)
         payroll.to_excel(xw, sheet_name="Pay Details drop (formatted)", index=False)
         items.to_excel(xw, sheet_name="Inventory Drop", index=False)
-
-    blob = buf.getvalue()
-    # Melbourne local time, not the server's. Vercel runs UTC, which in winter
-    # stamps files 10 hours behind the day they were actually produced - and the
-    # timestamp exists precisely so two pulls of the same FY can be told apart.
-    name = f"Invoice_Checker_{fy}_{_now_local():%Y-%m-%d_%H%M}.xlsx"
-
-    sales_docs = sales.drop_duplicates("InvoiceID") if "InvoiceID" in sales.columns else sales
-    invoices = sales_docs[sales_docs["Type"] == "Sales invoice"]
-    credits = sales_docs[sales_docs["Type"] == "Sales credit note"]
-    stats = {
-        "data_rows": len(data),
-        "exceptions": len(ex),
-        "sales_invoices": len(invoices),
-        "sales_invoice_total": round(float(pd.to_numeric(
-            invoices.get("Total"), errors="coerce").fillna(0).sum()), 2),
-        "sales_credit_notes": len(credits),
-        "sales_credit_total": round(float(pd.to_numeric(
-            credits.get("Total"), errors="coerce").fillna(0).sum()), 2),
-        "draft_sales_documents": int(
-            (sales_docs["Status"].astype(str).str.lower() == "draft").sum()),
-        "kb": round(len(blob) / 1024, 1),
-    }
-    return blob, name, stats
-
-
-def _public_base_url() -> str:
-    """Public origin of this deployment, for building the download link."""
-    for var in ("TCG_PUBLIC_URL", "VERCEL_PROJECT_PRODUCTION_URL", "VERCEL_URL"):
-        val = (os.environ.get(var) or "").strip().rstrip("/")
-        if val:
-            return val if val.startswith("http") else f"https://{val}"
-    return ""
-
-
-@mcp.custom_route("/workbook/{secret}/{fy}", methods=["GET"])
-async def workbook_download(request):
-    """Authenticated xlsx download.
-
-    Gated by the same MCP_SHARED_SECRET as the MCP endpoint, compared in
-    constant time. Anyone holding this URL can read the whole ledger, so it is
-    exactly as sensitive as the MCP URL - treat it the same way.
-    """
-    from starlette.responses import PlainTextResponse, Response
-    want = os.environ.get("MCP_SHARED_SECRET", "")
-    got = request.path_params.get("secret", "")
-    if not want or not hmac.compare_digest(str(got), str(want)):
-        return PlainTextResponse("not found", status_code=404)
-    blob, name, _ = _build_workbook(request.path_params.get("fy", "current"))
-    return Response(
-        blob,
-        media_type=XLSX_MIME,
-        headers={"Content-Disposition": f'attachment; filename="{name}"'},
-    )
-
-
-@mcp.tool()
-def export_workbook(fy: str = "current", delivery: str = "url"):
-    """Build the drop sheets + Data + Exceptions as an xlsx, ready to paste into
-    the existing Invoice Checker workbook.
-
-    Args:
-        fy: 'current', or 'FY26', 'FY25' etc.
-        delivery: how to hand the file back.
-            'url'  - a secret-gated download link (DEFAULT). Costs nothing in
-                     context and the file lands straight in Downloads.
-            'file' - the xlsx embedded in this response as base64. Use when a
-                     browser download is not practical. A full financial year is
-                     roughly 35-85k tokens of context every single call, so it
-                     is not the default.
-            'both' - link and embedded file.
-    """
-    delivery = (delivery or "url").strip().lower()
-    if delivery not in ("url", "file", "both"):
-        return (f"Unknown delivery {delivery!r}. Use 'url', 'file' or 'both'.")
-
-    blob, name, st = _build_workbook(fy)
-
-    summary = [
-        f"Invoice Checker workbook built for {fy} - {name} ({st['kb']:,.1f} KB)",
-        f"  Sales invoices        {st['sales_invoices']:>6}   "
-        f"${st['sales_invoice_total']:>14,.2f}  (GST inclusive)",
-        f"  Sales credit notes    {st['sales_credit_notes']:>6}   "
-        f"${st['sales_credit_total']:>14,.2f}  (carried as negatives)",
-        f"  Draft sales documents {st['draft_sales_documents']:>6}",
-        f"  Data rows             {st['data_rows']:>6}",
-        f"  Exceptions            {st['exceptions']:>6}",
-    ]
-
-    if delivery in ("url", "both"):
-        base, secret = _public_base_url(), os.environ.get("MCP_SHARED_SECRET", "")
-        if base and secret:
-            summary += ["", f"Download: {base}/workbook/{secret}/{fy}",
-                        "Treat that link like a password - it reads the whole ledger."]
-        else:
-            summary += ["", "No download link available: set TCG_PUBLIC_URL and "
-                        "MCP_SHARED_SECRET, or call again with delivery='file'."]
-
-    if delivery in ("file", "both"):
-        from mcp.types import TextContent, EmbeddedResource, BlobResourceContents
-        return [
-            TextContent(type="text", text="\n".join(summary)),
-            EmbeddedResource(
-                type="resource",
-                resource=BlobResourceContents(
-                    uri=f"file:///{name}",
-                    mimeType=XLSX_MIME,
-                    blob=base64.b64encode(blob).decode(),
-                ),
-            ),
-        ]
-
-    return "\n".join(summary)
-
-
-@mcp.tool()
-def tracking_diagnostics(fy: str = "current") -> str:
-    """Show which Xero tracking category lands in which drop column, and how
-    many lines carry each option.
-
-    Run this once after any change to tracking in Xero. It is the check that
-    proves the payroll-tax flag is being read from the right column - the thing
-    that was silently wrong when tracking was read by position.
-    """
-    try:
-        cats = client().tracking_categories()
-    except Exception as e:                      # noqa: BLE001
-        cats = []
-        note = f"Could not read /TrackingCategories: {e}"
-    else:
-        note = ""
-
-    _, _, sales, bills, _ = _load(fy)
-    out = [f"Xero tracking categories, in order: {cats or '(none returned)'}"]
-    if note:
-        out.append(note)
-    if mappers.TRACKING_ORDER_OVERRIDE:
-        out.append(f"TCG_TRACKING_ORDER override in force: "
-                   f"{mappers.TRACKING_ORDER_OVERRIDE}")
-    out.append(f"Payroll-tax category matched on name: "
-               f"{mappers.PAYROLL_TAX_CATEGORY!r}")
-    out.append("")
-
-    for label, df in (("Sales", sales), ("Bills", bills)):
-        if df.empty:
-            continue
-        out.append(f"{label} - {len(df)} lines")
-        for n_col, o_col in (("TrackingName1", "TrackingOption1"),
-                             ("TrackingName2", "TrackingOption2")):
-            names = df[n_col].astype(str).str.strip()
-            opts = df[o_col].astype(str).str.strip()
-            out.append(f"  {n_col}: {(names != '').sum()} populated "
-                       f"{sorted(set(names[names != '']))[:3]}")
-            counts = opts[opts != ""].value_counts().to_dict()
-            out.append(f"  {o_col}: {(opts != '').sum()} populated  {counts}")
-        flag = mappers.payroll_tax_option(df).value_counts().to_dict()
-        out.append(f"  -> resolved Payroll Tax Payable: {flag}")
-        out.append("")
-    return "\n".join(out)
+    return f"Written: {path} ({len(data)} data rows, {len(ex)} exceptions)"
 
 
 @mcp.tool()
