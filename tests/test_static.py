@@ -58,3 +58,51 @@ os.environ['TCG_WRITE_ENABLED']='true'
 try: writes._guard(); ok("writes enabled when flag set")
 except Exception as e: bad(f"guard stuck on: {e}")
 os.environ.pop('TCG_WRITE_ENABLED')
+
+
+# --- contractor ledger: item-code matching and PAYG-withholding exclusion ----
+
+def _dat_le_frame():
+    """Dat Le as the live FY27 data actually shows him: payroll name 'Dat Le',
+    item/sales name 'Dat Tien Le', both on Linfox - DTL."""
+    import pandas as pd
+    rows = []
+    for d in ("2026-07-06", "2026-07-20", "2026-08-03"):
+        rows.append({"Date": d, "Source": "Sales", "Inventory code": "Linfox - DTL",
+                     "Description": "Dat Tien Le - Data Analyst", "Units": 10,
+                     "Rate": 1040, "Amount": 10400, "Status": "Authorised",
+                     "Wages type with Super": None, "Wage Type": None,
+                     "Match key": "linfox - dtl"})
+        for amt, cc, wt in ((7143.05, "wages", "Wages"),
+                            (857.17, "super", "Superannuation"),
+                            (1670.0, "Ignore", "PAYG Withholding")):
+            rows.append({"Date": d, "Source": "Payroll", "Inventory code": "Linfox - DTL",
+                         "Description": "Dat Le", "Units": 0, "Rate": 0, "Amount": amt,
+                         "Status": None, "Wages type with Super": cc, "Wage Type": wt,
+                         "Match key": "linfox - dtl"})
+    df = pd.DataFrame(rows)
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df
+
+
+def _ledger(monkeypatch, term):
+    from src import server as S
+    monkeypatch.setattr(S, "_load", lambda fy: (_dat_le_frame(), None, None, None, None))
+    fn = getattr(S.get_contractor_ledger, "fn", S.get_contractor_ledger)
+    return fn(term)
+
+
+def test_ledger_matches_on_item_code_not_name(monkeypatch):
+    """Payroll name and item name differ; both must return the whole person."""
+    by_item = _ledger(monkeypatch, "Dat Tien Le")
+    by_payroll = _ledger(monkeypatch, "Dat Le")
+    assert "Gross margin: $7,199.34" in by_item
+    assert "Gross margin: $7,199.34" in by_payroll
+
+
+def test_ledger_excludes_payg_withholding_from_cost(monkeypatch):
+    """Withholding is carved out of gross, not added to it. 3 x 1,670 = 5,010
+    must be reported but must not touch employer cost."""
+    out = _ledger(monkeypatch, "Dat Le")
+    assert "Employer cost: $24,000.66" in out
+    assert "PAYG withheld (excluded from cost): $5,010.00" in out
