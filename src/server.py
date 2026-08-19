@@ -375,6 +375,135 @@ def get_rate_card() -> str:
     return items[cols + ["Margin"]].to_markdown(index=False)
 
 
+# ------------------------------------------------------------ payroll mailbox
+
+
+def _graph():
+    from .graph_client import GraphClient
+    return GraphClient()
+
+
+@mcp.tool()
+def graph_diagnostics() -> str:
+    """Prove the Microsoft connection works before trusting anything built on it.
+
+    Run this FIRST after deploying Graph credentials. It separates "the auth is
+    wrong" from "the logic is wrong", which are otherwise indistinguishable when
+    a sweep quietly returns nothing.
+
+    Reads only. Touches no files.
+    """
+    from . import mail_mappers as mmap
+    try:
+        g = _graph()
+    except RuntimeError as e:
+        return f"FAILED before connecting.\n{e}"
+
+    lines = [f"Mailbox:     {g.mailbox}", f"Files owner: {g.files_owner}", ""]
+    try:
+        fid = g.find_folder_id("Payroll - TCG")
+        lines.append(f"Mail folder 'Payroll - TCG': found ({fid[:24]}...)")
+    except Exception as e:                                    # noqa: BLE001
+        return "\n".join(lines + [f"Mail folder lookup FAILED: {e}"])
+
+    try:
+        drive = g._drive_id()
+        lines.append(f"OneDrive for {g.files_owner}: found ({drive[:24]}...)")
+    except Exception as e:                                    # noqa: BLE001
+        lines.append(f"OneDrive lookup FAILED: {e}")
+
+    roster = mmap.load_contractors()
+    fort = [c for c in roster if mmap.in_scope(c)]
+    lines += [
+        "",
+        f"Contractor lookup: {len(roster)} people, {sum(len(c['emails']) for c in roster)} addresses",
+        f"  fortnightly: {len(fort)}   monthly: {len(roster) - len(fort)}",
+        "",
+        "Connection is good. Run sweep_timesheets(period_end) for a dry plan.",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int = 45,
+                     cadence: str = "fortnightly") -> str:
+    """File contractor timesheets and invoices from the payroll mailbox.
+
+    DRY BY DEFAULT. dry_run=True reports what it WOULD file and writes nothing.
+    Read the plan, check it against who you expect, then re-run with
+    dry_run=False. The plan is the whole point - a filing step you check up
+    front is one you can trust, rather than one you audit afterwards.
+
+    Args:
+        period_end: fortnight ending Sunday, YYYY-MM-DD
+        dry_run: True = plan only. False = actually write the files.
+        lookback_days: how far back to search. Default 45, deliberately much
+            wider than the fortnight - people send early, late and out of order,
+            and a message outside the window is silently never filed.
+        cadence: 'fortnightly' or 'monthly'.
+    """
+    from datetime import timedelta
+    from . import mail_mappers as mmap
+
+    end = date.fromisoformat(period_end)
+    since = end - timedelta(days=lookback_days)
+    g = _graph()
+
+    msgs = g.messages("Payroll - TCG", since, end + timedelta(days=10))
+    plan = mmap.plan_filing(msgs, end, cadence=cadence)
+
+    head = [
+        f"Fortnight ending {end.isoformat()}  (period {mmap.period_start(end)} to {end})",
+        f"Searched {since} onward: {len(msgs)} messages",
+        f"Folder: Contractors/Timesheets/{mmap.fortnight_folder(end)}/",
+        "",
+    ]
+
+    if not plan["files"]:
+        head.append("Nothing to file.")
+    else:
+        head.append(f"{'DRY RUN - nothing written' if dry_run else 'FILING'}: "
+                    f"{len(plan['files'])} file(s)")
+        head.append("")
+        rows = sorted(plan["files"], key=lambda f: (f["contractor"], f["kind"], f["path"]))
+        head.append(pd.DataFrame([{
+            "Contractor": f["contractor"], "Type": f["kind"],
+            "Sent as": f["source_name"] or "(unnamed)",
+            "Filed as": f["path"].rsplit("/", 1)[-1],
+        } for f in rows]).to_markdown(index=False))
+
+    if plan["missing"]:
+        head += ["", f"NOT SENT ANYTHING ({len(plan['missing'])}): "
+                     + ", ".join(plan["missing"])]
+    if plan["unmatched"]:
+        head += ["", f"UNMATCHED SENDERS ({len(plan['unmatched'])}) - nobody in "
+                     "config/contractor_mail.json has these addresses:"]
+        for u in plan["unmatched"][:15]:
+            head.append(f"  {u['sender']:<40} {u['subject'][:50]}")
+
+    if dry_run:
+        head += ["", "Nothing was written. Re-run with dry_run=False to file these."]
+        return "\n".join(head)
+
+    written, skipped, failed = [], [], []
+    for f in plan["files"]:
+        try:
+            if g.exists(f["path"]):
+                skipped.append(f["path"])
+                continue
+            blob = g.attachment_bytes(f["message_id"], f["attachment_id"])
+            g.upload(f["path"], blob)
+            written.append(f["path"])
+        except Exception as e:                                # noqa: BLE001
+            failed.append(f"{f['path']}: {e}")
+
+    head += ["", f"Written: {len(written)}   Already there: {len(skipped)}   "
+                 f"Failed: {len(failed)}"]
+    for x in failed:
+        head.append(f"  FAILED {x}")
+    return "\n".join(head)
+
+
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 LOCAL_TZ = os.environ.get("TCG_TIMEZONE", "Australia/Melbourne")
