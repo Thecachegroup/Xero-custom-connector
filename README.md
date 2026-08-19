@@ -270,3 +270,51 @@ Tools for **PAYG withholding**, **payroll tax** and the **quarterly BAS** are no
 built yet. The data needed for them is already being pulled; the calculations
 are not written. These are tax lodgement figures, so they need to be specified
 carefully and checked against a lodged return before anyone relies on them.
+
+---
+
+## Payroll mailbox sweep (added 19 Aug 2026)
+
+Contractors email their timesheets as images **pasted into the message body**, not
+as attachments. Those are `isInline` attachments, and `hasAttachments` is **false**
+on a message whose only attachments are inline — which is why the standard Outlook
+and Power Automate connectors miss them. Graph returns them from `/attachments`
+like anything else, so this reads them directly.
+
+### What it does
+
+1. Read `Payroll - TCG` over a wide window (people send early, late, out of order)
+2. Match sender **address** to a contractor — never the display name, which arrives
+   as "Dat Le", "DatLe", "Le, Dat" and "Dat Tien Le" for the same person
+3. Pull every attachment, inline included
+4. Classify: timesheet / invoice / expense
+5. File to `Contractors/Timesheets/Fortnight  Ending DDMMYYYY/<Client>_<Name>/`
+6. Attach to Xero — timesheet onto the sales invoice, contractor invoice onto the bill
+
+### Modules
+
+| File | |
+|---|---|
+| `src/graph_client.py` | Auth, mail read, attachment bytes, OneDrive upload |
+| `src/mail_mappers.py` | Sender matching, classification, filenames, dry-run planning |
+| `config/contractor_mail.json` | Address → item code → folder. One row per person, several addresses each |
+| `src/writes.py` | `attach_to_invoice()`, `attach_to_bill()` |
+
+### Two spaces
+
+The folder is `Fortnight  Ending DDMMYYYY` — **two spaces** after "Fortnight". That
+is how every folder since 2015 is named and the match is exact. There is a test
+pinning it.
+
+Folder names in `contractor_mail.json` reproduce what is on disk, typos included
+(`Deepati Bansal`, `Saied Almer`). Correcting them here would break the match
+against the existing folders. Fix them in OneDrive first, then here.
+
+### Nothing is guessed
+
+`match_sender()` returns `None` rather than a best guess. An unmatched message gets
+reported, which is recoverable; a wrongly matched one files a contractor's invoice
+against someone else's bill, which is not.
+
+`plan_filing()` decides everything **before** a byte is written, so the plan can be
+checked against what you expect rather than audited afterwards.
