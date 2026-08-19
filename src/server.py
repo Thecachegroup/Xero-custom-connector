@@ -307,18 +307,62 @@ def run_invoice_check(fy: str = "current") -> str:
 @mcp.tool()
 def get_contractor_ledger(contractor: str, fy: str = "current") -> str:
     """Every sales line, bill line and pay line for one contractor in a FY,
-    side by side with the margin. Use when a specific contractor looks wrong."""
+    side by side with the margin. Use when a specific contractor looks wrong.
+
+    Matched by ITEM CODE, not by name. The text passed in only has to find ONE
+    row belonging to the person; every other row carrying the same item code is
+    pulled in with it.
+
+    The bug this replaces: matching was a substring test against Description.
+    A contractor whose payroll name differs from their item name - "Dat Le" on
+    payroll, "Dat Tien Le" on the invoice - came back as two half-people. One
+    showed sales with no cost (margin +$31,200), the other cost with no sales
+    (margin -$29,010.66). Neither figure was real; the true margin was +$7,199.34.
+
+    Margin is revenue minus EMPLOYER COST. PAYG withholding is carved OUT of
+    gross wages and remitted to the ATO, so it is not additional cost. mappers
+    already marks those rows "Ignore"; this now honours it. Summing them
+    understated every PAYG contractor and reported profitable people as
+    loss-making - Devinia Liddelow as -$7,121.94 when she was +$4,680.06.
+    """
     data, *_ = _load(fy)
-    mask = data["Description"].str.contains(contractor, case=False, na=False) | \
-           data["Inventory code"].fillna("").str.contains(contractor, case=False, na=False)
-    sub = data[mask].sort_values("Date")
-    if sub.empty:
+
+    seed = (data["Description"].fillna("").str.contains(contractor, case=False, na=False)
+            | data["Inventory code"].fillna("").str.contains(contractor, case=False, na=False))
+    if not seed.any():
         return f"No lines found for {contractor!r} in {fy}."
 
-    cols = ["Date", "Source", "Inventory code", "Description", "Units", "Rate", "Amount", "Status"]
-    margin = (sub[sub["Source"] == "Sales"]["Amount"].sum()
-              - sub[sub["Source"].isin(["Bills", "Payroll"])]["Amount"].sum())
-    return (f"{contractor} - {fy}\nGross margin: ${margin:,.2f}\n\n"
+    # Widen from the rows the text found to every row sharing their item code.
+    # Match key is already z-prefix-normalised, so 'Linfox - SJ' and
+    # 'zLinfox - SJ' resolve to the same person.
+    keys = {k for k in data.loc[seed, "Match key"].dropna().unique() if str(k).strip()}
+    mask = (seed | data["Match key"].isin(keys)) if keys else seed
+    sub = data[mask].sort_values("Date")
+
+    ignore = (sub.get("Wages type with Super", pd.Series("", index=sub.index))
+                 .fillna("").astype(str).str.strip().str.lower() == "ignore")
+    is_sale = sub["Source"] == "Sales"
+    is_cost = sub["Source"].isin(["Bills", "Payroll"]) & ~ignore
+
+    revenue = sub.loc[is_sale, "Amount"].sum()
+    cost = sub.loc[is_cost, "Amount"].sum()
+    withheld = sub.loc[ignore, "Amount"].sum()
+
+    head = [f"{contractor} - {fy}"]
+    if len(keys) > 1:
+        # More than one item code means either a retired/renamed duplicate or a
+        # search term loose enough to have swept in someone else. Say so rather
+        # than quietly reporting two people as one.
+        head.append(f"NOTE: {len(keys)} item codes matched - {', '.join(sorted(keys))}. "
+                    "Confirm this is one person.")
+    head.append(f"Revenue: ${revenue:,.2f}   Employer cost: ${cost:,.2f}   "
+                f"Gross margin: ${revenue - cost:,.2f}")
+    if withheld:
+        head.append(f"PAYG withheld (excluded from cost): ${withheld:,.2f}")
+
+    cols = ["Date", "Source", "Inventory code", "Description", "Wage Type",
+            "Units", "Rate", "Amount", "Status"]
+    return ("\n".join(head) + "\n\n"
             + sub[[c for c in cols if c in sub.columns]].to_markdown(index=False))
 
 
