@@ -869,6 +869,103 @@ def list_period_drafts(period_end: str, window_days: int = 10) -> str:
 
 
 @mcp.tool()
+def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
+                       window_days: int = 10, kinds: str = "both") -> str:
+    """Put the days worked onto the repeating drafts Xero has already generated.
+
+    QUANTITIES is one 'item code: days' per line, e.g.
+
+        Linfox - DL: 10
+        Linfox - EK: 2.5
+        Tec - PS: 42.23
+
+    Matched on ITEM CODE, never on a name. Names arrive as "Dat Le", "Dat Tien
+    Le" and "Le, Dat" for one person; the item code is the only stable key, and
+    matching on a name once split one contractor into two and moved $60,000.
+
+    THIS FILLS. IT NEVER CREATES. The repeating templates raise the drafts; this
+    puts a quantity on the line that is already there. Creating a second invoice
+    beside a draft Linfox has already been sent is the failure this exists to
+    avoid.
+
+    SAFETY, in order:
+      - dry_run defaults True. Nothing is written until it is explicitly False.
+      - Only DRAFT documents are touched. Approved, sent and paid are untouchable.
+      - Only lines whose quantity is currently ZERO are filled. A line somebody
+        has already billed is left exactly as it is, so running this four times
+        across a billing week cannot add the same days four times.
+      - The fortnight ending is appended to the description, once. A line that
+        already carries it is not stamped again.
+
+    KINDS: 'both' | 'sales' | 'bills'.
+    """
+    c = client()
+    end = date.fromisoformat(period_end)
+    lo = (end - timedelta(days=window_days)).isoformat()
+    hi = (end + timedelta(days=window_days)).isoformat()
+    stamp = f"Fortnight ending {end.strftime('%d/%m/%Y')}"
+
+    wanted, bad = writes.parse_quantities(quantities)
+    if bad:
+        return "Could not read these lines - expected 'item code: days':\n  " + "\n  ".join(bad)
+    if not wanted:
+        return "No quantities given. Nothing to do."
+
+    types = {"both": ["ACCREC", "ACCPAY"], "sales": ["ACCREC"], "bills": ["ACCPAY"]}
+    if kinds not in types:
+        return "kinds must be 'both', 'sales' or 'bills'."
+
+    planned, skipped, errors = [], [], []
+    seen_codes: set[str] = set()
+
+    for kind in types[kinds]:
+        label = "invoice" if kind == "ACCREC" else "bill"
+        try:
+            docs = list(c.iter_invoices(kind, lo, hi, statuses=["DRAFT"]))
+        except Exception as e:                                     # noqa: BLE001
+            errors.append(f"{label}s: could not be read - {e}")
+            continue
+
+        for d in docs:
+            for li in d.get("LineItems", []) or []:
+                code = (li.get("ItemCode") or "").strip()
+                if code in wanted:
+                    seen_codes.add(code)
+
+        p_, s_, to_write = writes.plan_line_fill(docs, wanted, stamp, label)
+        planned += p_
+        skipped += s_
+
+        if not dry_run:
+            for doc in to_write:
+                try:
+                    writes.update_invoice_lines(c, doc["InvoiceID"], doc["LineItems"])
+                except Exception as e:                             # noqa: BLE001
+                    errors.append(f"{label} {doc.get('InvoiceNumber')}: {e}")
+
+    missing = sorted(set(wanted) - seen_codes)
+
+    out = [f"Fortnight ending {end.isoformat()}   drafts dated {lo} to {hi}",
+           "DRY RUN - nothing written." if dry_run else "WRITTEN to Xero. Still DRAFT - approve and send yourself.",
+           ""]
+    if planned:
+        df = pd.DataFrame(planned)
+        out.append(df.to_markdown(index=False))
+        out.append("")
+        for k in df["Kind"].unique():
+            out.append(f"{k} total: ${df[df['Kind'] == k]['Amount'].sum():,.2f}")
+    else:
+        out.append("Nothing to fill - every matching line already has a quantity.")
+    if skipped:
+        out += ["", "LEFT ALONE:", pd.DataFrame(skipped).to_markdown(index=False)]
+    if missing:
+        out += ["", "NO DRAFT FOUND for these item codes: " + ", ".join(missing)]
+    if errors:
+        out += ["", "ERRORS:"] + [f"  {e}" for e in errors]
+    return "\n".join(out)
+
+
+@mcp.tool()
 def payroll_entry_plan(days_worked: str, period_start: str, period_end: str) -> str:
     """Turn 'name: days' lines into the exact payroll and sales figures for a
     fortnight, using each person's current Xero rate card. Read-only - it

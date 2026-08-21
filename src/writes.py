@@ -260,3 +260,106 @@ def attach_to_bill(client, invoice_id: str, filename: str, content: bytes,
     """Attach a contractor's own invoice to their bill. Kept internal."""
     return _attach(client, "Invoices", invoice_id, filename, content,
                    content_type, include_online=False)
+
+# Fields Xero accepts back on a line. LineAmount is deliberately NOT sent - it is
+# computed from Quantity x UnitAmount, and echoing a stale value back while
+# changing the quantity is how you end up with an invoice whose total does not
+# match its own lines.
+_LINE_KEEP = ("LineItemID", "Description", "Quantity", "UnitAmount", "ItemCode",
+              "AccountCode", "TaxType", "Tracking", "DiscountRate")
+
+
+def update_invoice_lines(client, invoice_id: str, lines: list[dict]) -> dict:
+    """Replace the line items on one existing invoice or bill, in place.
+
+    The document keeps its InvoiceID, number, contact, dates and status. Only
+    the lines change, and each line keeps its own LineItemID so Xero updates it
+    rather than adding a second one beside it.
+    """
+    _guard()
+    payload = {"Invoices": [{"InvoiceID": invoice_id,
+                             "LineItems": [{k: v for k, v in li.items()
+                                            if k in _LINE_KEEP and v is not None}
+                                           for li in lines]}]}
+    return _post(client, f"{API_BASE}/Invoices", payload)
+
+
+# ---------------------------------------------------------------- fill planning
+# Pure logic, no network. Separated so it can be tested, because this decides
+# what number goes on an invoice that goes to a client.
+
+
+def parse_quantities(text: str) -> tuple[dict[str, float], list[str]]:
+    """'item code: days' per line -> ({code: days}, [lines that made no sense]).
+
+    The code may contain spaces and hyphens ("Linfox - DL"), so the split is on
+    the LAST colon, not the first.
+    """
+    wanted: dict[str, float] = {}
+    bad: list[str] = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            bad.append(line)
+            continue
+        code, _, qty = line.rpartition(":")
+        try:
+            wanted[code.strip()] = float(qty.strip())
+        except ValueError:
+            bad.append(line)
+    return wanted, bad
+
+
+def plan_line_fill(docs: list[dict], wanted: dict[str, float], stamp: str,
+                   label: str = "invoice") -> tuple[list[dict], list[dict], list[dict]]:
+    """Decide what to change before anything is sent.
+
+    Returns (planned, skipped, docs_to_write). Mutates the line dicts inside
+    `docs` so the caller can post them straight back.
+
+    A line whose quantity is already non-zero is NEVER touched. That single rule
+    is what makes this safe to run four times across a billing week - Wednesday's
+    fill cannot be applied again on Friday and double the days.
+    """
+    planned: list[dict] = []
+    skipped: list[dict] = []
+    to_write: list[dict] = []
+
+    for d in docs:
+        lines = list(d.get("LineItems", []) or [])
+        changed = False
+        for li in lines:
+            code = (li.get("ItemCode") or "").strip()
+            if code not in wanted:
+                continue
+            qty = li.get("Quantity") or 0
+            if qty:
+                skipped.append({
+                    "Doc": d.get("InvoiceNumber") or str(d.get("InvoiceID", ""))[:8],
+                    "Contact": (d.get("Contact") or {}).get("Name", "?"),
+                    "Item": code, "Qty already": qty,
+                    "Why": "already billed - left alone",
+                })
+                continue
+
+            desc = str(li.get("Description") or "")
+            if stamp and stamp.lower() not in desc.lower():
+                li["Description"] = f"{desc} - {stamp}".strip(" -")
+            li["Quantity"] = wanted[code]
+            changed = True
+            unit = float(li.get("UnitAmount") or 0)
+            planned.append({
+                "Kind": label,
+                "Doc": d.get("InvoiceNumber") or str(d.get("InvoiceID", ""))[:8],
+                "Contact": (d.get("Contact") or {}).get("Name", "?"),
+                "Item": code,
+                "Days": wanted[code],
+                "Unit": unit,
+                "Amount": round(wanted[code] * unit, 2),
+            })
+        if changed:
+            to_write.append({"InvoiceID": d.get("InvoiceID"), "LineItems": lines,
+                             "InvoiceNumber": d.get("InvoiceNumber")})
+    return planned, skipped, to_write
