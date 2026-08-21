@@ -236,15 +236,26 @@ def stated_dates(text: str, year_hint: int) -> list[date]:
     return out
 
 
-def period_verdict(text: str, period_end: date, grace_days: int = 10) -> str:
+def period_verdict(text: str, period_end: date, grace_days: int = 10,
+                   not_after: date | None = None) -> str:
     """'in' | 'out' | 'unknown' - what the document itself says about its period.
 
     'unknown' means no date was stated and the caller should fall back to the
     received date. Returning 'unknown' rather than a guess is the point: a
     document with no stated period is genuinely undecidable from its title.
+
+    NOT_AFTER is the date the message arrived, and it discards impossible
+    readings. Nobody invoices for work they have not done yet, so a date later
+    than the day the document was sent is not the period it covers - it is a
+    reference number, a due date, a scan counter, something else. Karen Crabb's
+    "Timesheet 2026.08.27.pdf" arrived on 17 August with a covering note saying
+    it was for the same period as the invoice beside it; read as a period date
+    it was thrown out of its own fortnight.
     """
     start = period_end - timedelta(days=13)
     found = stated_dates(text, period_end.year)
+    if not_after is not None:
+        found = [d for d in found if d <= not_after]
     if not found:
         return "unknown"
     if any(start <= d <= period_end for d in found):
@@ -334,7 +345,8 @@ def plan_filing(messages: list[dict], period_end: date | str,
         # on its own but unmistakable next to "2026.8.2" on the invoice.
         subject = str(msg.get("subject", "") or "")
         names = " ".join(str(a.get("name", "")) for a in msg.get("attachments", []) or [])
-        msg_verdict = period_verdict(f"{subject} {names}", end_d, grace_days)
+        msg_verdict = period_verdict(f"{subject} {names}", end_d, grace_days,
+                                     not_after=recv)
         if msg_verdict == "unknown":
             msg_verdict = "in" if (recv and lo <= recv <= hi) else "out"
 
@@ -346,7 +358,8 @@ def plan_filing(messages: list[dict], period_end: date | str,
                 continue
 
             name = str(a.get("name", "") or "")
-            verdict = period_verdict(f"{subject} {name}", end_d, grace_days)
+            verdict = period_verdict(f"{subject} {name}", end_d, grace_days,
+                                     not_after=recv)
             if verdict == "unknown":
                 verdict = msg_verdict
             if verdict == "out":
@@ -357,6 +370,7 @@ def plan_filing(messages: list[dict], period_end: date | str,
                     "received": recv.isoformat() if recv else "",
                     "stated": ", ".join(d.isoformat() for d in
                                         stated_dates(f"{subject} {name}", end_d.year)[:4]),
+                    "reason": "stated period is a different fortnight",
                 })
                 continue
 
