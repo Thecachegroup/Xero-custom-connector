@@ -30,7 +30,13 @@ CONFIG_PATH = os.environ.get("TCG_CONTRACTOR_MAIL", "config/contractor_mail.json
 # Inline images from Linfox PPM arrive as image.png / image001.png with no
 # meaningful name. Real documents carry an extension that says what they are.
 _INVOICE_HINTS = ("invoice", "inv", "tax invoice", "bill")
-_TIMESHEET_HINTS = ("timesheet", "time sheet", "hours", "ts")
+# Split by strength. "hours" beats "invoice" because Peter Small's hours workbook
+# is called "Invoice_0024-HOURS.xlsx" - it carries the invoice number it belongs
+# to, but it is the timesheet. "ts" is a two-letter substring that also appears in
+# "receipts" and "payments", so it is checked last, after everything specific.
+_TIMESHEET_STRONG = ("timesheet", "time sheet", "hours")
+_TIMESHEET_WEAK = ("ts",)
+_TIMESHEET_HINTS = _TIMESHEET_STRONG + _TIMESHEET_WEAK
 _EXPENSE_HINTS = ("expense", "receipt", "reimburse")
 # Onboarding paperwork. Arrives in the same mailbox but is NOT period paperwork -
 # a passport does not belong in a fortnight folder, and filing one there once
@@ -72,8 +78,14 @@ def match_sender(sender: str, contractors: list[dict] | None = None) -> dict | N
     return None
 
 
+def _generic_name(name: str) -> bool:
+    """A filename that tells you nothing - image.png, image001.png, tmp_<guid>.png."""
+    n = str(name or "").lower()
+    return bool(re.fullmatch(r"(image|img|pasted[-_ ]?image)\d*\.\w+", n)) or n.startswith("tmp_")
+
+
 def classify(filename: str, content_type: str = "", is_inline: bool = False,
-             subject: str = "") -> str:
+             subject: str = "", has_document_invoice: bool = False) -> str:
     """'invoice' | 'timesheet' | 'expense' | 'unknown'.
 
     Order matters. The filename is checked first because a named file is the
@@ -83,22 +95,35 @@ def classify(filename: str, content_type: str = "", is_inline: bool = False,
 
     An inline image with an uninformative name is a timesheet: that is what the
     Linfox PPM screenshot is, every fortnight, from everyone who sends one.
+
+    HAS_DOCUMENT_INVOICE settles the case the subject line used to get wrong.
+    "Bilal Virk - Invoice - Linfox" carries an invoice hint in the subject, so
+    every inline screenshot in that email was filed as a second invoice - when
+    in fact Don Vuong, Mudassir Ali, Jay Jhala and Bilal Virk all send one
+    invoice as a proper document and their timesheets as images beside it. If
+    the message already contains a named invoice file, the images are the
+    evidence behind it, not another copy of it.
     """
     name = str(filename or "").lower()
     subj = str(subject or "").lower()
 
     if any(h in name for h in _ADMIN_HINTS):
         return "admin"
+    if any(h in name for h in _TIMESHEET_STRONG):
+        return "timesheet"
     if any(h in name for h in _INVOICE_HINTS):
         return "invoice"
-    if any(h in name for h in _TIMESHEET_HINTS):
-        return "timesheet"
     if any(h in name for h in _EXPENSE_HINTS):
         return "expense"
+    if any(h in name for h in _TIMESHEET_WEAK):
+        return "timesheet"
 
-    generic = bool(re.fullmatch(r"(image|img|pasted[-_ ]?image)\d*\.\w+", name)) or \
-              name.startswith("tmp_")
-    if is_inline or generic:
+    # The name says nothing. A message that already carries a named invoice
+    # document has its supporting evidence in whatever else is attached.
+    if has_document_invoice:
+        return "timesheet"
+
+    if is_inline or _generic_name(name):
         if any(h in subj for h in _INVOICE_HINTS):
             return "invoice"
         return "timesheet"
@@ -350,10 +375,20 @@ def plan_filing(messages: list[dict], period_end: date | str,
         if msg_verdict == "unknown":
             msg_verdict = "in" if (recv and lo <= recv <= hi) else "out"
 
+        # Does this message carry an invoice as a real, named document? If so its
+        # unnamed images are the timesheets behind it. Judged on the filename
+        # alone - the subject is what got this wrong in the first place.
+        has_doc_invoice = any(
+            not _generic_name(a.get("name", ""))
+            and classify(a.get("name", ""), a.get("contentType", "")) == "invoice"
+            for a in msg.get("attachments", []) or []
+        )
+
         filed_any = False
         for a in msg.get("attachments", []) or []:
             kind = classify(a.get("name", ""), a.get("contentType", ""),
-                            bool(a.get("isInline")), subject)
+                            bool(a.get("isInline")), subject,
+                            has_document_invoice=has_doc_invoice)
             if kind == "admin" and not file_admin:
                 continue
 

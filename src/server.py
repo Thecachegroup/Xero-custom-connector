@@ -25,7 +25,7 @@ import base64
 import hmac
 import logging
 import tempfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 
 import pandas as pd
@@ -800,6 +800,68 @@ def cash_and_receivables() -> str:
             + overdue.nlargest(10, "InvoiceAmountDue")[
                 ["ContactName", "InvoiceNumber", "DueDate", "InvoiceAmountDue"]
             ].to_markdown(index=False))
+
+
+@mcp.tool()
+def list_period_drafts(period_end: str, window_days: int = 10) -> str:
+    """Every DRAFT invoice and bill dated around a fortnight end, line by line.
+
+    Read-only. This is what has to be filled in before anything is sent, and
+    seeing it exactly as Xero holds it is the difference between filling a draft
+    and accidentally raising a second one beside it.
+
+    The repeating templates generate these drafts with Quantity 0.00. A line
+    still showing 0 is a line nobody has billed.
+    """
+    c = client()
+    end = date.fromisoformat(period_end)
+    lo = (end - timedelta(days=window_days)).isoformat()
+    hi = (end + timedelta(days=window_days)).isoformat()
+
+    out = [f"DRAFT invoices and bills dated {lo} to {hi}", ""]
+    grand_empty = 0
+
+    for kind, label in (("ACCREC", "SALES INVOICES (to clients)"),
+                        ("ACCPAY", "BILLS (from contractors)")):
+        try:
+            docs = list(c.iter_invoices(kind, lo, hi, statuses=["DRAFT"]))
+        except Exception as e:                                    # noqa: BLE001
+            out += [label, f"  lookup FAILED: {e}", ""]
+            continue
+
+        out.append(f"{label} - {len(docs)} draft(s)")
+        if not docs:
+            out += ["  none", ""]
+            continue
+
+        for d in docs:
+            out.append("")
+            out.append(f"  {d.get('Contact', {}).get('Name', '?')}"
+                       f"   No: {d.get('InvoiceNumber') or '(none)'}"
+                       f"   Date: {mappers.parse_xero_date(d.get('Date'))}"
+                       f"   Ref: {d.get('Reference') or '(none)'}")
+            out.append(f"    InvoiceID: {d.get('InvoiceID')}")
+            rows = []
+            for li in d.get("LineItems", []) or []:
+                qty = li.get("Quantity")
+                if not qty:
+                    grand_empty += 1
+                rows.append({
+                    "Item": li.get("ItemCode") or "",
+                    "Description": str(li.get("Description") or "")[:44],
+                    "Qty": qty,
+                    "Unit": li.get("UnitAmount"),
+                    "Amount": li.get("LineAmount"),
+                    "Account": li.get("AccountCode") or "",
+                    "Tax": li.get("TaxType") or "",
+                    "LineItemID": li.get("LineItemID"),
+                })
+            if rows:
+                out.append(pd.DataFrame(rows).to_markdown(index=False))
+        out.append("")
+
+    out.append(f"Lines with no quantity: {grand_empty}")
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------- write tools
