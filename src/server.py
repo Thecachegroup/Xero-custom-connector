@@ -401,8 +401,8 @@ def graph_diagnostics() -> str:
 
     lines = [f"Mailbox:     {g.mailbox}", f"Files owner: {g.files_owner}", ""]
     try:
-        fid = g.find_folder_id("Payroll - TCG")
-        lines.append(f"Mail folder 'Payroll - TCG': found ({fid[:24]}...)")
+        fid, used = g.resolve_folder(g.folder)
+        lines.append(f"Mail folder: {used} -> {fid[:24]}...")
     except Exception as e:                                    # noqa: BLE001
         return "\n".join(lines + [f"Mail folder lookup FAILED: {e}"])
 
@@ -449,13 +449,14 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
     since = end - timedelta(days=lookback_days)
     g = _graph()
 
-    msgs = g.messages("Payroll - TCG", since, end + timedelta(days=10))
+    _fid, folder_used = g.resolve_folder(g.folder)
+    msgs = g.messages(g.folder, since, end + timedelta(days=10))
     plan = mmap.plan_filing(msgs, end, cadence=cadence)
     lo, hi = mmap.period_window(end)
 
     head = [
         f"Fortnight ending {end.isoformat()}  (period {mmap.period_start(end)} to {end})",
-        f"Searched {since} onward: {len(msgs)} messages",
+        f"Searched {folder_used} from {since}: {len(msgs)} messages",
         f"Folder: Contractors/Timesheets/{mmap.fortnight_folder(end)}/",
         "",
     ]

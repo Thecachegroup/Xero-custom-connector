@@ -15,6 +15,7 @@ AUTH. Client credentials (app-only). No user, no refresh token, nothing to go
 stale. Set in Vercel:
     GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET
     TCG_PAYROLL_MAILBOX   default payroll@thecachegroup.com.au
+    TCG_PAYROLL_FOLDER    default 'Payroll - TCG'; falls back to Inbox if absent
     TCG_FILES_OWNER       the mailbox whose OneDrive holds Contractors/
 
 SECURITY - READ THIS BEFORE GRANTING THE PERMISSION. Mail.Read as an APPLICATION
@@ -62,6 +63,7 @@ class GraphClient:
                 "registration. Nothing has been read."
             ) from None
         self.mailbox = os.environ.get("TCG_PAYROLL_MAILBOX", "payroll@thecachegroup.com.au")
+        self.folder = os.environ.get("TCG_PAYROLL_FOLDER", "Payroll - TCG")
         self.files_owner = os.environ.get("TCG_FILES_OWNER", "andrew.hurnard@thecachegroup.com.au")
         self._token: str | None = None
         self._expiry = 0.0
@@ -138,6 +140,9 @@ class GraphClient:
 
     # ---------- mail ----------
 
+    # Graph accepts these as folder ids directly, no lookup needed.
+    WELL_KNOWN = {"inbox", "archive", "sentitems", "drafts", "deleteditems"}
+
     def find_folder_id(self, name: str) -> str:
         """Resolve a mail folder by display name, searching child folders too.
 
@@ -145,6 +150,8 @@ class GraphClient:
         than a hardcoded id means it survives being moved or recreated.
         """
         target = name.strip().lower()
+        if target.replace(" ", "") in self.WELL_KNOWN:
+            return target.replace(" ", "")
         roots = self.get_all(f"{GRAPH}/users/{quote(self.mailbox)}/mailFolders",
                              {"$top": "100"})
         for f in roots:
@@ -162,6 +169,21 @@ class GraphClient:
             f"No mail folder called {name!r} in {self.mailbox}. Nothing has been read."
         )
 
+    def resolve_folder(self, name: str) -> tuple[str, str]:
+        """(folder id, what to call it). Falls back to the Inbox, and says so.
+
+        A dedicated payroll mailbox has no 'Payroll - TCG' folder - everything
+        arrives in its Inbox, because the folder only ever existed as a rule in
+        Andrew's own mailbox. Falling back is correct for a mailbox that exists
+        solely for payroll, but it is never silent: the caller prints which
+        folder was actually read, so nobody mistakes "read the wrong place" for
+        "nobody sent anything".
+        """
+        try:
+            return self.find_folder_id(name), name
+        except RuntimeError:
+            return "inbox", f"Inbox (no folder called {name!r} in this mailbox)"
+
     def messages(self, folder: str, since: date | str, until: date | str | None = None) -> list[dict]:
         """Messages in a folder, newest first, with their attachments resolved.
 
@@ -175,7 +197,7 @@ class GraphClient:
             u = until if isinstance(until, str) else until.isoformat()
             flt += f" and receivedDateTime le {u}T23:59:59Z"
 
-        fid = self.find_folder_id(folder)
+        fid, _ = self.resolve_folder(folder)
         raw = self.get_all(
             f"{GRAPH}/users/{quote(self.mailbox)}/mailFolders/{fid}/messages",
             {"$filter": flt, "$top": "50", "$orderby": "receivedDateTime desc",
