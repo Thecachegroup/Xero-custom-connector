@@ -160,6 +160,102 @@ def in_scope(contractor: dict, cadence: str = "fortnightly") -> bool:
     return str(contractor.get("cadence", "fortnightly")).lower() == cadence.lower()
 
 
+
+# --------------------------------------------------------------------------
+# Which period does this document SAY it is for
+# --------------------------------------------------------------------------
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+
+# Deliberately conservative. A bare 8-digit run like "DevIT Invoice 20260802"
+# is an invoice NUMBER as often as a date, and guessing wrong moves a document
+# into the wrong fortnight silently. Anything not confidently a date is left
+# alone and the received date decides instead.
+# Year-first, any of - . / as separator. Karen Crabb writes "2026.8.16";
+# a four-digit leading year makes the order unambiguous, so this is safe
+# to widen where the day-first form below is not.
+_ISO = re.compile(r"\b(20\d{2})[-./](\d{1,2})[-./](\d{1,2})\b")
+_DMY = re.compile(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](20\d{2}|\d{2})\b")
+_DM = re.compile(r"\b(\d{1,2})[/\-](\d{1,2})\b")
+_D_MONTH = re.compile(
+    r"\b(\d{1,2})\s*(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)",
+    re.I)
+_MONTH_D = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})\s*(?:st|nd|rd|th)?\b",
+    re.I)
+
+
+def stated_dates(text: str, year_hint: int) -> list[date]:
+    """Every date the text explicitly states.
+
+    Contractors title their emails with the period the work covers - "Timesheets
+    3rd - 14th August", "(02-08-2026 to 15-08-2026)", "Weeks Ending 2026-08-08".
+    That is a direct statement of which fortnight the document belongs to, and
+    it beats the received date, which only says when they got round to sending it.
+    """
+    out: list[date] = []
+    t = str(text or "")
+
+    def add(y, m, d):
+        try:
+            out.append(date(int(y), int(m), int(d)))
+        except ValueError:
+            pass
+
+    for y, m, d in _ISO.findall(t):
+        add(y, m, d)
+    consumed = _ISO.sub(" ", t)
+
+    for a, m, b in _DMY.findall(consumed):
+        lead = int(a)
+        lead_year = 2000 + lead if lead < 100 else lead
+        tail_year = 2000 + int(b) if int(b) < 100 else int(b)
+        # Australian day-first is the default. The one exception: a two-digit
+        # LEADING value that is the year we are working in, against a trailing
+        # value that is not, is a year-first date. Karen Crabb writes
+        # "26.8.16" for 16 August 2026; read day-first that is August 2016,
+        # which is not a wrong guess so much as a document lost.
+        if tail_year != year_hint and lead_year == year_hint and int(b) <= 31:
+            add(lead_year, m, b)
+        else:
+            add(tail_year, m, a)
+    consumed = _DMY.sub(" ", consumed)
+
+    for d, mon in _D_MONTH.findall(consumed):
+        add(year_hint, _MONTHS[mon.lower()[:3]], d)
+    for mon, d in _MONTH_D.findall(consumed):
+        add(year_hint, _MONTHS[mon.lower()[:3]], d)
+    consumed = _MONTH_D.sub(" ", _D_MONTH.sub(" ", consumed))
+
+    for d, m in _DM.findall(consumed):              # "3/8-14/8"
+        if 1 <= int(m) <= 12:
+            add(year_hint, m, d)
+
+    return out
+
+
+def period_verdict(text: str, period_end: date, grace_days: int = 10) -> str:
+    """'in' | 'out' | 'unknown' - what the document itself says about its period.
+
+    'unknown' means no date was stated and the caller should fall back to the
+    received date. Returning 'unknown' rather than a guess is the point: a
+    document with no stated period is genuinely undecidable from its title.
+    """
+    start = period_end - timedelta(days=13)
+    found = stated_dates(text, period_end.year)
+    if not found:
+        return "unknown"
+    if any(start <= d <= period_end for d in found):
+        return "in"
+    # Dates stated, none in this fortnight. Allow the pay week itself - an
+    # invoice dated the Monday after still belongs to the period it covers.
+    if any(period_end < d <= period_end + timedelta(days=grace_days) for d in found):
+        return "in"
+    return "out"
+
+
 def period_window(period_end: date | str, grace_days: int = 10) -> tuple[date, date]:
     """Which messages belong to this fortnight.
 
@@ -224,20 +320,47 @@ def plan_filing(messages: list[dict], period_end: date | str,
             continue
 
         recv = _as_date(msg.get("received"))
-        if recv and not (lo <= recv <= hi):
-            out_of_period.append({
-                "contractor": who["name"],
-                "subject": msg.get("subject", ""),
-                "received": recv.isoformat(),
-            })
-            continue
+        end_d = period_end if isinstance(period_end, date) else date.fromisoformat(str(period_end))
 
-        seen.add(who["name"])
+        # What the document SAYS beats when it arrived. Only fall back to the
+        # received date when nothing states a period.
+        #
+        # Judged per attachment, not per message. Karen Crabb sends an invoice
+        # and its timesheets together and names each one with the date it
+        # covers, so a single message can straddle two fortnights. An
+        # attachment whose own name states nothing inherits the message
+        # verdict, which pools the subject and every attachment name - that is
+        # what resolves her "26.8.2" timesheet, a format too ambiguous to parse
+        # on its own but unmistakable next to "2026.8.2" on the invoice.
+        subject = str(msg.get("subject", "") or "")
+        names = " ".join(str(a.get("name", "")) for a in msg.get("attachments", []) or [])
+        msg_verdict = period_verdict(f"{subject} {names}", end_d, grace_days)
+        if msg_verdict == "unknown":
+            msg_verdict = "in" if (recv and lo <= recv <= hi) else "out"
+
+        filed_any = False
         for a in msg.get("attachments", []) or []:
             kind = classify(a.get("name", ""), a.get("contentType", ""),
-                            bool(a.get("isInline")), msg.get("subject", ""))
+                            bool(a.get("isInline")), subject)
             if kind == "admin" and not file_admin:
                 continue
+
+            name = str(a.get("name", "") or "")
+            verdict = period_verdict(f"{subject} {name}", end_d, grace_days)
+            if verdict == "unknown":
+                verdict = msg_verdict
+            if verdict == "out":
+                out_of_period.append({
+                    "contractor": who["name"],
+                    "subject": subject,
+                    "file": name,
+                    "received": recv.isoformat() if recv else "",
+                    "stated": ", ".join(d.isoformat() for d in
+                                        stated_dates(f"{subject} {name}", end_d.year)[:4]),
+                })
+                continue
+
+            filed_any = True
             staged.append({
                 "contractor": who["name"], "item_code": who["item_code"],
                 "folder": who["folder"], "kind": kind,
@@ -245,6 +368,9 @@ def plan_filing(messages: list[dict], period_end: date | str,
                 "source_name": a.get("name", ""), "received": recv,
                 "_who": who,
             })
+
+        if filed_any:
+            seen.add(who["name"])
 
     # Part numbers assigned ACROSS the whole plan, ordered by when they arrived,
     # so two files can never resolve to the same name.
