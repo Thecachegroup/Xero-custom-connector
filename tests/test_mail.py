@@ -105,8 +105,8 @@ def test_plan_files_two_inline_screenshots_as_parts_one_and_two():
 def test_plan_separates_an_invoice_from_its_timesheet():
     plan = mm.plan_filing([_msg(
         "karenmareecrabb@gmail.com", "Karen Crabb - invoice",
-        [{"id": "a1", "name": "100003 KC invoice to 2026.8.2.pdf"},
-         {"id": "a2", "name": "TCG Weekly Timesheet - Karen Crabb 26.8.2.pdf"}],
+        [{"id": "a1", "name": "100003 KC invoice to 2026.8.16.pdf"},
+         {"id": "a2", "name": "TCG Weekly Timesheet - Karen Crabb 26.8.16.pdf"}],
     )], date(2026, 8, 16), ROSTER)
     kinds = {f["kind"] for f in plan["files"]}
     assert kinds == {"invoice", "timesheet"}
@@ -192,3 +192,67 @@ def test_period_window_runs_from_the_previous_period_end():
     lo, hi = mm.period_window(date(2026, 8, 16))
     assert lo == date(2026, 8, 3)
     assert hi == date(2026, 8, 26)
+
+
+# --------------------------------------------------------------------------
+# The period the document STATES beats the date it arrived
+# --------------------------------------------------------------------------
+
+def test_stated_dates_reads_dot_separated_year_first():
+    """Karen Crabb's real filename. Year-first with dots parsed nothing before."""
+    assert mm.stated_dates("100003 KC invoice to 2026.8.16.pdf", 2026) == [date(2026, 8, 16)]
+    assert mm.stated_dates("Timesheet 2026.08.27.pdf", 2026) == [date(2026, 8, 27)]
+    assert mm.stated_dates("Weeks Ending 2026-08-08", 2026) == [date(2026, 8, 8)]
+    assert mm.stated_dates("period 2026/08/16", 2026) == [date(2026, 8, 16)]
+
+
+def test_day_first_dates_still_read_day_first():
+    """16.8.2026 is the sixteenth of August, not the eighth of ... whatever."""
+    assert mm.stated_dates("Invoice 16.8.2026", 2026) == [date(2026, 8, 16)]
+    assert mm.stated_dates("(02-08-2026 to 15-08-2026)", 2026) == [
+        date(2026, 8, 2), date(2026, 8, 15)]
+
+
+def test_stated_period_beats_received_date():
+    """Sent inside the window, but the document says it covers a later fortnight."""
+    assert mm.period_verdict("100003 KC invoice to 2026.8.16.pdf", date(2026, 8, 16)) == "in"
+    assert mm.period_verdict("Timesheet 2026.08.27.pdf", date(2026, 8, 16)) == "out"
+    assert mm.period_verdict("Timesheet.pdf", date(2026, 8, 16)) == "unknown"
+
+
+def test_a_later_fortnight_is_not_filed_into_this_one():
+    """Arrived in the window; states 27 Aug. Must not land in the 16 Aug folder."""
+    msgs = [_m("karenmareecrabb@gmail.com", "Timesheet",
+               [{"id": "a", "name": "Timesheet 2026.08.27.pdf"}], "2026-08-19", "m1")]
+    assert mm.plan_filing(msgs, date(2026, 8, 16), ROSTER)["files"] == []
+
+
+def test_previous_fortnights_paperwork_is_excluded_by_its_stated_date():
+    """2026.8.2 is the fortnight before. It arrived in the window; it is not ours."""
+    plan = mm.plan_filing([_msg(
+        "karenmareecrabb@gmail.com", "Karen Crabb - invoice",
+        [{"id": "a1", "name": "100003 KC invoice to 2026.8.2.pdf"},
+         {"id": "a2", "name": "TCG Weekly Timesheet - Karen Crabb 26.8.2.pdf"}],
+    )], date(2026, 8, 16), ROSTER)
+    assert plan["files"] == []
+    assert len(plan["out_of_period"]) == 2
+    assert "Karen Crabb" in plan["missing"]
+
+
+def test_one_message_can_straddle_two_fortnights():
+    """Judged per attachment: the 16 Aug invoice files, the 27 Aug timesheet does not."""
+    plan = mm.plan_filing([_msg(
+        "karenmareecrabb@gmail.com", "Karen Crabb",
+        [{"id": "a1", "name": "100003 KC invoice to 2026.8.16.pdf"},
+         {"id": "a2", "name": "Timesheet 2026.08.27.pdf"}],
+    )], date(2026, 8, 16), ROSTER)
+    assert [f["source_name"] for f in plan["files"]] == ["100003 KC invoice to 2026.8.16.pdf"]
+    assert [o["file"] for o in plan["out_of_period"]] == ["Timesheet 2026.08.27.pdf"]
+
+
+def test_two_digit_year_first_is_read_as_this_year_not_2016():
+    """26.8.16 is 16 Aug 2026. Day-first would make it Aug 2016 and lose the file."""
+    assert mm.stated_dates("TCG Weekly Timesheet - Karen Crabb 26.8.16.pdf", 2026) == [
+        date(2026, 8, 16)]
+    assert mm.stated_dates("Invoice 15/08/26", 2026) == [date(2026, 8, 15)]
+    assert mm.stated_dates("Invoice 02-08-2026", 2026) == [date(2026, 8, 2)]
