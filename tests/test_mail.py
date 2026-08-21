@@ -214,17 +214,34 @@ def test_day_first_dates_still_read_day_first():
 
 
 def test_stated_period_beats_received_date():
-    """Sent inside the window, but the document says it covers a later fortnight."""
     assert mm.period_verdict("100003 KC invoice to 2026.8.16.pdf", date(2026, 8, 16)) == "in"
-    assert mm.period_verdict("Timesheet 2026.08.27.pdf", date(2026, 8, 16)) == "out"
+    assert mm.period_verdict("Timesheet 2026.08.30.pdf", date(2026, 8, 16)) == "out"
     assert mm.period_verdict("Timesheet.pdf", date(2026, 8, 16)) == "unknown"
 
 
 def test_a_later_fortnight_is_not_filed_into_this_one():
-    """Arrived in the window; states 27 Aug. Must not land in the 16 Aug folder."""
+    """States 30 Aug and was sent after it. Must not land in the 16 Aug folder."""
     msgs = [_m("karenmareecrabb@gmail.com", "Timesheet",
-               [{"id": "a", "name": "Timesheet 2026.08.27.pdf"}], "2026-08-19", "m1")]
+               [{"id": "a", "name": "Timesheet 2026.08.30.pdf"}], "2026-08-31", "m1")]
     assert mm.plan_filing(msgs, date(2026, 8, 16), ROSTER)["files"] == []
+
+
+def test_a_date_after_the_send_date_is_not_a_period():
+    """Karen Crabb, real email, 17 Aug 2026.
+
+    Two attachments, covering note says both are for the same billing period.
+    "2026.08.27" cannot be the period - nobody documents work they have not
+    done. Read as one, it threw her timesheet out of its own fortnight.
+    """
+    assert mm.period_verdict("Timesheet 2026.08.27.pdf", date(2026, 8, 16),
+                             not_after=date(2026, 8, 17)) == "unknown"
+    msgs = [_m("karenmareecrabb@gmail.com", "Karen Crabb - invoice",
+               [{"id": "a1", "name": "100003 KC invoice to 2026.8.16.pdf"},
+                {"id": "a2", "name": "Timesheet 2026.08.27.pdf"}],
+               "2026-08-17", "m1")]
+    plan = mm.plan_filing(msgs, date(2026, 8, 16), ROSTER)
+    assert len(plan["files"]) == 2
+    assert {f["kind"] for f in plan["files"]} == {"invoice", "timesheet"}
 
 
 def test_previous_fortnights_paperwork_is_excluded_by_its_stated_date():
@@ -240,14 +257,15 @@ def test_previous_fortnights_paperwork_is_excluded_by_its_stated_date():
 
 
 def test_one_message_can_straddle_two_fortnights():
-    """Judged per attachment: the 16 Aug invoice files, the 27 Aug timesheet does not."""
-    plan = mm.plan_filing([_msg(
+    """Judged per attachment: this fortnight's invoice files, the prior one does not."""
+    plan = mm.plan_filing([_m(
         "karenmareecrabb@gmail.com", "Karen Crabb",
         [{"id": "a1", "name": "100003 KC invoice to 2026.8.16.pdf"},
-         {"id": "a2", "name": "Timesheet 2026.08.27.pdf"}],
+         {"id": "a2", "name": "100003 KC invoice to 2026.8.2.pdf"}],
+        "2026-08-17", "m1",
     )], date(2026, 8, 16), ROSTER)
     assert [f["source_name"] for f in plan["files"]] == ["100003 KC invoice to 2026.8.16.pdf"]
-    assert [o["file"] for o in plan["out_of_period"]] == ["Timesheet 2026.08.27.pdf"]
+    assert [o["file"] for o in plan["out_of_period"]] == ["100003 KC invoice to 2026.8.2.pdf"]
 
 
 def test_two_digit_year_first_is_read_as_this_year_not_2016():
