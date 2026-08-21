@@ -274,3 +274,31 @@ def test_two_digit_year_first_is_read_as_this_year_not_2016():
         date(2026, 8, 16)]
     assert mm.stated_dates("Invoice 15/08/26", 2026) == [date(2026, 8, 15)]
     assert mm.stated_dates("Invoice 02-08-2026", 2026) == [date(2026, 8, 2)]
+
+
+def test_images_beside_a_real_invoice_are_timesheets():
+    """Don, Mudassir, Jay and Bilal all send one invoice document plus timesheet
+    images. The subject says "Invoice", which used to file the images as invoices."""
+    msgs = [_m("donvuong@mail.com", "Invoice - D&L Solutions P/L",
+               [{"id": "a1", "name": "Invoice#20260819.pdf"},
+                {"id": "a2", "name": "2026-08-08_00-24-42.png"},
+                {"id": "a3", "name": "2026-08-14_15-55-36.png", "isInline": True}],
+               "2026-08-19", "m1")]
+    plan = mm.plan_filing(msgs, date(2026, 8, 16), ROSTER)
+    kinds = sorted(f["kind"] for f in plan["files"])
+    assert kinds == ["invoice", "timesheet", "timesheet"], kinds
+
+
+def test_an_invoice_only_email_still_files_its_image_as_an_invoice():
+    """No invoice document present, subject says invoice - the image is the invoice."""
+    assert mm.classify("image.png", is_inline=True, subject="Bilal Virk - Invoice") == "invoice"
+    assert mm.classify("image.png", is_inline=True, subject="Bilal Virk - Invoice",
+                       has_document_invoice=True) == "timesheet"
+
+
+def test_an_hours_workbook_is_a_timesheet_even_when_named_invoice():
+    """Peter Small's backing sheet is 'Invoice_0024-HOURS.xlsx'."""
+    assert mm.classify("Peter Small_TecAlliance_(02-08-2026 to 15-08-2026) "
+                       "Invoice_0024-HOURS.xlsx") == "timesheet"
+    assert mm.classify("Peter Small_TecAlliance_(02-08-2026 to 15-08-2026) "
+                       "Invoice_0024.pdf") == "invoice"
