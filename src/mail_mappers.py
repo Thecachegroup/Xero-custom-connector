@@ -32,6 +32,12 @@ CONFIG_PATH = os.environ.get("TCG_CONTRACTOR_MAIL", "config/contractor_mail.json
 _INVOICE_HINTS = ("invoice", "inv", "tax invoice", "bill")
 _TIMESHEET_HINTS = ("timesheet", "time sheet", "hours", "ts")
 _EXPENSE_HINTS = ("expense", "receipt", "reimburse")
+# Onboarding paperwork. Arrives in the same mailbox but is NOT period paperwork -
+# a passport does not belong in a fortnight folder, and filing one there once
+# means it is copied forward every fortnight afterwards.
+_ADMIN_HINTS = ("passport", "banking", "bank detail", "super choice", "tfn",
+                "declaration", "contract", "handbook", "licence", "license",
+                "visa", "id ", "identification")
 
 
 def load_contractors(path: str | None = None) -> list[dict]:
@@ -81,6 +87,8 @@ def classify(filename: str, content_type: str = "", is_inline: bool = False,
     name = str(filename or "").lower()
     subj = str(subject or "").lower()
 
+    if any(h in name for h in _ADMIN_HINTS):
+        return "admin"
     if any(h in name for h in _INVOICE_HINTS):
         return "invoice"
     if any(h in name for h in _TIMESHEET_HINTS):
@@ -152,53 +160,127 @@ def in_scope(contractor: dict, cadence: str = "fortnightly") -> bool:
     return str(contractor.get("cadence", "fortnightly")).lower() == cadence.lower()
 
 
+def period_window(period_end: date | str, grace_days: int = 10) -> tuple[date, date]:
+    """Which messages belong to this fortnight.
+
+    THIS REPLACES A LIVE DEFECT. The first version searched a flat 45 days back,
+    which was meant to catch late senders but had no way to tell "sent late for
+    this fortnight" from "sent on time for the last one". A dry run for the
+    fortnight ending 16 Aug proposed filing four fortnights of Peter Small's
+    invoices - 21/06, 05/07, 19/07 and 02/08 - into the same folder.
+
+    The honest boundary is the PREVIOUS period end: anything received after the
+    last fortnight closed, up to a grace period past this one, belongs to this
+    fortnight. Someone sending three weeks late is now reported as missing
+    rather than silently filed against the wrong period, which is the right
+    failure - it is visible.
+    """
+    end = period_end if isinstance(period_end, date) else date.fromisoformat(str(period_end))
+    return end - timedelta(days=13), end + timedelta(days=grace_days)
+
+
 def plan_filing(messages: list[dict], period_end: date | str,
                 contractors: list[dict] | None = None,
-                cadence: str = "fortnightly") -> dict:
+                cadence: str = "fortnightly",
+                grace_days: int = 10,
+                file_admin: bool = False) -> dict:
     """Decide where every attachment goes, before anything is written.
 
-    Returns {"files": [...], "unmatched": [...], "missing": [...]}.
+    Returns {"files": [...], "unmatched": [...], "missing": [...],
+             "out_of_period": [...]}.
 
     Nothing is uploaded here. A dry plan can be shown to Andrew and checked
     against what he expects, which is the difference between a filing step he
     trusts and one he has to audit afterwards.
+
+    Two things this gets right that the first version did not:
+
+    PERIOD. Messages outside the fortnight's own window are excluded and
+    reported, not filed. See period_window().
+
+    PART NUMBERING. Parts run across the WHOLE plan per contractor and kind, not
+    per message. Numbering per message meant two emails each produced a
+    "_part1", both resolved to the same filename, and the skip-if-exists check
+    silently dropped the second. Different files must never collide on a name.
     """
     roster = contractors if contractors is not None else load_contractors()
     in_play = [c for c in roster if in_scope(c, cadence)]
-    files, unmatched, seen = [], [], set()
+    lo, hi = period_window(period_end, grace_days)
+
+    unmatched, out_of_period, seen = [], [], set()
+    staged: list[dict] = []
 
     for msg in messages:
         who = match_sender(msg.get("sender", ""), roster)
-        if not who or not in_scope(who, cadence):
-            if not who:
-                unmatched.append({
-                    "sender": _addr(msg.get("sender", "")),
-                    "subject": msg.get("subject", ""),
-                    "received": msg.get("received", ""),
-                    "reason": "no contractor matches this address",
-                })
+        if not who:
+            unmatched.append({
+                "sender": _addr(msg.get("sender", "")),
+                "subject": msg.get("subject", ""),
+                "received": msg.get("received", ""),
+                "reason": "no contractor matches this address",
+            })
+            continue
+        if not in_scope(who, cadence):
+            continue
+
+        recv = _as_date(msg.get("received"))
+        if recv and not (lo <= recv <= hi):
+            out_of_period.append({
+                "contractor": who["name"],
+                "subject": msg.get("subject", ""),
+                "received": recv.isoformat(),
+            })
             continue
 
         seen.add(who["name"])
-        atts = msg.get("attachments", []) or []
-        by_kind: dict[str, list[dict]] = {}
-        for a in atts:
-            k = classify(a.get("name", ""), a.get("contentType", ""),
-                         bool(a.get("isInline")), msg.get("subject", ""))
-            by_kind.setdefault(k, []).append(a)
+        for a in msg.get("attachments", []) or []:
+            kind = classify(a.get("name", ""), a.get("contentType", ""),
+                            bool(a.get("isInline")), msg.get("subject", ""))
+            if kind == "admin" and not file_admin:
+                continue
+            staged.append({
+                "contractor": who["name"], "item_code": who["item_code"],
+                "folder": who["folder"], "kind": kind,
+                "attachment_id": a.get("id"), "message_id": msg.get("id"),
+                "source_name": a.get("name", ""), "received": recv,
+                "_who": who,
+            })
 
-        for kind, group in by_kind.items():
-            for i, a in enumerate(group, start=1):
-                files.append({
-                    "contractor": who["name"],
-                    "item_code": who["item_code"],
-                    "kind": kind,
-                    "attachment_id": a.get("id"),
-                    "message_id": msg.get("id"),
-                    "source_name": a.get("name", ""),
-                    "path": target_path(who, kind, period_end, a.get("name", ""),
-                                        i, len(group)),
-                })
+    # Part numbers assigned ACROSS the whole plan, ordered by when they arrived,
+    # so two files can never resolve to the same name.
+    files = []
+    groups: dict[tuple, list[dict]] = {}
+    for item in staged:
+        groups.setdefault((item["contractor"], item["kind"]), []).append(item)
+
+    for (_c, kind), group in groups.items():
+        group.sort(key=lambda x: (x["received"] or date.min, x["source_name"]))
+        for i, item in enumerate(group, start=1):
+            files.append({
+                "contractor": item["contractor"],
+                "item_code": item["item_code"],
+                "kind": kind,
+                "attachment_id": item["attachment_id"],
+                "message_id": item["message_id"],
+                "source_name": item["source_name"],
+                "path": target_path(item["_who"], kind, period_end,
+                                    item["source_name"], i, len(group)),
+            })
 
     missing = [c["name"] for c in in_play if c["name"] not in seen]
-    return {"files": files, "unmatched": unmatched, "missing": sorted(missing)}
+    return {"files": sorted(files, key=lambda f: f["path"]),
+            "unmatched": unmatched,
+            "missing": sorted(missing),
+            "out_of_period": out_of_period}
+
+
+def _as_date(value) -> date | None:
+    if not value:
+        return None
+    if isinstance(value, date):
+        return value
+    txt = str(value)[:10]
+    try:
+        return date.fromisoformat(txt)
+    except ValueError:
+        return None

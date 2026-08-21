@@ -134,3 +134,61 @@ def test_monthly_contractors_are_out_of_scope_for_a_fortnightly_sweep():
     assert plan["files"] == []
     assert plan["unmatched"] == []          # recognised, just not this run
     assert "Deepti Bansal" not in plan["missing"]
+
+
+# --- period window and part numbering (defects found by the first dry run) ----
+
+def _m(sender, subject, atts, received, mid):
+    return {"id": mid, "sender": sender, "subject": subject,
+            "received": received, "attachments": atts}
+
+
+def test_previous_fortnights_are_excluded_not_filed():
+    """The first dry run proposed filing four fortnights of Peter Small's
+    invoices into the 16 Aug folder. Only the current one belongs."""
+    msgs = [
+        _m("pjs.ucanemailme@gmail.com", "Invoice 0021", [{"id": "a", "name": "Invoice_0021.pdf"}], "2026-07-05", "m1"),
+        _m("pjs.ucanemailme@gmail.com", "Invoice 0022", [{"id": "b", "name": "Invoice_0022.pdf"}], "2026-07-19", "m2"),
+        _m("pjs.ucanemailme@gmail.com", "Invoice 0023", [{"id": "c", "name": "Invoice_0023.pdf"}], "2026-08-02", "m3"),
+        _m("pjs.ucanemailme@gmail.com", "Invoice 0024", [{"id": "d", "name": "Invoice_0024.pdf"}], "2026-08-17", "m4"),
+    ]
+    plan = mm.plan_filing(msgs, date(2026, 8, 16), ROSTER)
+    assert len(plan["files"]) == 1
+    assert plan["files"][0]["source_name"] == "Invoice_0024.pdf"
+    assert len(plan["out_of_period"]) == 3
+
+
+def test_two_messages_never_collide_on_a_filename():
+    """Part numbers must run across the whole plan, not restart per message -
+    otherwise both resolve to _part1 and skip-if-exists drops one silently."""
+    msgs = [
+        _m("jachakkshitija@gmail.com", "Timesheets wk1",
+           [{"id": "a1", "name": "image.png", "isInline": True}], "2026-08-10", "m1"),
+        _m("jachakkshitija@gmail.com", "Timesheets wk2",
+           [{"id": "a2", "name": "image.png", "isInline": True}], "2026-08-17", "m2"),
+    ]
+    plan = mm.plan_filing(msgs, date(2026, 8, 16), ROSTER)
+    paths = [f["path"] for f in plan["files"]]
+    assert len(paths) == 2
+    assert len(set(paths)) == 2, f"filenames collided: {paths}"
+
+
+def test_onboarding_paperwork_is_not_filed_as_period_paperwork():
+    """A passport is not a timesheet and does not belong in a fortnight folder."""
+    assert mm.classify("KC passport.jpg") == "admin"
+    assert mm.classify("TCG Contractor Details and Banking Form - Karen Crabb.docx") == "admin"
+    plan = mm.plan_filing([_m("karenmareecrabb@gmail.com", "Docs",
+                              [{"id": "a", "name": "KC passport.jpg"}],
+                              "2026-08-17", "m1")], date(2026, 8, 16), ROSTER)
+    assert plan["files"] == []
+
+
+def test_don_vuong_now_resolves():
+    """He was reported as having sent nothing; his config entry had no address."""
+    assert mm.match_sender("donvuong@mail.com")["item_code"] == "Linfox - DV"
+
+
+def test_period_window_runs_from_the_previous_period_end():
+    lo, hi = mm.period_window(date(2026, 8, 16))
+    assert lo == date(2026, 8, 3)
+    assert hi == date(2026, 8, 26)

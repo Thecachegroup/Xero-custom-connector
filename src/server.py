@@ -451,6 +451,7 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
 
     msgs = g.messages("Payroll - TCG", since, end + timedelta(days=10))
     plan = mmap.plan_filing(msgs, end, cadence=cadence)
+    lo, hi = mmap.period_window(end)
 
     head = [
         f"Fortnight ending {end.isoformat()}  (period {mmap.period_start(end)} to {end})",
@@ -471,6 +472,12 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
             "Sent as": f["source_name"] or "(unnamed)",
             "Filed as": f["path"].rsplit("/", 1)[-1],
         } for f in rows]).to_markdown(index=False))
+
+    if plan.get("out_of_period"):
+        head += ["", f"OUTSIDE THIS FORTNIGHT ({len(plan['out_of_period'])}) - received "
+                     f"outside {lo} to {hi}, NOT filed:"]
+        for o in plan["out_of_period"][:15]:
+            head.append(f"  {o['received']}  {o['contractor']:<22} {o['subject'][:45]}")
 
     if plan["missing"]:
         head += ["", f"NOT SENT ANYTHING ({len(plan['missing'])}): "
@@ -502,6 +509,83 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
     for x in failed:
         head.append(f"  FAILED {x}")
     return "\n".join(head)
+
+
+@mcp.tool()
+def list_period_documents(period_end: str, window_days: int = 7) -> str:
+    """Every Xero sales invoice and bill for a fortnight, per contractor.
+
+    READ ONLY. Writes nothing, changes nothing.
+
+    This is the reconnaissance both write steps depend on: you cannot fill in a
+    draft invoice or attach a file to a bill without first knowing WHICH document
+    it is. Proving that lookup here - against real invoice IDs, in a tool that
+    cannot damage anything - is what stops the write tools guessing.
+
+    It also answers the question that matters most after a pay run: which
+    invoices are still sitting at zero units, i.e. work that has been paid for
+    but not yet billed to the client.
+
+    Args:
+        period_end: fortnight ending Sunday, YYYY-MM-DD
+        window_days: how far either side of period_end to look for documents
+            dated against this period. Invoices are dated the Monday after, so
+            the default of 7 catches them.
+    """
+    from datetime import timedelta
+    from . import mail_mappers as mmap
+
+    end = date.fromisoformat(period_end)
+    lo = (end - timedelta(days=window_days)).isoformat()
+    hi = (end + timedelta(days=window_days)).isoformat()
+    c = client()
+
+    roster = {r["item_code"]: r for r in mmap.load_contractors()}
+    rows, unmatched = [], []
+
+    for kind, xtype in (("Sales", "ACCREC"), ("Bill", "ACCPAY")):
+        for inv in c.iter_invoices(xtype, lo, hi):
+            for li in inv.get("LineItems", []) or []:
+                code = li.get("ItemCode") or ""
+                who = roster.get(code)
+                if not who and not code:
+                    continue
+                rows.append({
+                    "Contractor": who["name"] if who else f"(code {code})",
+                    "Kind": kind,
+                    "Status": inv.get("Status", ""),
+                    "Date": str(inv.get("DateString", inv.get("Date", "")))[:10],
+                    "Number": inv.get("InvoiceNumber", ""),
+                    "Units": li.get("Quantity", 0),
+                    "Amount": li.get("LineAmount", 0),
+                    "InvoiceID": inv.get("InvoiceID", ""),
+                })
+                if not who:
+                    unmatched.append(code)
+
+    if not rows:
+        return f"No sales invoices or bills dated {lo} to {hi}."
+
+    df = pd.DataFrame(rows).sort_values(["Contractor", "Kind", "Date"])
+    out = [f"Documents dated {lo} to {hi}  (fortnight ending {end})", ""]
+    out.append(df[["Contractor", "Kind", "Status", "Date", "Number",
+                   "Units", "Amount"]].to_markdown(index=False))
+
+    zero = df[(df["Units"].astype(float) == 0) & (df["Kind"] == "Sales")]
+    if not zero.empty:
+        out += ["", f"NOT YET BILLED - {len(zero)} sales line(s) still at zero units:"]
+        for _, r in zero.iterrows():
+            out.append(f"  {r['Contractor']:<24} {r['Number']:<12} {r['Status']}")
+        out.append("  Work has been paid for but the client has not been invoiced.")
+
+    if unmatched:
+        out += ["", "Item codes not in config/contractor_mail.json: "
+                    + ", ".join(sorted(set(unmatched)))]
+
+    out += ["", "InvoiceIDs (needed to attach files or fill a draft):"]
+    for _, r in df.iterrows():
+        out.append(f"  {r['Contractor']:<24} {r['Kind']:<6} {r['InvoiceID']}")
+    return "\n".join(out)
 
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"

@@ -18,22 +18,150 @@
     "timesheet alongside it."
   ],
   "contractors": [
-    {"name": "Devinia Liddelow",      "item_code": "Linfox - DL",    "folder": "Linfox_Devinia Liddelow",             "kind": "PAYG", "cadence": "fortnightly", "emails": ["devinia_liddelow@linfox.com"]},
-    {"name": "Dat Le",                "item_code": "Linfox - DTL",   "folder": "Linfox_Dat Le",                       "kind": "PAYG", "cadence": "fortnightly", "emails": ["dat_le@linfox.com"]},
-    {"name": "Kshitija Jachak",       "item_code": "Linfox - KBJ",   "folder": "Linfox_Kshitija Jachak",              "kind": "PAYG", "cadence": "fortnightly", "emails": ["jachakkshitija@gmail.com"]},
-    {"name": "Emily Kimmins",         "item_code": "Linfox - EK",    "folder": "Linfox_Emily Kimmins",                "kind": "PAYG", "cadence": "fortnightly", "emails": ["emily_kimmins@linfox.com", "emilykimmins@hotmail.com"]},
-
-    {"name": "Karen Crabb",           "item_code": "Linfox - KCrabb","folder": "Linfox_Karen Crabb",                  "kind": "ABN",  "cadence": "fortnightly", "emails": ["karenmareecrabb@gmail.com"]},
-    {"name": "Mudassir Ali",          "item_code": "Linfox - Mali",  "folder": "Linfox_Mudassir Ali",                 "kind": "ABN",  "cadence": "fortnightly", "emails": ["mudassirali27@outlook.com"]},
-    {"name": "Peter Small",           "item_code": "Tec - PS",       "folder": "Tec_Peter Small",                     "kind": "ABN",  "cadence": "fortnightly", "emails": ["pjs.ucanemailme@gmail.com"]},
-    {"name": "Jay Jhala",             "item_code": "Linfox - JJ",    "folder": "Linfox_Jay Jhala",                    "kind": "ABN",  "cadence": "fortnightly", "emails": ["jhalajay@gmail.com"]},
-    {"name": "Bilal Virk",            "item_code": "Linfox - BVIRK", "folder": "Linfox_Bilal Virk",                   "kind": "ABN",  "cadence": "fortnightly", "emails": ["techneitconsulting@gmail.com"]},
-    {"name": "Richa Arora",           "item_code": "Linfox - RAA",   "folder": "Linfox_Richa Arora",                  "kind": "ABN",  "cadence": "fortnightly", "emails": ["richaarora16@gmail.com"]},
-    {"name": "Don Vuong",             "item_code": "Linfox - DV",    "folder": "Linfox_Don Vuong",                    "kind": "ABN",  "cadence": "fortnightly", "emails": []},
-
-    {"name": "Deepti Bansal",         "item_code": "Linfox - DBL",   "folder": "Linfox_Deepati Bansal Monthly",       "kind": "ABN",  "cadence": "monthly",     "emails": ["bansal.deepti90@gmail.com"]},
-    {"name": "Bhasker Veela",         "item_code": "Linfox - BV",    "folder": "Linfox_Bhasker Veela Monthly",        "kind": "ABN",  "cadence": "monthly",     "emails": []},
-    {"name": "Prasanthi Dharanikota", "item_code": "Linfox - PD",    "folder": "Linfox_Prasanthi Dharanikota Monthly","kind": "ABN",  "cadence": "monthly",     "emails": []},
-    {"name": "Vivek Kumar Choudhary", "item_code": "Linfox - VKC",   "folder": "Linfox_Vivek Choudhary monthly",      "kind": "ABN",  "cadence": "monthly",     "emails": []}
+    {
+      "name": "Devinia Liddelow",
+      "item_code": "Linfox - DL",
+      "folder": "Linfox_Devinia Liddelow",
+      "kind": "PAYG",
+      "cadence": "fortnightly",
+      "emails": [
+        "devinia_liddelow@linfox.com"
+      ]
+    },
+    {
+      "name": "Dat Le",
+      "item_code": "Linfox - DTL",
+      "folder": "Linfox_Dat Le",
+      "kind": "PAYG",
+      "cadence": "fortnightly",
+      "emails": [
+        "dat_le@linfox.com"
+      ]
+    },
+    {
+      "name": "Kshitija Jachak",
+      "item_code": "Linfox - KBJ",
+      "folder": "Linfox_Kshitija Jachak",
+      "kind": "PAYG",
+      "cadence": "fortnightly",
+      "emails": [
+        "jachakkshitija@gmail.com"
+      ]
+    },
+    {
+      "name": "Emily Kimmins",
+      "item_code": "Linfox - EK",
+      "folder": "Linfox_Emily Kimmins",
+      "kind": "PAYG",
+      "cadence": "fortnightly",
+      "emails": [
+        "emily_kimmins@linfox.com",
+        "emilykimmins@hotmail.com"
+      ]
+    },
+    {
+      "name": "Karen Crabb",
+      "item_code": "Linfox - KCrabb",
+      "folder": "Linfox_Karen Crabb",
+      "kind": "ABN",
+      "cadence": "fortnightly",
+      "emails": [
+        "karenmareecrabb@gmail.com"
+      ]
+    },
+    {
+      "name": "Mudassir Ali",
+      "item_code": "Linfox - Mali",
+      "folder": "Linfox_Mudassir Ali",
+      "kind": "ABN",
+      "cadence": "fortnightly",
+      "emails": [
+        "mudassirali27@outlook.com"
+      ]
+    },
+    {
+      "name": "Peter Small",
+      "item_code": "Tec - PS",
+      "folder": "Tec_Peter Small",
+      "kind": "ABN",
+      "cadence": "fortnightly",
+      "emails": [
+        "pjs.ucanemailme@gmail.com"
+      ]
+    },
+    {
+      "name": "Jay Jhala",
+      "item_code": "Linfox - JJ",
+      "folder": "Linfox_Jay Jhala",
+      "kind": "ABN",
+      "cadence": "fortnightly",
+      "emails": [
+        "jhalajay@gmail.com"
+      ]
+    },
+    {
+      "name": "Bilal Virk",
+      "item_code": "Linfox - BVIRK",
+      "folder": "Linfox_Bilal Virk",
+      "kind": "ABN",
+      "cadence": "fortnightly",
+      "emails": [
+        "techneitconsulting@gmail.com"
+      ]
+    },
+    {
+      "name": "Richa Arora",
+      "item_code": "Linfox - RAA",
+      "folder": "Linfox_Richa Arora",
+      "kind": "ABN",
+      "cadence": "fortnightly",
+      "emails": [
+        "richaarora16@gmail.com"
+      ]
+    },
+    {
+      "name": "Don Vuong",
+      "item_code": "Linfox - DV",
+      "folder": "Linfox_Don Vuong",
+      "kind": "ABN",
+      "cadence": "fortnightly",
+      "emails": [
+        "donvuong@mail.com"
+      ]
+    },
+    {
+      "name": "Deepti Bansal",
+      "item_code": "Linfox - DBL",
+      "folder": "Linfox_Deepati Bansal Monthly",
+      "kind": "ABN",
+      "cadence": "monthly",
+      "emails": [
+        "bansal.deepti90@gmail.com"
+      ]
+    },
+    {
+      "name": "Bhasker Veela",
+      "item_code": "Linfox - BV",
+      "folder": "Linfox_Bhasker Veela Monthly",
+      "kind": "ABN",
+      "cadence": "monthly",
+      "emails": []
+    },
+    {
+      "name": "Prasanthi Dharanikota",
+      "item_code": "Linfox - PD",
+      "folder": "Linfox_Prasanthi Dharanikota Monthly",
+      "kind": "ABN",
+      "cadence": "monthly",
+      "emails": []
+    },
+    {
+      "name": "Vivek Kumar Choudhary",
+      "item_code": "Linfox - VKC",
+      "folder": "Linfox_Vivek Choudhary monthly",
+      "kind": "ABN",
+      "cadence": "monthly",
+      "emails": []
+    }
   ]
 }
