@@ -287,27 +287,31 @@ class GraphClient:
                    recursive: bool = False) -> list[dict]:
         """Everything filed under a folder. Returns Graph driveItems.
 
-        Each item gains a 'path' key relative to `root`, because the caller needs
-        to know which contractor folder a file came out of - the folder is what
-        identifies the person, not the filename.
+        Each item gains a 'path' key relative to RELATIVE_PATH - the folder that
+        was asked for - not to `root`. The caller needs to know which contractor
+        folder a file came out of, and the folder is what identifies the person;
+        the filename prefix is initials and two people can share those.
         """
         drive = self._drive_id()
 
-        def walk(rel: str) -> list[dict]:
+        def walk(rel: str, sub: str) -> list[dict]:
             path = f"{root}/{rel}".strip("/")
             url = f"{GRAPH}/drives/{drive}/root:/{quote(path)}:/children"
             out: list[dict] = []
             for it in self.get_all(url, {"$top": "200"}):
-                child_rel = f"{rel}/{it['name']}".strip("/")
-                if it.get("folder"):
+                child_sub = f"{sub}/{it['name']}".strip("/")
+                # Presence, not truthiness. Graph sends {"childCount": 0} for an
+                # empty folder, which is falsy - and an empty contractor folder is
+                # normal, so testing the value silently turns folders into files.
+                if "folder" in it:
                     if recursive:
-                        out += walk(child_rel)
+                        out += walk(f"{rel}/{it['name']}".strip("/"), child_sub)
                 else:
-                    it["path"] = child_rel
+                    it["path"] = child_sub
                     out.append(it)
             return out
 
-        return walk(relative_path)
+        return walk(relative_path, "")
 
     def download(self, relative_path: str, root: str = "Contractors/Timesheets") -> bytes:
         """Read a filed document back out of OneDrive."""

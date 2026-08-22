@@ -971,11 +971,16 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
         new_num = {n["InvoiceID"]: n["Now"] for n in num_changes}
 
         # The period reference is TCG's, so it goes on sales invoices only, and
-        # only on the ones this run is actually filling. An untouched draft -
-        # Saeid Almaher's, the empty expenses one - keeps whatever it had.
-        touched = {d["InvoiceID"] for d in to_write}
+        # on every draft for somebody in THIS period's list - not only the ones
+        # this pass happens to be filling. Filling and referencing are separate
+        # runs across a billing week: an invoice filled on Wednesday must still
+        # get its reference on Friday. Scoped by item code, so an untouched
+        # draft - a leaver's, the empty expenses one - keeps whatever it had.
+        in_scope = {d["InvoiceID"] for d in docs
+                    if any((li.get("ItemCode") or "").strip() in wanted
+                           for li in (d.get("LineItems") or []))}
         ref_changes = writes.plan_reference_change(
-            [d for d in docs if d.get("InvoiceID") in touched], ref
+            [d for d in docs if d.get("InvoiceID") in in_scope], ref
         ) if (kind == "ACCREC" and ref) else []
         rereferenced += ref_changes
         new_ref = {r["InvoiceID"]: r["Now"] for r in ref_changes}
