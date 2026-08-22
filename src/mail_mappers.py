@@ -132,8 +132,15 @@ def match_sender_or_forward(msg: dict, contractors: list[dict] | None = None,
     return None
 
 
+# An inline image smaller than this is a signature logo, a divider or a tracking
+# pixel, not a timesheet. Andrew's signature graphic is 5,496 bytes; the smallest
+# real PPM screenshot filed so far is 28,023.
+SIGNATURE_IMAGE_MAX_BYTES = 15_000
+
+
 def classify(filename: str, content_type: str = "", is_inline: bool = False,
-             subject: str = "", has_document_invoice: bool = False) -> str:
+             subject: str = "", has_document_invoice: bool = False,
+             size: int | None = None) -> str:
     """'invoice' | 'timesheet' | 'expense' | 'unknown'.
 
     Order matters. The filename is checked first because a named file is the
@@ -154,6 +161,14 @@ def classify(filename: str, content_type: str = "", is_inline: bool = False,
     """
     name = str(filename or "").lower()
     subj = str(subject or "").lower()
+
+    # Forwarding a message drags the forwarder's signature graphic along as an
+    # inline attachment. Filing it as a timesheet puts a company logo on an
+    # invoice as evidence of days worked.
+    if (is_inline and size is not None and size <= SIGNATURE_IMAGE_MAX_BYTES
+            and str(content_type or "").lower().startswith("image/")
+            and not any(h in name for h in _TIMESHEET_STRONG)):
+        return "signature"
 
     if any(h in name for h in _ADMIN_HINTS):
         return "admin"
@@ -281,7 +296,13 @@ def stated_dates(text: str, year_hint: int) -> list[date]:
         add(y, m, d)
     consumed = _ISO.sub(" ", t)
 
-    for a, m, b in _DMY.findall(consumed):
+    # Only spans that actually yield a plausible date are consumed. A span that
+    # is rejected must stay readable, because "3/8-14/8" is a RANGE - two dates
+    # in day/month form - and this pattern grabs "3/8-14" out of the middle of
+    # it. Blanking that span destroyed both real dates and left the whole thing
+    # unparseable; keeping it lets the day/month pass below read 3/8 and 14/8.
+    def _dmy(match: "re.Match") -> str:
+        a, m, b = match.group(1), match.group(2), match.group(3)
         lead = int(a)
         lead_year = 2000 + lead if lead < 100 else lead
         tail_year = 2000 + int(b) if int(b) < 100 else int(b)
@@ -292,9 +313,15 @@ def stated_dates(text: str, year_hint: int) -> list[date]:
         # which is not a wrong guess so much as a document lost.
         if tail_year != year_hint and lead_year == year_hint and int(b) <= 31:
             add(lead_year, m, b)
-        else:
-            add(tail_year, m, a)
-    consumed = _DMY.sub(" ", consumed)
+            return " "
+        # A year a decade away from the one being worked on is not a year. It is
+        # the middle of something else that happens to look like a date.
+        if abs(tail_year - year_hint) > 1:
+            return match.group(0)
+        add(tail_year, m, a)
+        return " "
+
+    consumed = _DMY.sub(_dmy, consumed)
 
     for d, mon in _D_MONTH.findall(consumed):
         add(year_hint, _MONTHS[mon.lower()[:3]], d)
@@ -437,7 +464,10 @@ def plan_filing(messages: list[dict], period_end: date | str,
         for a in msg.get("attachments", []) or []:
             kind = classify(a.get("name", ""), a.get("contentType", ""),
                             bool(a.get("isInline")), subject,
-                            has_document_invoice=has_doc_invoice)
+                            has_document_invoice=has_doc_invoice,
+                            size=a.get("size"))
+            if kind == "signature":
+                continue
             if kind == "admin" and not file_admin:
                 continue
 
