@@ -367,12 +367,31 @@ def get_contractor_ledger(contractor: str, fy: str = "current") -> str:
 
 
 @mcp.tool()
-def get_rate_card() -> str:
-    """The Xero item rate card: what each contractor should cost and sell for."""
+def get_rate_card(show_accounts: bool = False, contains: str = "") -> str:
+    """The Xero item rate card: what each contractor should cost and sell for.
+
+    SHOW_ACCOUNTS adds the general ledger codes each item posts to - the cost
+    account and the revenue account. Andrew codes contractor cost to 477 (PAYG
+    Contractors), and an item quietly pointing somewhere else puts the cost in
+    the wrong place on every invoice it touches.
+
+    CONTAINS filters to item codes or names containing that text, because the
+    full card runs to 200 lines.
+    """
     items = mappers.items_to_rows(client().items())
-    cols = ["*ItemCode", "ItemName", "PurchasesUnitPrice", "SalesUnitPrice", "Status"]
+    if contains:
+        needle = contains.strip().lower()
+        items = items[items["*ItemCode"].str.lower().str.contains(needle, na=False)
+                      | items["ItemName"].str.lower().str.contains(needle, na=False)]
+        if items.empty:
+            return f"No item matches {contains!r}."
     items["Margin"] = items["SalesUnitPrice"] - items["PurchasesUnitPrice"]
-    return items[cols + ["Margin"]].to_markdown(index=False)
+    cols = ["*ItemCode", "ItemName", "PurchasesUnitPrice", "SalesUnitPrice",
+            "Margin", "Status"]
+    if show_accounts:
+        cols = ["*ItemCode", "ItemName", "PurchasesUnitPrice", "PurchasesAccount",
+                "SalesUnitPrice", "SalesAccount", "Margin", "Status"]
+    return items[cols].to_markdown(index=False)
 
 
 # ------------------------------------------------------------ payroll mailbox
@@ -1302,10 +1321,20 @@ def list_payroll_setup() -> str:
     out = ["Payroll calendars:"]
     out += [f"  {x.get('Name')} ({x.get('CalendarType')}) -> {x.get('PayrollCalendarID')}"
             for x in cals]
-    out += ["", "Earnings rates:"]
-    out += [f"  {x.get('Name') or x.get('name')} "
-            f"[{x.get('RateType') or x.get('EarningsType') or ''}] -> "
-            f"{x.get('EarningsRateID') or x.get('earningsRateID')}" for x in rates]
+    out += ["", "Earnings rates  (GL account each one posts wages to):"]
+    for x in rates:
+        acct = (x.get("AccountCode") or x.get("accountCode")
+                or x.get("ExpenseAccountCode") or "")
+        out.append(
+            f"  {x.get('Name') or x.get('name')} "
+            f"[{x.get('RateType') or x.get('EarningsType') or ''}] "
+            f"account={acct or 'NOT SET'} -> "
+            f"{x.get('EarningsRateID') or x.get('earningsRateID')}")
+
+    # Everything the rate carries, once, so a field named differently than
+    # expected is visible rather than silently reported as NOT SET.
+    if rates:
+        out += ["", f"Fields on an earnings rate: {sorted(rates[0].keys())}"]
     return "\n".join(out)
 
 
