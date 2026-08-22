@@ -302,3 +302,57 @@ def test_an_hours_workbook_is_a_timesheet_even_when_named_invoice():
                        "Invoice_0024-HOURS.xlsx") == "timesheet"
     assert mm.classify("Peter Small_TecAlliance_(02-08-2026 to 15-08-2026) "
                        "Invoice_0024.pdf") == "invoice"
+
+
+# ------------------------------------------------------- forwards from our side
+
+FWD_BODY = """Regards
+
+Andrew Hurnard
+Director
+The Cache Group
+0417 037 451
+
+
+From: Karen Crabb <karenmareecrabb@gmail.com>
+Sent: Tuesday, 18 August 2026 4:43 AM
+To: Payroll - TCG <Payroll@thecachegroup.com.au>
+Cc: Andrew Hurnard <andrew.hurnard@thecachegroup.com.au>
+Subject: Karen Crabb - invoice
+"""
+OWN = ("thecachegroup.com.au",)
+
+
+def test_a_forward_from_us_resolves_to_the_original_sender():
+    msg = {"sender": "andrew.hurnard@thecachegroup.com.au", "body": FWD_BODY}
+    assert mm.match_sender_or_forward(msg, ROSTER, OWN)["name"] == "Karen Crabb"
+
+
+def test_the_body_is_only_consulted_for_our_own_addresses():
+    """A contractor's own message must never be attributed to someone named in it."""
+    msg = {"sender": "jhalajay@gmail.com", "body": FWD_BODY}
+    assert mm.match_sender_or_forward(msg, ROSTER, OWN)["name"] == "Jay Jhala"
+    stranger = {"sender": "someone@elsewhere.com", "body": FWD_BODY}
+    assert mm.match_sender_or_forward(stranger, ROSTER, OWN) is None
+
+
+def test_without_own_domains_nothing_is_read_out_of_a_body():
+    msg = {"sender": "andrew.hurnard@thecachegroup.com.au", "body": FWD_BODY}
+    assert mm.match_sender_or_forward(msg, ROSTER, ()) is None
+
+
+def test_forwarded_senders_reads_plain_and_angle_bracket_forms():
+    assert mm.forwarded_senders("From: Matt <Matt@thecachegroup.com.au>") == \
+        ["matt@thecachegroup.com.au"]
+    assert mm.forwarded_senders("From: donvuong@mail.com\nSent: today") == \
+        ["donvuong@mail.com"]
+    assert mm.forwarded_senders("no headers here") == []
+
+
+def test_a_forwarded_message_files_against_the_right_contractor():
+    msgs = [_m("andrew.hurnard@thecachegroup.com.au", "FW: Karen Crabb - invoice",
+               [{"id": "a", "name": "100003 KC invoice to 2026.8.16.pdf"}],
+               "2026-08-22", "m1")]
+    msgs[0]["body"] = FWD_BODY
+    plan = mm.plan_filing(msgs, date(2026, 8, 16), ROSTER, own_domains=OWN)
+    assert [f["contractor"] for f in plan["files"]] == ["Karen Crabb"]
