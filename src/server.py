@@ -390,7 +390,8 @@ def get_rate_card(show_accounts: bool = False, contains: str = "") -> str:
             "Margin", "Status"]
     if show_accounts:
         cols = ["*ItemCode", "ItemName", "PurchasesUnitPrice", "PurchasesAccount",
-                "SalesUnitPrice", "SalesAccount", "Margin", "Status"]
+                "SalesUnitPrice", "SalesAccount", "InventoryType", "Quantity",
+                "InventoryAssetAccount", "CostOfGoodsSoldAccount", "Status"]
     return items[cols].to_markdown(index=False)
 
 

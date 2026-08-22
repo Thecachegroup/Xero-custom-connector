@@ -274,8 +274,11 @@ def items_to_rows(items: list[dict]) -> pd.DataFrame:
             "SalesUnitPrice": sd.get("UnitPrice"),
             "SalesAccount": sd.get("AccountCode", ""),
             "SalesTaxRate": sd.get("TaxType", ""),
-            "InventoryAssetAccount": pd_.get("COGSAccountCode", ""),
-            "CostOfGoodsSoldAccount": it.get("InventoryAssetAccountCode", ""),
+            # These were crossed. Xero puts InventoryAssetAccountCode at the top
+            # level of the item and COGSAccountCode inside PurchaseDetails, so
+            # each column was reporting the other one's account.
+            "InventoryAssetAccount": it.get("InventoryAssetAccountCode", ""),
+            "CostOfGoodsSoldAccount": pd_.get("COGSAccountCode", ""),
             "Status": "Active" if it.get("IsSold") or it.get("IsPurchased") else "Inactive",
             "InventoryType": "Tracked" if it.get("IsTrackedAsInventory") else "Untracked",
         })
