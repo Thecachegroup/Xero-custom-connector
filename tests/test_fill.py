@@ -202,17 +202,46 @@ def _inv(num, lines, total=1000):
             "Contact": {"Name": "Linfox"}, "LineItems": lines, "Total": total}
 
 
-def test_only_a_filled_and_attached_invoice_is_submitted():
+ATT = {"i-TCG-1": {"ts.png"}, "i-TCG-2": set(), "i-TCG-3": {"x.pdf"}, "i-TCG-4": set()}
+
+
+def _four():
     filled = [{"Quantity": 10, "UnitAmount": 1406}]
-    docs = [_inv("TCG-1", filled), _inv("TCG-2", filled),
+    return [_inv("TCG-1", filled), _inv("TCG-2", filled),
             _inv("TCG-3", [{"Quantity": 0, "UnitAmount": 0}]), _inv("TCG-4", [])]
-    ready, held = w.plan_submission(docs, {"i-TCG-1": {"ts.png"}, "i-TCG-2": set(),
-                                           "i-TCG-3": {"x.pdf"}, "i-TCG-4": set()})
-    assert [r["Doc"] for r in ready] == ["TCG-1"]
+
+
+def test_an_empty_line_always_holds_an_invoice_back():
+    """The one test that never bends. An invoice billing nothing is not an invoice."""
+    ready, held = w.plan_submission(_four(), ATT)
     why = {h["Doc"]: h["Why"] for h in held}
-    assert why["TCG-2"] == "nothing attached"
     assert "still at zero" in why["TCG-3"]
     assert why["TCG-4"] == "no lines"
+    assert "TCG-3" not in [r["Doc"] for r in ready]
+
+
+def test_a_missing_document_does_not_hold_an_invoice_back():
+    """Andrew, 22 Aug 2026: a late timesheet must not delay the client's invoice."""
+    ready, _ = w.plan_submission(_four(), ATT)
+    assert sorted(r["Doc"] for r in ready) == ["TCG-1", "TCG-2"]
+    evidence = {r["Doc"]: r["Evidence"] for r in ready}
+    assert evidence["TCG-1"] == "attached"
+    assert evidence["TCG-2"] == "NONE YET", "going out bare must stay visible"
+
+
+def test_require_attachment_restores_the_stricter_rule():
+    ready, held = w.plan_submission(_four(), ATT, require_attachment=True)
+    assert [r["Doc"] for r in ready] == ["TCG-1"]
+    assert {h["Doc"]: h["Why"] for h in held}["TCG-2"] == "nothing attached"
+
+
+def test_word_layout_debris_is_never_a_timesheet():
+    """~WRD0000.jpg is 14,559 bytes - too near the size cutoff to trust size alone."""
+    from src import mail_mappers as mmx
+    assert mmx.classify("~WRD0000.jpg", "image/jpeg", True, "FW: Invoice",
+                        size=14559) == "signature"
+    assert mmx.classify("~WRD0000.jpg", "image/jpeg", True, "FW: Invoice",
+                        size=900000) == "signature"
 
 
 def test_status_changes_are_limited_to_draft_and_submitted():
