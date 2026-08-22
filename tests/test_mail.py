@@ -356,3 +356,47 @@ def test_a_forwarded_message_files_against_the_right_contractor():
     msgs[0]["body"] = FWD_BODY
     plan = mm.plan_filing(msgs, date(2026, 8, 16), ROSTER, own_domains=OWN)
     assert [f["contractor"] for f in plan["files"]] == ["Karen Crabb"]
+
+
+def test_a_date_range_is_two_dates_not_one_wrong_one():
+    """Devinia titles hers "Payroll - 3/8-14/8". The day-first pattern grabbed
+    "3/8-14" out of the middle and read it as August 2014, which threw her
+    timesheet out of its own fortnight."""
+    assert mm.stated_dates("FW: Payroll - 3/8-14/8", 2026) == [
+        date(2026, 8, 3), date(2026, 8, 14)]
+    assert mm.stated_dates("Payroll - 20/7-31/7", 2026) == [
+        date(2026, 7, 20), date(2026, 7, 31)]
+    assert mm.period_verdict("FW: Payroll - 3/8-14/8", date(2026, 8, 16)) == "in"
+
+
+def test_real_two_digit_years_still_read():
+    assert mm.stated_dates("Invoice 15/08/26", 2026) == [date(2026, 8, 15)]
+    assert mm.stated_dates("Invoice 16.8.2026", 2026) == [date(2026, 8, 16)]
+    assert mm.stated_dates("(02-08-2026 to 15-08-2026)", 2026) == [
+        date(2026, 8, 2), date(2026, 8, 15)]
+
+
+def test_a_forwarders_signature_graphic_is_not_a_timesheet():
+    """Andrew's signature logo is 5,496 bytes and rides along on every forward.
+    The smallest real PPM screenshot filed is 28,023."""
+    assert mm.classify("image001.png", "image/png", True,
+                       "FW: Karen Crabb - invoice", size=5496) == "signature"
+    assert mm.classify("image.png", "image/png", True,
+                       "Timesheets", size=95301) == "timesheet"
+    # no size known - behave as before rather than guess
+    assert mm.classify("image001.png", "image/png", True, "Timesheets") == "timesheet"
+
+
+def test_the_signature_is_dropped_from_the_plan():
+    msgs = [_m("andrew.hurnard@thecachegroup.com.au", "FW: Karen Crabb - invoice",
+               [{"id": "a1", "name": "100003 KC invoice to 2026.8.16.pdf",
+                 "contentType": "application/pdf", "size": 65343},
+                {"id": "a2", "name": "Timesheet 2026.08.27.pdf",
+                 "contentType": "application/pdf", "size": 422065},
+                {"id": "a3", "name": "image001.png", "contentType": "image/png",
+                 "isInline": True, "size": 5496}],
+               "2026-08-22", "m1")]
+    msgs[0]["body"] = FWD_BODY
+    plan = mm.plan_filing(msgs, date(2026, 8, 16), ROSTER, own_domains=OWN)
+    assert sorted(f["source_name"] for f in plan["files"]) == [
+        "100003 KC invoice to 2026.8.16.pdf", "Timesheet 2026.08.27.pdf"]
