@@ -230,3 +230,17 @@ def test_a_bill_with_no_item_code_is_matched_on_the_supplier_name():
                             "UnitAmount": 132}]}]
     got = w.plan_number_change(docs, {"That's Sparkling Clean": "SC-4471"})
     assert [(g["Was"], g["Now"]) for g in got] == [("53 North Rd", "SC-4471")]
+
+
+def test_the_reference_is_not_lost_when_the_days_were_filled_on_an_earlier_run():
+    """Filling and referencing happen on different days of the billing week.
+    Scoping the reference to 'what this pass filled' skipped every invoice."""
+    ref = "3 August to 16 August 2026"
+    already_filled = {"InvoiceID": "a", "InvoiceNumber": "TCG-21185", "Reference": "DL",
+                      "Contact": {"Name": "Linfox"},
+                      "LineItems": [{"ItemCode": "Linfox - DL", "Quantity": 10,
+                                     "UnitAmount": 1406}]}
+    planned, skipped, to_write = w.plan_line_fill([already_filled], {"Linfox - DL": 10},
+                                                  "stamp")
+    assert to_write == [], "nothing to fill - that is the situation under test"
+    assert w.plan_reference_change([already_filled], ref)[0]["Now"] == ref
