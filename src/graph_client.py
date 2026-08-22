@@ -282,3 +282,35 @@ class GraphClient:
             if e.response is not None and e.response.status_code == 404:
                 return False
             raise
+
+    def list_files(self, relative_path: str, root: str = "Contractors/Timesheets",
+                   recursive: bool = False) -> list[dict]:
+        """Everything filed under a folder. Returns Graph driveItems.
+
+        Each item gains a 'path' key relative to `root`, because the caller needs
+        to know which contractor folder a file came out of - the folder is what
+        identifies the person, not the filename.
+        """
+        drive = self._drive_id()
+
+        def walk(rel: str) -> list[dict]:
+            path = f"{root}/{rel}".strip("/")
+            url = f"{GRAPH}/drives/{drive}/root:/{quote(path)}:/children"
+            out: list[dict] = []
+            for it in self.get_all(url, {"$top": "200"}):
+                child_rel = f"{rel}/{it['name']}".strip("/")
+                if it.get("folder"):
+                    if recursive:
+                        out += walk(child_rel)
+                else:
+                    it["path"] = child_rel
+                    out.append(it)
+            return out
+
+        return walk(relative_path)
+
+    def download(self, relative_path: str, root: str = "Contractors/Timesheets") -> bytes:
+        """Read a filed document back out of OneDrive."""
+        path = f"{root}/{relative_path}".strip("/")
+        url = f"{GRAPH}/drives/{self._drive_id()}/root:/{quote(path)}:/content"
+        return self._request("GET", url).content

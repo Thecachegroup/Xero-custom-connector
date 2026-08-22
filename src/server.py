@@ -870,7 +870,8 @@ def list_period_drafts(period_end: str, window_days: int = 10) -> str:
 
 @mcp.tool()
 def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
-                       window_days: int = 10, kinds: str = "both") -> str:
+                       window_days: int = 10, kinds: str = "both",
+                       bill_numbers: str = "", reference: str = "auto") -> str:
     """Put the days worked onto the repeating drafts Xero has already generated.
 
     QUANTITIES is one 'item code: days' per line, e.g.
@@ -897,6 +898,20 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
       - The fortnight ending is appended to the description, once. A line that
         already carries it is not stamped again.
 
+    BILL_NUMBERS, optional, one 'item code: their invoice number' per line:
+
+        Linfox - BVIRK: INV-0016
+        Linfox - JJ: 20260802
+
+    Puts the contractor's OWN invoice number onto their bill, replacing the
+    placeholder the repeating template generates ("Inv", "JJ", "KCrabb"). Bills
+    only - a sales invoice number is TCG's and is never touched. A bill already
+    carrying the right number is left alone.
+
+    REFERENCE goes on the SALES invoices, in TCG's house format taken from the
+    invoices actually sent: "3 August to 16 August 2026". 'auto' derives it from
+    the period; a literal string overrides it; '' leaves references alone.
+
     KINDS: 'both' | 'sales' | 'bills'.
     """
     c = client()
@@ -911,11 +926,23 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
     if not wanted:
         return "No quantities given. Nothing to do."
 
+    ref = (writes.period_reference(end - timedelta(days=13), end)
+           if reference == "auto" else (reference or "").strip())
+
+    numbers: dict[str, str] = {}
+    for raw in str(bill_numbers or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        code, _, num = line.rpartition(":")
+        if code.strip() and num.strip():
+            numbers[code.strip()] = num.strip()
+
     types = {"both": ["ACCREC", "ACCPAY"], "sales": ["ACCREC"], "bills": ["ACCPAY"]}
     if kinds not in types:
         return "kinds must be 'both', 'sales' or 'bills'."
 
-    planned, skipped, errors = [], [], []
+    planned, skipped, errors, renumbered, rereferenced = [], [], [], [], []
     seen_codes: set[str] = set()
 
     for kind in types[kinds]:
@@ -936,30 +963,226 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
         planned += p_
         skipped += s_
 
+        # The contractor's own invoice number, on their bill only. A sales
+        # invoice number belongs to TCG and is never rewritten.
+        num_changes = writes.plan_number_change(docs, numbers) if (
+            kind == "ACCPAY" and numbers) else []
+        renumbered += num_changes
+        new_num = {n["InvoiceID"]: n["Now"] for n in num_changes}
+
+        # The period reference is TCG's, so it goes on sales invoices only, and
+        # only on the ones this run is actually filling. An untouched draft -
+        # Saeid Almaher's, the empty expenses one - keeps whatever it had.
+        touched = {d["InvoiceID"] for d in to_write}
+        ref_changes = writes.plan_reference_change(
+            [d for d in docs if d.get("InvoiceID") in touched], ref
+        ) if (kind == "ACCREC" and ref) else []
+        rereferenced += ref_changes
+        new_ref = {r["InvoiceID"]: r["Now"] for r in ref_changes}
+
+        by_id = {d["InvoiceID"]: d for d in to_write}
+        for inv_id in list(new_num) + list(new_ref):
+            by_id.setdefault(inv_id, {"InvoiceID": inv_id, "LineItems": None,
+                                      "InvoiceNumber": None})
+
         if not dry_run:
-            for doc in to_write:
+            for inv_id, doc in by_id.items():
                 try:
-                    writes.update_invoice_lines(c, doc["InvoiceID"], doc["LineItems"])
+                    writes.update_invoice(c, inv_id,
+                                          lines=doc.get("LineItems"),
+                                          invoice_number=new_num.get(inv_id),
+                                          reference=new_ref.get(inv_id))
                 except Exception as e:                             # noqa: BLE001
-                    errors.append(f"{label} {doc.get('InvoiceNumber')}: {e}")
+                    errors.append(f"{label} {doc.get('InvoiceNumber') or inv_id[:8]}: {e}")
 
     missing = sorted(set(wanted) - seen_codes)
 
     out = [f"Fortnight ending {end.isoformat()}   drafts dated {lo} to {hi}",
            "DRY RUN - nothing written." if dry_run else "WRITTEN to Xero. Still DRAFT - approve and send yourself.",
            ""]
+    if planned or renumbered:
+        pass
     if planned:
         df = pd.DataFrame(planned)
         out.append(df.to_markdown(index=False))
         out.append("")
         for k in df["Kind"].unique():
             out.append(f"{k} total: ${df[df['Kind'] == k]['Amount'].sum():,.2f}")
-    else:
+    elif not renumbered and not rereferenced:
         out.append("Nothing to fill - every matching line already has a quantity.")
+    if rereferenced:
+        out += ["", f'REFERENCE set to "{ref}" on:',
+                pd.DataFrame([{k: v for k, v in r.items() if k != "InvoiceID"}
+                              for r in rereferenced]).to_markdown(index=False)]
+    if renumbered:
+        out += ["", "BILL NUMBERS set to the contractor's own:",
+                pd.DataFrame([{k: v for k, v in n.items() if k != "InvoiceID"}
+                              for n in renumbered]).to_markdown(index=False)]
     if skipped:
         out += ["", "LEFT ALONE:", pd.DataFrame(skipped).to_markdown(index=False)]
     if missing:
         out += ["", "NO DRAFT FOUND for these item codes: " + ", ".join(missing)]
+    if errors:
+        out += ["", "ERRORS:"] + [f"  {e}" for e in errors]
+    return "\n".join(out)
+
+
+@mcp.tool()
+def attach_period_files(period_end: str, dry_run: bool = True,
+                        window_days: int = 10) -> str:
+    """Put the evidence onto the Xero records before Andrew reviews them.
+
+    TIMESHEET -> the SALES INVOICE, marked to travel with it when it is emailed,
+    so Linfox sees what they are being billed for without anyone attaching it by
+    hand.
+
+    THE CONTRACTOR'S OWN INVOICE -> their BILL, and it does NOT travel - it is
+    TCG's record of what they charged, not something to send back out.
+
+    Files come from Contractors/Timesheets/Fortnight  Ending DDMMYYYY/ and are
+    matched on the CONTAINING FOLDER, not the filename. The folder is
+    "<Client>_<Name>" and maps to exactly one item code; a filename prefix is
+    initials, and two people can share initials.
+
+    Safety:
+      - dry_run defaults True
+      - DRAFT documents only
+      - a file already attached under that name is SKIPPED. Xero does not reject
+        a duplicate filename, it stores a second copy - so without this check
+        every run of the billing week adds another copy of the same timesheet.
+
+    Needs the accounting.attachments scope. Without it Xero returns 401 and the
+    error will say so.
+    """
+    from . import mail_mappers as mmap
+    c = client()
+    g = _graph()
+    end = date.fromisoformat(period_end)
+    lo = (end - timedelta(days=window_days)).isoformat()
+    hi = (end + timedelta(days=window_days)).isoformat()
+    folder = mmap.fortnight_folder(end)
+
+    try:
+        files = g.list_files(folder, recursive=True)
+    except Exception as e:                                         # noqa: BLE001
+        return f"Could not read {folder}: {e}"
+    if not files:
+        return f"No files in {folder}. Run sweep_timesheets first."
+
+    folder_to_code = {ct["folder"]: ct["item_code"] for ct in mmap.load_contractors()}
+
+    sales, bills = {}, {}
+    for kind, bucket in (("ACCREC", sales), ("ACCPAY", bills)):
+        for d in c.iter_invoices(kind, lo, hi, statuses=["DRAFT"]):
+            for li in d.get("LineItems") or []:
+                code = (li.get("ItemCode") or "").strip()
+                if code:
+                    bucket.setdefault(code, d)
+
+    planned, unplaceable = writes.plan_attachments(files, folder_to_code, sales, bills)
+
+    already, todo, errors = [], [], []
+    seen_on: dict[str, set] = {}
+    for item in planned:
+        doc_id = item["InvoiceID"]
+        if doc_id not in seen_on:
+            seen_on[doc_id] = writes.existing_attachments(c, doc_id)
+        if item["File"].strip().lower() in seen_on[doc_id]:
+            already.append(item)
+        else:
+            todo.append(item)
+
+    if not dry_run:
+        done = []
+        for item in todo:
+            try:
+                content = g.download(f"{folder}/{item['Path']}")
+                writes._attach(c, "Invoices", item["InvoiceID"], item["File"],
+                               content, writes.content_type_for(item["File"]),
+                               include_online=item["IncludeOnline"])
+                done.append(item)
+            except Exception as e:                                 # noqa: BLE001
+                errors.append(f"{item['File']} -> {item['Doc']}: {e}")
+        todo = done
+
+    out = [f"Attachments for fortnight ending {end.isoformat()}",
+           f"Folder: Contractors/Timesheets/{folder}/",
+           "DRY RUN - nothing attached." if dry_run else "ATTACHED. Records still DRAFT.",
+           ""]
+    if todo:
+        cols = ["File", "Kind", "Onto", "Contact", "Doc", "IncludeOnline"]
+        out.append(pd.DataFrame(todo)[cols].to_markdown(index=False))
+    else:
+        out.append("Nothing to attach.")
+    if already:
+        out += ["", f"ALREADY ATTACHED, skipped ({len(already)}):",
+                pd.DataFrame(already)[["File", "Doc"]].to_markdown(index=False)]
+    if unplaceable:
+        out += ["", "COULD NOT PLACE:",
+                pd.DataFrame(unplaceable).to_markdown(index=False)]
+    if errors:
+        out += ["", "ERRORS:"] + [f"  {e}" for e in errors]
+    return "\n".join(out)
+
+
+@mcp.tool()
+def submit_period_invoices(period_end: str, dry_run: bool = True,
+                           window_days: int = 10) -> str:
+    """Move the finished sales invoices from Draft to Awaiting Approval.
+
+    The point is that Drafts becomes a to-do list. An invoice that is filled and
+    has its timesheet attached moves out by itself; anything still sitting in
+    Drafts on Saturday is something that did not come through - a contractor who
+    never sent a timesheet, an expenses invoice with nothing to pass through, a
+    leaver whose template is still firing.
+
+    An invoice is only submitted when BOTH are true:
+      - every line has a quantity
+      - something is attached to it
+
+    Submitting a half-finished invoice would defeat the whole point.
+
+    SALES INVOICES ONLY. Bills stay in draft - they are paid, not sent.
+    Approving and sending remains Andrew's; this only moves DRAFT -> SUBMITTED,
+    and he can move it back.
+    """
+    c = client()
+    end = date.fromisoformat(period_end)
+    lo = (end - timedelta(days=window_days)).isoformat()
+    hi = (end + timedelta(days=window_days)).isoformat()
+
+    docs = list(c.iter_invoices("ACCREC", lo, hi, statuses=["DRAFT"]))
+    if not docs:
+        return f"No draft sales invoices dated {lo} to {hi}."
+
+    att = {d["InvoiceID"]: writes.existing_attachments(c, d["InvoiceID"]) for d in docs}
+    ready, held = writes.plan_submission(docs, att)
+
+    errors = []
+    if not dry_run and ready:
+        done = []
+        for r in ready:
+            try:
+                writes.set_invoice_status(c, r["InvoiceID"], "SUBMITTED")
+                done.append(r)
+            except Exception as e:                                 # noqa: BLE001
+                errors.append(f"{r['Doc']}: {e}")
+        ready = done
+
+    out = [f"Sales invoices for fortnight ending {end.isoformat()}",
+           "DRY RUN - nothing moved." if dry_run else
+           "MOVED to Awaiting Approval. Approving and sending is still yours.",
+           ""]
+    if ready:
+        out += [f"READY ({len(ready)}):",
+                pd.DataFrame([{k: v for k, v in r.items() if k != "InvoiceID"}
+                              for r in ready]).to_markdown(index=False)]
+    else:
+        out.append("Nothing is ready to submit.")
+    if held:
+        out += ["", f"LEFT IN DRAFTS ({len(held)}) - these are the ones to look at:",
+                pd.DataFrame([{k: v for k, v in h.items() if k != "InvoiceID"}
+                              for h in held]).to_markdown(index=False)]
     if errors:
         out += ["", "ERRORS:"] + [f"  {e}" for e in errors]
     return "\n".join(out)
