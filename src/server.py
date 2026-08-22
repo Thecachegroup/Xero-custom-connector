@@ -840,6 +840,81 @@ def cash_and_receivables() -> str:
 
 
 @mcp.tool()
+def find_documents(contact: str, kind: str = "bills", months: int = 12,
+                   statuses: str = "", lines: bool = True, limit: int = 40) -> str:
+    """Every invoice or bill for one contact, whatever its status. Read-only.
+
+    This is the plain "what have we done with this supplier before" lookup, and
+    it exists because nothing else could answer it. `get_contractor_ledger` is
+    keyed on item code and line description, so anybody billed without an
+    inventory item - Matt O'Meara, the cleaner, anything coded straight to an
+    expense account - was invisible to it. That is not a small gap: the way you
+    handle someone this fortnight should follow what you did last fortnight, and
+    you cannot copy what you cannot see.
+
+    CONTACT is matched as a case-insensitive substring of the contact name.
+    KIND: 'bills' (ACCPAY) | 'sales' (ACCREC) | 'both'.
+    STATUSES: comma separated, e.g. "AUTHORISED,PAID". Blank means every status.
+    """
+    c = client()
+    today = date.today()
+    start = date(today.year - (months // 12 + 1), today.month, 1).isoformat()
+    want = [s.strip().upper() for s in statuses.split(",") if s.strip()] or \
+        ["DRAFT", "SUBMITTED", "AUTHORISED", "PAID", "VOIDED"]
+    kinds = {"bills": ["ACCPAY"], "sales": ["ACCREC"], "both": ["ACCPAY", "ACCREC"]}
+    if kind not in kinds:
+        return "kind must be 'bills', 'sales' or 'both'."
+
+    needle = contact.strip().lower()
+    found = []
+    for k in kinds[kind]:
+        for d in c.iter_invoices(k, start, today.isoformat(), statuses=want):
+            name = str((d.get("Contact") or {}).get("Name", ""))
+            if needle in name.lower():
+                found.append((k, d))
+
+    if not found:
+        return (f"Nothing for a contact matching {contact!r} in the last "
+                f"{months} months. Try fewer words, or months=36.")
+
+    found.sort(key=lambda x: mappers.parse_xero_date(x[1].get("Date")) or date.min)
+    found = found[-limit:]
+
+    out = [f"{len(found)} document(s) for a contact matching {contact!r}", ""]
+    rows = []
+    for k, d in found:
+        rows.append({
+            "Date": mappers.parse_xero_date(d.get("Date")),
+            "Type": "bill" if k == "ACCPAY" else "invoice",
+            "Number": d.get("InvoiceNumber") or "",
+            "Reference": d.get("Reference") or "",
+            "Status": d.get("Status", ""),
+            "Total": d.get("Total"),
+            "Due": d.get("AmountDue"),
+        })
+    out.append(pd.DataFrame(rows).to_markdown(index=False))
+
+    if lines:
+        out += ["", "LINES:"]
+        lrows = []
+        for k, d in found:
+            for li in d.get("LineItems") or []:
+                lrows.append({
+                    "Date": mappers.parse_xero_date(d.get("Date")),
+                    "Number": d.get("InvoiceNumber") or "",
+                    "Description": str(li.get("Description") or "")[:60],
+                    "Qty": li.get("Quantity"),
+                    "Unit": li.get("UnitAmount"),
+                    "Amount": li.get("LineAmount"),
+                    "Account": li.get("AccountCode") or "",
+                    "Tax": li.get("TaxType") or "",
+                })
+        if lrows:
+            out.append(pd.DataFrame(lrows).to_markdown(index=False))
+    return "\n".join(out)
+
+
+@mcp.tool()
 def list_period_drafts(period_end: str, window_days: int = 10) -> str:
     """Every DRAFT invoice and bill dated around a fortnight end, line by line.
 
@@ -1088,7 +1163,8 @@ def attach_period_files(period_end: str, dry_run: bool = True,
 
     Safety:
       - dry_run defaults True
-      - DRAFT documents only
+      - DRAFT, SUBMITTED and AUTHORISED - a late timesheet must still reach an
+        invoice that has already been sent. PAID and VOIDED are left alone.
       - a file already attached under that name is SKIPPED. Xero does not reject
         a duplicate filename, it stores a second copy - so without this check
         every run of the billing week adds another copy of the same timesheet.
@@ -1113,9 +1189,14 @@ def attach_period_files(period_end: str, dry_run: bool = True,
 
     folder_to_code = {ct["folder"]: ct["item_code"] for ct in mmap.load_contractors()}
 
+    # Not only drafts. A timesheet that turns up after the invoice has gone out
+    # still belongs on it - Andrew's rule is that the invoice does not wait for
+    # the evidence, so the evidence has to be able to catch up. Attaching to an
+    # authorised invoice changes no figure and does not resend it.
+    live = ["DRAFT", "SUBMITTED", "AUTHORISED"]
     sales, bills = {}, {}
     for kind, bucket in (("ACCREC", sales), ("ACCPAY", bills)):
-        for d in c.iter_invoices(kind, lo, hi, statuses=["DRAFT"]):
+        for d in c.iter_invoices(kind, lo, hi, statuses=live):
             for li in d.get("LineItems") or []:
                 code = (li.get("ItemCode") or "").strip()
                 if code:
@@ -1169,7 +1250,8 @@ def attach_period_files(period_end: str, dry_run: bool = True,
 
 @mcp.tool()
 def submit_period_invoices(period_end: str, dry_run: bool = True,
-                           window_days: int = 10, kinds: str = "both") -> str:
+                           window_days: int = 10, kinds: str = "both",
+                           require_attachment: bool = False) -> str:
     """Move the finished sales invoices from Draft to Awaiting Approval.
 
     The point is that Drafts becomes a to-do list. An invoice that is filled and
@@ -1178,11 +1260,16 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
     never sent a timesheet, an expenses invoice with nothing to pass through, a
     leaver whose template is still firing.
 
-    An invoice is only submitted when BOTH are true:
-      - every line has a quantity
-      - something is attached to it
+    An invoice is submitted when EVERY LINE HAS A QUANTITY. An invoice billing
+    nothing is not an invoice, and that test never bends.
 
-    Submitting a half-finished invoice would defeat the whole point.
+    A MISSING DOCUMENT NO LONGER HOLDS IT BACK. A contractor being late with a
+    timesheet should not delay the client's invoice - the client can see the
+    hours in their own system and rarely asks. The timesheet is attached when it
+    arrives, to whatever the invoice has become by then. Anything going out
+    without evidence is named in the report so it stays visible.
+
+    REQUIRE_ATTACHMENT=True restores the stricter rule.
 
     KINDS: 'both' | 'sales' | 'bills'. Bills move too, for the same reason - a
     bill with no supplier invoice behind it is one that has not been checked.
@@ -1207,7 +1294,7 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
             continue
         att = {d["InvoiceID"]: writes.existing_attachments(c, d["InvoiceID"])
                for d in docs}
-        r, h = writes.plan_submission(docs, att)
+        r, h = writes.plan_submission(docs, att, require_attachment)
         for row in r:
             row["Kind"] = label
         for row in h:
@@ -1233,12 +1320,19 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
            "DRY RUN - nothing moved." if dry_run else
            "MOVED to Awaiting Approval. Approving and sending is still yours.",
            ""]
+    bare = [r for r in ready if r.get("Evidence") == "NONE YET"]
     if ready:
         out += [f"READY ({len(ready)}):",
                 pd.DataFrame([{k: v for k, v in r.items() if k != "InvoiceID"}
                               for r in ready]).to_markdown(index=False)]
     else:
         out.append("Nothing is ready to submit.")
+    if bare:
+        out += ["", f"GOING OUT WITH NO DOCUMENT ATTACHED ({len(bare)}) - "
+                "attach it when it arrives:",
+                pd.DataFrame([{k: v for k, v in b.items()
+                               if k in ("Kind", "Doc", "Contact")} for b in bare]
+                             ).to_markdown(index=False)]
     if held:
         out += ["", f"LEFT IN DRAFTS ({len(held)}) - these are the ones to look at:",
                 pd.DataFrame([{k: v for k, v in h.items() if k != "InvoiceID"}

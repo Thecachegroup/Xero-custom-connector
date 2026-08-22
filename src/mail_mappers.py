@@ -165,6 +165,11 @@ def classify(filename: str, content_type: str = "", is_inline: bool = False,
     # Forwarding a message drags the forwarder's signature graphic along as an
     # inline attachment. Filing it as a timesheet puts a company logo on an
     # invoice as evidence of days worked.
+    # Word writes ~WRD0000.jpg into a forwarded message. It is layout debris and
+    # it is 14,559 bytes - close enough to the size cutoff that name-matching it
+    # is the safer test.
+    if name.startswith("~wrd") or name.startswith("~$"):
+        return "signature"
     if (is_inline and size is not None and size <= SIGNATURE_IMAGE_MAX_BYTES
             and str(content_type or "").lower().startswith("image/")
             and not any(h in name for h in _TIMESHEET_STRONG)):

@@ -552,14 +552,25 @@ def set_invoice_status(client, invoice_id: str, status: str) -> dict:
                  {"Invoices": [{"InvoiceID": invoice_id, "Status": status}]})
 
 
-def plan_submission(docs: list[dict], attachments_by_id: dict[str, set]) -> tuple[list[dict], list[dict]]:
+def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
+                    require_attachment: bool = False) -> tuple[list[dict], list[dict]]:
     """Which invoices are finished enough to submit, and why the rest are not.
 
-    An invoice is finished when every line has a quantity AND something is
-    attached to it. Submitting a half-finished invoice would defeat the whole
-    point - Drafts has to mean "not done".
+    A LINE WITH NO QUANTITY ALWAYS HOLDS IT BACK. That is the real test of
+    finished, and it is not negotiable - an invoice billing nothing is not an
+    invoice.
 
-    Returns (ready, held).
+    A MISSING DOCUMENT DOES NOT. Andrew's call, 22 Aug 2026: a contractor being
+    late with a timesheet should not hold up an invoice, because the client can
+    see the hours in their own system and usually never asks. The document is
+    attached later, when it turns up, to whatever the invoice has become by
+    then. Every invoice going out without one is named in the report, so "no
+    evidence yet" stays visible instead of becoming invisible.
+
+    REQUIRE_ATTACHMENT restores the stricter rule where it matters more.
+
+    Returns (ready, held). Rows carry Evidence so the caller can say which went
+    out bare.
     """
     ready: list[dict] = []
     held: list[dict] = []
@@ -575,8 +586,10 @@ def plan_submission(docs: list[dict], attachments_by_id: dict[str, set]) -> tupl
         if empty:
             held.append({**row, "Why": f"{len(empty)} line(s) still at zero"})
             continue
-        if not attachments_by_id.get(d.get("InvoiceID")):
+        has_doc = bool(attachments_by_id.get(d.get("InvoiceID")))
+        if require_attachment and not has_doc:
             held.append({**row, "Why": "nothing attached"})
             continue
-        ready.append({**row, "Total": d.get("Total") or d.get("SubTotal")})
+        ready.append({**row, "Total": d.get("Total") or d.get("SubTotal"),
+                      "Evidence": "attached" if has_doc else "NONE YET"})
     return ready, held
