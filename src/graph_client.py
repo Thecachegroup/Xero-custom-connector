@@ -201,7 +201,7 @@ class GraphClient:
         raw = self.get_all(
             f"{GRAPH}/users/{quote(self.mailbox)}/mailFolders/{fid}/messages",
             {"$filter": flt, "$top": "50", "$orderby": "receivedDateTime desc",
-             "$select": "id,subject,from,receivedDateTime,hasAttachments"},
+             "$select": "id,subject,from,receivedDateTime,hasAttachments,bodyPreview"},
         )
 
         out = []
@@ -211,6 +211,7 @@ class GraphClient:
                 "subject": m.get("subject", ""),
                 "sender": (m.get("from", {}).get("emailAddress", {}) or {}).get("address", ""),
                 "received": m.get("receivedDateTime", ""),
+                "body": m.get("bodyPreview", ""),
                 "attachments": self.attachments(m["id"]),
             })
         return out
@@ -318,3 +319,14 @@ class GraphClient:
         path = f"{root}/{relative_path}".strip("/")
         url = f"{GRAPH}/drives/{self._drive_id()}/root:/{quote(path)}:/content"
         return self._request("GET", url).content
+
+    def message_body(self, message_id: str) -> str:
+        """The full body of one message, for when bodyPreview is not enough.
+
+        Fetched per message and only when needed - a forward whose quoted header
+        block sits below a long signature. Selecting bodies for every message in
+        a 45-day sweep would multiply the payload for no benefit.
+        """
+        data = self.get(f"{GRAPH}/users/{quote(self.mailbox)}/messages/{message_id}",
+                        {"$select": "body"})
+        return str((data.get("body") or {}).get("content") or "")

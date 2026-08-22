@@ -470,7 +470,25 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
 
     _fid, folder_used = g.resolve_folder(g.folder)
     msgs = g.messages(g.folder, since, end + timedelta(days=10))
-    plan = mmap.plan_filing(msgs, end, cadence=cadence)
+
+    # Andrew forwards contractor mail into the payroll mailbox, which makes him
+    # the sender. bodyPreview usually carries the quoted "From:" line, but his
+    # signature can push it past 255 characters - so anything still unmatched
+    # after the preview gets its full body fetched, one message at a time.
+    own = tuple(d.strip().lower() for d in
+                os.environ.get("TCG_OWN_DOMAINS", "thecachegroup.com.au").split(",")
+                if d.strip())
+    for m in msgs:
+        if mmap.match_sender_or_forward(m, own_domains=own):
+            continue
+        addr = str(m.get("sender", "")).lower()
+        if any(addr.endswith("@" + d) for d in own):
+            try:
+                m["body"] = g.message_body(m["id"])
+            except Exception:                                      # noqa: BLE001
+                pass
+
+    plan = mmap.plan_filing(msgs, end, cadence=cadence, own_domains=own)
     lo, hi = mmap.period_window(end)
 
     head = [
@@ -1151,7 +1169,7 @@ def attach_period_files(period_end: str, dry_run: bool = True,
 
 @mcp.tool()
 def submit_period_invoices(period_end: str, dry_run: bool = True,
-                           window_days: int = 10) -> str:
+                           window_days: int = 10, kinds: str = "both") -> str:
     """Move the finished sales invoices from Draft to Awaiting Approval.
 
     The point is that Drafts becomes a to-do list. An invoice that is filled and
@@ -1166,21 +1184,39 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
 
     Submitting a half-finished invoice would defeat the whole point.
 
-    SALES INVOICES ONLY. Bills stay in draft - they are paid, not sent.
-    Approving and sending remains Andrew's; this only moves DRAFT -> SUBMITTED,
-    and he can move it back.
+    KINDS: 'both' | 'sales' | 'bills'. Bills move too, for the same reason - a
+    bill with no supplier invoice behind it is one that has not been checked.
+
+    Approving, paying and sending all remain Andrew's; this only moves
+    DRAFT -> SUBMITTED, and he can move it back.
     """
     c = client()
     end = date.fromisoformat(period_end)
     lo = (end - timedelta(days=window_days)).isoformat()
     hi = (end + timedelta(days=window_days)).isoformat()
 
-    docs = list(c.iter_invoices("ACCREC", lo, hi, statuses=["DRAFT"]))
-    if not docs:
-        return f"No draft sales invoices dated {lo} to {hi}."
+    types = {"both": [("ACCREC", "invoice"), ("ACCPAY", "bill")],
+             "sales": [("ACCREC", "invoice")], "bills": [("ACCPAY", "bill")]}
+    if kinds not in types:
+        return "kinds must be 'both', 'sales' or 'bills'."
 
-    att = {d["InvoiceID"]: writes.existing_attachments(c, d["InvoiceID"]) for d in docs}
-    ready, held = writes.plan_submission(docs, att)
+    ready, held = [], []
+    for kind, label in types[kinds]:
+        docs = list(c.iter_invoices(kind, lo, hi, statuses=["DRAFT"]))
+        if not docs:
+            continue
+        att = {d["InvoiceID"]: writes.existing_attachments(c, d["InvoiceID"])
+               for d in docs}
+        r, h = writes.plan_submission(docs, att)
+        for row in r:
+            row["Kind"] = label
+        for row in h:
+            row["Kind"] = label
+        ready += r
+        held += h
+
+    if not ready and not held:
+        return f"No draft documents dated {lo} to {hi}."
 
     errors = []
     if not dry_run and ready:
@@ -1193,7 +1229,7 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
                 errors.append(f"{r['Doc']}: {e}")
         ready = done
 
-    out = [f"Sales invoices for fortnight ending {end.isoformat()}",
+    out = [f"Fortnight ending {end.isoformat()}",
            "DRY RUN - nothing moved." if dry_run else
            "MOVED to Awaiting Approval. Approving and sending is still yours.",
            ""]

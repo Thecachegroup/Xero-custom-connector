@@ -84,6 +84,54 @@ def _generic_name(name: str) -> bool:
     return bool(re.fullmatch(r"(image|img|pasted[-_ ]?image)\d*\.\w+", n)) or n.startswith("tmp_")
 
 
+_FWD_FROM = re.compile(
+    r"^\s*(?:From|Sent by)\s*:\s*(?:[^<\n]*<\s*)?([\w.+-]+@[\w.-]+\.\w+)",
+    re.I | re.M)
+
+
+def forwarded_senders(text: str) -> list[str]:
+    """Addresses appearing on a 'From:' line inside a forwarded message.
+
+    Andrew forwards contractor mail into the payroll mailbox, which makes HIM
+    the sender and hides the contractor completely. The original sender is still
+    there, in the quoted header block Outlook writes into the body.
+
+    Order is preserved: the outermost forward comes first, so the first match is
+    the person who actually sent the thing being forwarded.
+    """
+    out: list[str] = []
+    for a in _FWD_FROM.findall(str(text or "")):
+        low = a.strip().lower()
+        if low not in out:
+            out.append(low)
+    return out
+
+
+def match_sender_or_forward(msg: dict, contractors: list[dict] | None = None,
+                            own_domains: tuple[str, ...] = ()) -> dict | None:
+    """The contractor this message is about, following one forward if needed.
+
+    The sender is tried first and always wins. Only when the sender is one of
+    OUR OWN addresses - a forward from Andrew or the payroll mailbox - is the
+    body consulted, because a contractor's own message must never be attributed
+    to somebody named inside it.
+    """
+    who = match_sender(msg.get("sender", ""), contractors)
+    if who:
+        return who
+
+    addr = _addr(msg.get("sender", ""))
+    domain = addr.rsplit("@", 1)[-1] if "@" in addr else ""
+    if not own_domains or domain not in {d.strip().lower() for d in own_domains}:
+        return None
+
+    for candidate in forwarded_senders(msg.get("body", "")):
+        who = match_sender(candidate, contractors)
+        if who:
+            return who
+    return None
+
+
 def classify(filename: str, content_type: str = "", is_inline: bool = False,
              subject: str = "", has_document_invoice: bool = False) -> str:
     """'invoice' | 'timesheet' | 'expense' | 'unknown'.
@@ -315,7 +363,8 @@ def plan_filing(messages: list[dict], period_end: date | str,
                 contractors: list[dict] | None = None,
                 cadence: str = "fortnightly",
                 grace_days: int = 10,
-                file_admin: bool = False) -> dict:
+                file_admin: bool = False,
+                own_domains: tuple[str, ...] = ()) -> dict:
     """Decide where every attachment goes, before anything is written.
 
     Returns {"files": [...], "unmatched": [...], "missing": [...],
@@ -343,7 +392,7 @@ def plan_filing(messages: list[dict], period_end: date | str,
     staged: list[dict] = []
 
     for msg in messages:
-        who = match_sender(msg.get("sender", ""), roster)
+        who = match_sender_or_forward(msg, roster, own_domains)
         if not who:
             unmatched.append({
                 "sender": _addr(msg.get("sender", "")),
