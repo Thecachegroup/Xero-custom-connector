@@ -48,6 +48,40 @@ def _guard() -> None:
         )
 
 
+def _xero_reason(resp) -> str:
+    """Pull the human-readable reason out of a Xero error response.
+
+    Xero puts the actual cause in Elements[*].ValidationErrors[*].Message, which
+    sits at the END of the echoed element. Truncating the raw body cuts it off
+    every time - which is how a rate-card rejection on 'Linfox - BV' went
+    undiagnosed on 25/08/2026. Surface the messages themselves and fall back to
+    the raw body only when the shape is not what we expect.
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        return f"Xero said: {resp.text[:1000]}"
+
+    msgs: list[str] = []
+    for el in data.get("Elements") or []:
+        for ve in el.get("ValidationErrors") or []:
+            m = (ve.get("Message") or "").strip()
+            if m:
+                msgs.append(m)
+        for w in el.get("Warnings") or []:
+            m = (w.get("Message") or "").strip()
+            if m:
+                msgs.append(f"(warning) {m}")
+
+    top = (data.get("Message") or "").strip()
+    if not msgs:
+        detail = (data.get("Detail") or "").strip()
+        return f"Xero said: {top or detail or str(data)[:1000]}"
+
+    joined = "; ".join(dict.fromkeys(msgs))
+    return f"Xero said: {joined}" + (f" [{top}]" if top else "")
+
+
 def _post(client, url: str, payload: dict) -> dict:
     """POST through the same rate limiter the read path uses."""
     client._limiter.acquire()
@@ -65,7 +99,7 @@ def _post(client, url: str, payload: dict) -> dict:
     if resp.status_code >= 400:
         raise RuntimeError(
             f"Xero rejected the write ({resp.status_code}). Nothing was changed. "
-            f"Xero said: {resp.text[:500]}"
+            f"{_xero_reason(resp)}"
         )
     return resp.json()
 
@@ -157,15 +191,42 @@ def update_item_rates(
     purchase_rate: float | None = None,
     sell_rate: float | None = None,
 ) -> dict:
-    """Update the cost and/or sell rate on one inventory item (the rate card)."""
+    """Update the cost and/or sell rate on one inventory item (the rate card).
+
+    Reads the item first and merges into its existing details blocks, rather
+    than posting a bare {"UnitPrice": x}. Xero validates an item update in
+    FULL: a partial SalesDetails or PurchaseDetails drops AccountCode,
+    COGSAccountCode and TaxType, and tracked inventory items are rejected with
+    a ValidationException. That is what blocked 'Linfox - BV' on 25/08/2026.
+    """
     _guard()
     if purchase_rate is None and sell_rate is None:
         raise ValueError("Give at least one of purchase_rate or sell_rate.")
-    item: dict = {"Code": item_code}
+
+    wanted = item_code.strip().lower()
+    existing = next(
+        (i for i in client.items()
+         if (i.get("Code") or "").strip().lower() == wanted),
+        None,
+    )
+    if existing is None:
+        raise RuntimeError(
+            f"No Xero item with code {item_code!r}. Check get_rate_card for the "
+            "exact code - they are case and space sensitive."
+        )
+
+    item: dict = {"ItemID": existing["ItemID"], "Code": existing["Code"]}
+
     if purchase_rate is not None:
-        item["PurchaseDetails"] = {"UnitPrice": round(float(purchase_rate), 4)}
+        details = dict(existing.get("PurchaseDetails") or {})
+        details["UnitPrice"] = round(float(purchase_rate), 4)
+        item["PurchaseDetails"] = details
+
     if sell_rate is not None:
-        item["SalesDetails"] = {"UnitPrice": round(float(sell_rate), 4)}
+        details = dict(existing.get("SalesDetails") or {})
+        details["UnitPrice"] = round(float(sell_rate), 4)
+        item["SalesDetails"] = details
+
     return _post(client, f"{API_BASE}/Items", {"Items": [item]})
 
 
