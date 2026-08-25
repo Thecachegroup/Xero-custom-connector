@@ -248,7 +248,27 @@ def update_item_rates(
         details["UnitPrice"] = round(float(sell_rate), 4)
         item["SalesDetails"] = details
 
-    return _post(client, f"{API_BASE}/Items", {"Items": [item]})
+    # Post to the SINGLE-ITEM endpoint, not the /Items collection. Xero
+    # validates a collection post as a full replace, which trips the tracked
+    # inventory guards on any item that has been invoiced.
+    url = f"{API_BASE}/Items/{existing['ItemID']}"
+    try:
+        return _post(client, url, {"Items": [item]})
+    except RuntimeError as exc:
+        blocked = ("tracked transactions" in str(exc)
+                   or "once item is tracked" in str(exc))
+        if not blocked:
+            raise
+        raise RuntimeError(
+            f"Xero will not change the rate on {existing['Code']!r} through the "
+            "API. It is a tracked inventory item with transactions against it, "
+            "and Xero locks those to the web UI. Nothing was changed.\n"
+            "Change it by hand: Business > Products and services > click "
+            f"{existing['Code']!r} > edit the price > Save.\n"
+            "This is a Xero restriction, not a connector fault - do not retry "
+            "and do not go looking for a payload fix. Confirmed 25/08/2026 "
+            "against both the /Items collection and the single-item endpoint."
+        ) from None
 
 
 def create_draft_invoice(
