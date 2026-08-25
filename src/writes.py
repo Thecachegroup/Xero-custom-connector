@@ -217,8 +217,29 @@ def update_item_rates(
 
     item: dict = {"ItemID": existing["ItemID"], "Code": existing["Code"]}
 
+    # Xero treats an Items POST as a FULL REPLACE, not a patch. On a tracked
+    # inventory item, omitting the tracking fields reads as "make this item
+    # untracked" - which Xero refuses outright once the item has transactions
+    # against it:
+    #   "Cannot change Inventory Asset Account once item is tracked."
+    #   "The item cannot be made un-tracked because it is associated with
+    #    tracked transactions"
+    # That is what blocked 'Linfox - BV' on 25/08/2026, while 'Linfox - BV
+    # oncall' - same shape, but never billed - updated fine. Re-send the
+    # tracking fields unchanged so the item stays exactly as it is.
+    if existing.get("IsTrackedAsInventory"):
+        item["IsTrackedAsInventory"] = True
+        if existing.get("InventoryAssetAccountCode"):
+            item["InventoryAssetAccountCode"] = existing["InventoryAssetAccountCode"]
+        # PurchaseDetails carries COGSAccountCode on a tracked item and has to
+        # travel with it, whether or not the cost rate is changing.
+        purchase = dict(existing.get("PurchaseDetails") or {})
+        if purchase:
+            item["PurchaseDetails"] = purchase
+
     if purchase_rate is not None:
-        details = dict(existing.get("PurchaseDetails") or {})
+        details = dict(item.get("PurchaseDetails")
+                       or existing.get("PurchaseDetails") or {})
         details["UnitPrice"] = round(float(purchase_rate), 4)
         item["PurchaseDetails"] = details
 
