@@ -15,7 +15,9 @@
     "",
     "cadence: fortnightly | monthly. Only fortnightly is swept today.",
     "kind: PAYG contractors send timesheets; ABN send an invoice, often with a",
-    "timesheet alongside it."
+    "timesheet alongside it.",
+    "",
+    "Jerry Gonsalves started 17/08/2026 and Mazher Ali 24/08/2026. Both were missed by the fortnight ending 30/08/2026 sweep because nobody added them here - which is the whole reason this file is scheduled for deletion in favour of matching the Xero roster by name."
   ],
   "contractors": [
     {
@@ -162,6 +164,27 @@
       "kind": "ABN",
       "cadence": "monthly",
       "emails": []
+    },
+    {
+      "name": "Jerry Gonsalves",
+      "item_code": "Linfox - JG",
+      "folder": "Linfox_Jerry Gonsalves",
+      "kind": "PAYG",
+      "cadence": "fortnightly",
+      "emails": [
+        "jerry_gonsalves@linfox.com",
+        "jerrygonsalves30@gmail.com"
+      ]
+    },
+    {
+      "name": "Mazher Ali",
+      "item_code": "Linfox - MAZ",
+      "folder": "Linfox_Mazher Ali",
+      "kind": "ABN",
+      "cadence": "fortnightly",
+      "emails": [
+        "mdmazherali@gmail.com"
+      ]
     }
   ]
 }

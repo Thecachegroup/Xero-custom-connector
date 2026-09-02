@@ -14,7 +14,9 @@ with contentBytes, so this reads them directly.
 AUTH. Client credentials (app-only). No user, no refresh token, nothing to go
 stale. Set in Vercel:
     GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET
-    TCG_PAYROLL_MAILBOX   default payroll@thecachegroup.com.au
+    TCG_PAYROLL_MAILBOX   the SHARED MAILBOX payrollmb@thecachegroup.com.au.
+                          payroll@ is a distribution group - it delivers INTO
+                          payrollmb@ but cannot itself be read or sent from.
     TCG_PAYROLL_FOLDER    default 'Payroll - TCG'; falls back to Inbox if absent
     TCG_FILES_OWNER       the mailbox whose OneDrive holds Contractors/
 
@@ -330,3 +332,24 @@ class GraphClient:
         data = self.get(f"{GRAPH}/users/{quote(self.mailbox)}/messages/{message_id}",
                         {"$select": "body"})
         return str((data.get("body") or {}).get("content") or "")
+
+    def message_mime(self, message_id: str) -> bytes:
+        """The whole message as RFC-822 bytes, for a timesheet that IS the email.
+
+        Devinia Liddelow types her hours into the body as a table and attaches
+        nothing at all. There is no file to download, so the message itself is
+        the document - saved verbatim, exactly as she sent it, rather than
+        retyped into a PDF by us. Andrew: "if I just save the file, it is
+        exactly what the person has sent me."
+        """
+        resp = self._request(
+            "GET",
+            f"{GRAPH}/users/{quote(self.mailbox)}/messages/{message_id}/$value",
+            headers={"Accept": "*/*"},
+        )
+        if not resp.content:
+            raise RuntimeError(
+                f"Message {message_id} returned no MIME content. "
+                "Nothing has been written."
+            )
+        return resp.content

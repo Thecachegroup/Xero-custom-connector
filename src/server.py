@@ -499,7 +499,7 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
         "",
     ]
 
-    if not plan["files"]:
+    if not plan["files"] and not plan.get("body_only"):
         head.append("Nothing to file.")
     else:
         head.append(f"{'DRY RUN - nothing written' if dry_run else 'FILING'}: "
@@ -511,6 +511,14 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
             "Sent as": f["source_name"] or "(unnamed)",
             "Filed as": f["path"].rsplit("/", 1)[-1],
         } for f in rows]).to_markdown(index=False))
+
+    if plan.get("body_only"):
+        head += ["", f"TIMESHEET IS IN THE EMAIL BODY ({len(plan['body_only'])}) - no "
+                     "attachment to file, so the message itself is saved as .eml.",
+                 "READ IT AND KEY THE DAYS BY HAND - nothing here counts the days:"]
+        for b in plan["body_only"]:
+            head.append(f"  {b['received'][:10]}  {b['contractor']:<22} "
+                        f"{str(b['subject'])[:40]:<42} -> {b['path'].rsplit('/', 1)[-1]}")
 
     if plan.get("out_of_period"):
         head += ["", f"OUTSIDE THIS FORTNIGHT ({len(plan['out_of_period'])}) - received "
@@ -529,6 +537,10 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
 
     if dry_run:
         head += ["", "Nothing was written. Re-run with dry_run=False to file these."]
+        if plan["missing"]:
+            head.append("Before trusting NOT SENT ANYTHING: search the mailbox by "
+                        "surname. A matched sender with no attachment now shows "
+                        "above, but an UNMATCHED address never will.")
         return "\n".join(head)
 
     written, skipped, failed = [], [], []
@@ -542,6 +554,16 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
             written.append(f["path"])
         except Exception as e:                                # noqa: BLE001
             failed.append(f"{f['path']}: {e}")
+
+    for b in plan.get("body_only", []):
+        try:
+            if g.exists(b["path"]):
+                skipped.append(b["path"])
+                continue
+            g.upload(b["path"], g.message_mime(b["message_id"]))
+            written.append(b["path"])
+        except Exception as e:                                # noqa: BLE001
+            failed.append(f"{b['path']}: {e}")
 
     head += ["", f"Written: {len(written)}   Already there: {len(skipped)}   "
                  f"Failed: {len(failed)}"]

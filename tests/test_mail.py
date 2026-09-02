@@ -400,3 +400,96 @@ def test_the_signature_is_dropped_from_the_plan():
     plan = mm.plan_filing(msgs, date(2026, 8, 16), ROSTER, own_domains=OWN)
     assert sorted(f["source_name"] for f in plan["files"]) == [
         "100003 KC invoice to 2026.8.16.pdf", "Timesheet 2026.08.27.pdf"]
+
+
+# ------------------------------------------------- body-only timesheets
+# Devinia Liddelow types her hours into the email as a table and attaches
+# nothing. Before this, plan_filing had no entry for her at all and she came
+# back under "missing" - identical to someone who never wrote. The fortnight
+# ending 30 August 2026 nearly went out without her.
+
+DEVINIA_BODY_ONLY = {
+    "id": "m-devinia-1",
+    "subject": "Re: Payroll - 17/8-28/8",
+    "sender": "Devinia_Liddelow@linfox.com",
+    "received": "2026-09-01T09:49:00Z",
+    "attachments": [],
+}
+
+
+def test_a_body_only_message_is_not_reported_as_missing():
+    plan = mm.plan_filing([DEVINIA_BODY_ONLY], date(2026, 8, 30))
+    assert "Devinia Liddelow" not in plan["missing"]
+
+
+def test_a_body_only_message_is_saved_as_eml_in_her_own_folder():
+    plan = mm.plan_filing([DEVINIA_BODY_ONLY], date(2026, 8, 30))
+    assert len(plan["body_only"]) == 1
+    entry = plan["body_only"][0]
+    assert entry["contractor"] == "Devinia Liddelow"
+    assert entry["message_id"] == "m-devinia-1"
+    assert entry["path"] == (
+        "Fortnight  Ending 30082026/Linfox_Devinia Liddelow/"
+        "DL_timesheet_2026-08-30.eml"
+    )
+
+
+def test_a_body_only_message_produces_no_attachment_files():
+    """It is a message, not a file. Nothing goes through attachment_bytes."""
+    plan = mm.plan_filing([DEVINIA_BODY_ONLY], date(2026, 8, 30))
+    assert plan["files"] == []
+
+
+def test_a_message_that_carried_a_document_is_never_body_only():
+    msg = dict(DEVINIA_BODY_ONLY, attachments=[
+        {"id": "a1", "name": "image001.png", "contentType": "image/png",
+         "isInline": True, "size": 95040},
+    ])
+    plan = mm.plan_filing([msg], date(2026, 8, 30))
+    assert plan["body_only"] == []
+    assert len(plan["files"]) == 1
+
+
+def test_a_signature_graphic_alone_still_counts_as_body_only():
+    """A logo dragged along by a forward is not a document."""
+    msg = dict(DEVINIA_BODY_ONLY, attachments=[
+        {"id": "a1", "name": "image9.png", "contentType": "image/png",
+         "isInline": True, "size": 1200},
+    ])
+    plan = mm.plan_filing([msg], date(2026, 8, 30))
+    assert len(plan["body_only"]) == 1
+    assert plan["files"] == []
+
+
+def test_a_body_only_message_from_another_fortnight_is_left_alone():
+    msg = dict(DEVINIA_BODY_ONLY, subject="Payroll - 3/8-14/8",
+               received="2026-08-17T09:00:00Z")
+    plan = mm.plan_filing([msg], date(2026, 8, 30))
+    assert plan["body_only"] == []
+    assert "Devinia Liddelow" in plan["missing"]
+
+
+def test_two_body_only_messages_from_one_person_do_not_collide():
+    a = dict(DEVINIA_BODY_ONLY, id="m1", received="2026-08-28T09:00:00Z")
+    b = dict(DEVINIA_BODY_ONLY, id="m2", received="2026-09-01T09:49:00Z")
+    plan = mm.plan_filing([a, b], date(2026, 8, 30))
+    paths = [e["path"] for e in plan["body_only"]]
+    assert len(paths) == len(set(paths)) == 2
+    assert all("_part" in p for p in paths)
+
+
+# ------------------------------------------------- the two new starters
+
+def test_jerry_gonsalves_is_on_the_roster():
+    """Started 17/08/2026. Sends an inline image from his Linfox address."""
+    who = mm.match_sender("Jerry_Gonsalves@linfox.com")
+    assert who is not None and who["item_code"] == "Linfox - JG"
+    assert who["folder"] == "Linfox_Jerry Gonsalves"
+
+
+def test_mazher_ali_is_on_the_roster_and_is_not_mudassir():
+    maz = mm.match_sender("mdmazherali@gmail.com")
+    mud = mm.match_sender("mudassirali27@outlook.com")
+    assert maz["item_code"] == "Linfox - MAZ"
+    assert mud["item_code"] == "Linfox - Mali"
+    assert maz["folder"] != mud["folder"]

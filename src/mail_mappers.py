@@ -400,7 +400,7 @@ def plan_filing(messages: list[dict], period_end: date | str,
     """Decide where every attachment goes, before anything is written.
 
     Returns {"files": [...], "unmatched": [...], "missing": [...],
-             "out_of_period": [...]}.
+             "out_of_period": [...], "body_only": [...]}.
 
     Nothing is uploaded here. A dry plan can be shown to Andrew and checked
     against what he expects, which is the difference between a filing step he
@@ -415,6 +415,16 @@ def plan_filing(messages: list[dict], period_end: date | str,
     per message. Numbering per message meant two emails each produced a
     "_part1", both resolved to the same filename, and the skip-if-exists check
     silently dropped the second. Different files must never collide on a name.
+
+    BODY-ONLY TIMESHEETS. The unit of work here is an attachment, so a person
+    who types their hours into the email and attaches nothing produced no plan
+    entry at all and fell through to "missing" - indistinguishable from someone
+    who never wrote. That is how Devinia Liddelow was reported as having sent
+    nothing for the fortnight ending 30 August 2026 when her timesheet had been
+    sitting in the mailbox since the Tuesday. Those messages now come back under
+    "body_only": the message itself is saved as .eml and the person counts as
+    having sent. The days still have to be read by a human - which is the
+    honest outcome, and a long way better than silence.
     """
     roster = contractors if contractors is not None else load_contractors()
     in_play = [c for c in roster if in_scope(c, cadence)]
@@ -422,6 +432,7 @@ def plan_filing(messages: list[dict], period_end: date | str,
 
     unmatched, out_of_period, seen = [], [], set()
     staged: list[dict] = []
+    body_staged: list[dict] = []
 
     for msg in messages:
         who = match_sender_or_forward(msg, roster, own_domains)
@@ -466,6 +477,7 @@ def plan_filing(messages: list[dict], period_end: date | str,
         )
 
         filed_any = False
+        saw_attachment = False
         for a in msg.get("attachments", []) or []:
             kind = classify(a.get("name", ""), a.get("contentType", ""),
                             bool(a.get("isInline")), subject,
@@ -473,6 +485,10 @@ def plan_filing(messages: list[dict], period_end: date | str,
                             size=a.get("size"))
             if kind == "signature":
                 continue
+            # Counted before the admin and period filters. A message that
+            # carried a document is not a body-only timesheet, whatever we
+            # decided to do with that document.
+            saw_attachment = True
             if kind == "admin" and not file_admin:
                 continue
 
@@ -505,6 +521,16 @@ def plan_filing(messages: list[dict], period_end: date | str,
         if filed_any:
             seen.add(who["name"])
 
+        # Nothing attached but the signature block, and the message belongs to
+        # this fortnight: the timesheet is the email. Save it whole.
+        if not saw_attachment and msg_verdict == "in":
+            body_staged.append({
+                "contractor": who["name"], "item_code": who["item_code"],
+                "folder": who["folder"], "message_id": msg.get("id"),
+                "subject": subject, "received": recv, "_who": who,
+            })
+            seen.add(who["name"])
+
     # Part numbers assigned ACROSS the whole plan, ordered by when they arrived,
     # so two files can never resolve to the same name.
     files = []
@@ -526,11 +552,32 @@ def plan_filing(messages: list[dict], period_end: date | str,
                                     item["source_name"], i, len(group)),
             })
 
+    # Same part-numbering rule as the attachments: across the whole plan, per
+    # contractor, so two body-only emails from one person cannot collide.
+    body_only: list[dict] = []
+    bgroups: dict[str, list[dict]] = {}
+    for item in body_staged:
+        bgroups.setdefault(item["contractor"], []).append(item)
+    for _c, group in bgroups.items():
+        group.sort(key=lambda x: (x["received"] or date.min, str(x["message_id"] or "")))
+        for i, item in enumerate(group, start=1):
+            body_only.append({
+                "contractor": item["contractor"],
+                "item_code": item["item_code"],
+                "kind": "timesheet",
+                "message_id": item["message_id"],
+                "subject": item["subject"],
+                "received": item["received"].isoformat() if item["received"] else "",
+                "path": target_path(item["_who"], "timesheet", period_end,
+                                    "message.eml", i, len(group)),
+            })
+
     missing = [c["name"] for c in in_play if c["name"] not in seen]
     return {"files": sorted(files, key=lambda f: f["path"]),
             "unmatched": unmatched,
             "missing": sorted(missing),
-            "out_of_period": out_of_period}
+            "out_of_period": out_of_period,
+            "body_only": sorted(body_only, key=lambda f: f["path"])}
 
 
 def _as_date(value) -> date | None:
