@@ -403,6 +403,82 @@ def _graph():
     return GraphClient()
 
 
+def _live_roster() -> tuple[list[dict], list[dict], list[dict]]:
+    """(roster, gaps, duplicate items) straight from Xero.
+
+    The roster is derived, never listed. Anyone set up to be paid is on it the
+    moment they are set up, and a leaver drops off when their template stops -
+    which is the whole point, because the old config file needed a commit and a
+    redeploy every time somebody joined and did not get one.
+    """
+    import pandas as pd
+    from . import roster as rst
+
+    c = client()
+    items = c.items()
+    employees = c.employees()
+    repeating = c.repeating_invoices()
+
+    idf = pd.DataFrame([{"*ItemCode": i.get("Code"), "Name": i.get("Name")}
+                        for i in items])
+    resolve = mappers.build_employee_code_map(idf)["_resolve"] if not idf.empty \
+        else (lambda _n: None)
+
+    people = rst.build(items, employees, repeating,
+                       contacts=None, resolve_employee=resolve)
+    return people, rst.gaps(items, people), rst.duplicates(items)
+
+
+@mcp.tool()
+def roster_diagnostics() -> str:
+    """Who the sweep thinks is on the roster, and why - before it matters.
+
+    READ ONLY. Run this after deploying, and any time somebody joins or leaves,
+    to see the roster Xero produces without waiting for a sweep to act on it.
+
+    Three things it answers. WHO is on it, with the addresses that will be
+    matched. WHO IS SET UP BUT CANNOT BE BILLED - an active inventory item with
+    no payroll record and no repeating bill, which is exactly how Mazher Ali
+    worked five days in the fortnight ending 30 August 2026 with no invoice
+    behind him. And WHICH PEOPLE CARRY MORE THAN ONE LIVE ITEM, usually an old
+    one at a stale rate that somebody can still bill off.
+    """
+    people, gaps_, dupes = _live_roster()
+
+    lines = [f"Roster built from Xero: {len(people)} people", ""]
+    rows = [{
+        "Name": p["name"], "Item": p["item_code"], "Kind": p["kind"],
+        "Cadence": p["cadence"], "Folder": p["folder"],
+        "Addresses on file": ", ".join(p["emails"]) or "(none - matched by name)",
+    } for p in people]
+    lines.append(pd.DataFrame(rows).to_markdown(index=False))
+
+    lines += ["", "An address is not required. Nine of ten contractor addresses",
+              "carry the person's own name and are read directly; the tenth",
+              "carries their Xero contact name.", ""]
+
+    if gaps_:
+        lines += [f"SET UP BUT CANNOT BE BILLED ({len(gaps_)}) - active item, no "
+                  "payroll record and no repeating bill. Their work raises no "
+                  "draft and nobody is chased for a timesheet:"]
+        for g_ in gaps_:
+            lines.append(f"  {g_['item_code']:<24} {g_['name']}")
+        lines.append("")
+
+    if dupes:
+        lines += [f"MORE THAN ONE LIVE ITEM ({len(dupes)}) - check the rate on "
+                  "each, and archive or delete the ones nobody should bill:"]
+        for d in dupes:
+            lines.append(f"  {d['name']:<24} {', '.join(d['item_codes'])}")
+        lines.append("")
+
+    lines.append("config/roster_overrides.json holds only what Xero cannot know "
+                 "- folder names that do not match the person, the monthly "
+                 "cadence, and extra personal addresses. Nobody needs an entry "
+                 "there to be found.")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def graph_diagnostics() -> str:
     """Prove the Microsoft connection works before trusting anything built on it.
@@ -489,12 +565,16 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
             except Exception:                                      # noqa: BLE001
                 pass
 
-    plan = mmap.plan_filing(msgs, end, cadence=cadence, own_domains=own)
+    people, gaps_, _dupes = _live_roster()
+    plan = mmap.plan_filing(msgs, end, cadence=cadence, own_domains=own,
+                            contractors=people)
     lo, hi = mmap.period_window(end)
 
+    in_play = [p for p in people if mmap.in_scope(p, cadence)]
     head = [
         f"Fortnight ending {end.isoformat()}  (period {mmap.period_start(end)} to {end})",
         f"Searched {folder_used} from {since}: {len(msgs)} messages",
+        f"Roster from Xero: {len(in_play)} {cadence} of {len(people)} people",
         f"Folder: Contractors/Timesheets/{mmap.fortnight_folder(end)}/",
         "",
     ]
@@ -530,10 +610,18 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
         head += ["", f"NOT SENT ANYTHING ({len(plan['missing'])}): "
                      + ", ".join(plan["missing"])]
     if plan["unmatched"]:
-        head += ["", f"UNMATCHED SENDERS ({len(plan['unmatched'])}) - nobody in "
-                     "config/contractor_mail.json has these addresses:"]
+        head += ["", f"UNMATCHED ({len(plan['unmatched'])}) - no address on file and "
+                     "no name on the message matches anyone on the roster:"]
         for u in plan["unmatched"][:15]:
-            head.append(f"  {u['sender']:<40} {u['subject'][:50]}")
+            head.append(f"  {u['sender']:<40} {str(u['subject'])[:44]}")
+            head.append(f"  {'':<40} {u.get('reason', '')}")
+
+    if gaps_:
+        head += ["", f"SET UP BUT CANNOT BE BILLED ({len(gaps_)}) - active inventory "
+                     "item, no payroll record and no repeating bill. No draft is "
+                     "raised for these people and nobody is chased for a timesheet:"]
+        for g_ in gaps_:
+            head.append(f"  {g_['item_code']:<24} {g_['name']}")
 
     if dry_run:
         head += ["", "Nothing was written. Re-run with dry_run=False to file these."]

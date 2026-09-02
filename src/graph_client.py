@@ -51,6 +51,16 @@ log = logging.getLogger(__name__)
 GRAPH = "https://graph.microsoft.com/v1.0"
 
 
+def _addresses(recipients) -> list[str]:
+    """Plain address strings out of Graph's recipient objects."""
+    out = []
+    for r in recipients or []:
+        a = ((r or {}).get("emailAddress") or {}).get("address")
+        if a:
+            out.append(str(a).strip().lower())
+    return out
+
+
 class GraphClient:
     def __init__(self, tenant_id: str | None = None, client_id: str | None = None,
                  client_secret: str | None = None):
@@ -203,15 +213,26 @@ class GraphClient:
         raw = self.get_all(
             f"{GRAPH}/users/{quote(self.mailbox)}/mailFolders/{fid}/messages",
             {"$filter": flt, "$top": "50", "$orderby": "receivedDateTime desc",
-             "$select": "id,subject,from,receivedDateTime,hasAttachments,bodyPreview"},
+             "$select": "id,subject,from,toRecipients,ccRecipients,replyTo,"
+                        "receivedDateTime,hasAttachments,bodyPreview"},
         )
 
         out = []
         for m in raw:
+            frm = (m.get("from", {}) or {}).get("emailAddress", {}) or {}
             out.append({
                 "id": m["id"],
                 "subject": m.get("subject", ""),
-                "sender": (m.get("from", {}).get("emailAddress", {}) or {}).get("address", ""),
+                "sender": frm.get("address", ""),
+                # The display name is weak evidence on its own - the sender sets
+                # it - but it is the only thing carrying a name on an address
+                # like pjs.ucanemailme@gmail.com.
+                "sender_name": frm.get("name", ""),
+                # Reckon and MYOB send on a contractor's behalf and put the
+                # contractor in the CC. Without these the sweep sees only the
+                # billing system.
+                "cc": _addresses(m.get("ccRecipients")),
+                "reply_to": _addresses(m.get("replyTo")),
                 "received": m.get("receivedDateTime", ""),
                 "body": m.get("bodyPreview", ""),
                 "attachments": self.attachments(m["id"]),

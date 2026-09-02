@@ -1,0 +1,132 @@
+TCG Xero connector - the roster now comes from Xero
+Built for Andrew Hurnard, 2 September 2026, Melbourne. Off main.
+
+DO NOT UPLOAD _WHAT-CHANGED.txt. Everything else is the repo.
+
+------------------------------------------------------------------------------
+RUN THIS FIRST AFTER DEPLOYING
+
+    roster_diagnostics()
+
+It is read-only. It prints the roster Xero produces, the addresses it will
+match, anyone set up but unbillable, and anyone carrying more than one live
+item. Check it against who you expect BEFORE the Friday sweep relies on it.
+
+The roster logic is proven against fixtures built from your real item codes and
+addresses - 118 tests, up from 85 - but it has never yet run against live Xero.
+roster_diagnostics is how you find out, without a sweep acting on the answer.
+
+------------------------------------------------------------------------------
+WHAT CHANGED
+
+1. THE ROSTER IS DERIVED, NOT LISTED.  new file src/roster.py
+
+   config/contractor_mail.json is no longer read by anything in the sweep. The
+   roster is built at run time:
+
+     PAYG   - payroll employees, name resolved to an item code through the same
+              map the invoice check has used for months
+     ABN    - the contact on a repeating BILL, linked by the item code on its
+              line. "D & L Solutions Pty Ltd" says Don Vuong nowhere; the line
+              says Linfox - DV, and that is the only reliable link.
+
+   Archived (z-prefixed) and inactive items are dropped. An item with neither a
+   payroll record nor a repeating bill is dropped too, which is how
+   Passthru - Expenses stays out without being named anywhere.
+
+   A joiner appears the moment they are set up to be paid. A leaver drops off
+   when their template stops. Nobody edits a file.
+
+2. SENDERS ARE MATCHED BY NAME.  src/mail_mappers.py
+
+   Order, and it does not change: a known address wins; then the cc and
+   reply-to; then a forward from one of our own domains; then the name.
+
+   Nine of ten of your contractor addresses carry the person's own name -
+   devinia_liddelow, jachakkshitija, karenmareecrabb, mudassirali27, donvuong,
+   jhalajay, richaarora16, mdmazherali, jerry_gonsalves. The tenth,
+   techneitconsulting@gmail.com, carries their Xero CONTACT name, which is
+   matched too. All nine are in the tests, by address, asserting the right
+   person.
+
+   Guard rails, because names are looser than addresses:
+     - an address (or contact name in the address) is enough on its own
+     - a display name, a subject line or a name in the body is NOT. Each needs
+       a second signal agreeing with it
+     - a display name alone is never accepted, at any strength
+     - two people matching equally well is REPORTED, never resolved. Mudassir
+       Ali and Mazher Ali are brothers, one seat, item codes one character
+       apart - there is a test for exactly that
+     - a forward from one of our own addresses is never attributed by name.
+       Your own "FW: Don Vuong timesheet" is not from Don Vuong
+     - Reckon, MYOB and the like are flagged "OPEN IT, there is a document
+       inside" rather than dropped as junk - and resolve properly when the
+       contractor is in the cc, which is how Reckon sends
+
+3. A TIMESHEET TYPED INTO THE EMAIL BODY IS NO LONGER INVISIBLE.
+
+   The sweep's unit of work was an attachment, so a matched contractor who
+   attached nothing produced no plan entry and fell through to NOT SENT
+   ANYTHING - identical to someone who never wrote. That is how Devinia
+   Liddelow was reported missing for the fortnight ending 30/08 when her
+   timesheet had been in the mailbox since the Tuesday.
+
+   Those now come back under "body_only": the message is saved whole as .eml
+   into her own folder, named like everything else, and she stops counting as
+   missing. The sweep prints it loudly:
+
+     TIMESHEET IS IN THE EMAIL BODY (n) - no attachment to file, so the
+     message itself is saved as .eml.
+     READ IT AND KEY THE DAYS BY HAND - nothing here counts the days
+
+   It cannot count hours out of a typed table and does not pretend to. What it
+   can do is stop her disappearing.
+
+   New GraphClient.message_mime() fetches the raw message. No new Graph
+   permission - Mail.Read already covers it, so none of this is gated on the
+   Exchange access policy you have not run yet.
+
+4. THE COVERAGE GAP IS REPORTED IN THE SWEEP ITSELF.
+
+   SET UP BUT CANNOT BE BILLED - an active inventory item with no payroll
+   record and no repeating bill. Mazher Ali worked five days that way in the
+   fortnight ending 30/08 and no draft was ever raised. An item is NOT enough;
+   the repeating templates are what raise drafts, and nothing checked for that
+   before.
+
+   roster_diagnostics also lists people carrying more than one live item -
+   yours currently shows Mazher Ali on three (Linfox - MAZ at 1000/1225, plus
+   zLinfox - MA and zLinfox - MAZ still Active at an old 900/1103).
+
+5. The UNMATCHED block now prints WHY each message did not match, rather than
+   "nobody in config/contractor_mail.json has these addresses".
+
+------------------------------------------------------------------------------
+FILES
+
+  new      src/roster.py
+  new      config/roster_overrides.json
+  new      tests/test_roster.py
+  changed  src/mail_mappers.py      name matching, body-only, match_message()
+  changed  src/graph_client.py      cc / reply-to / display name, message_mime
+  changed  src/xero_client.py       repeating_invoices()
+  changed  src/server.py            _live_roster(), roster_diagnostics(), sweep
+  changed  tests/test_mail.py       nine body-only and new-starter tests
+  changed  config/contractor_mail.json   annotated as dead; safe to delete
+
+config/roster_overrides.json holds ONLY what Xero cannot know: the folder names
+that do not match the person ("Deepati Bansal" - the typo is load-bearing,
+correct it and every existing file stops matching), "Dat Le" where the item
+says "Dat Tien Le", the monthly cadence of the offshore team, and two personal
+addresses. Seven entries. Nobody needs one to be found.
+
+------------------------------------------------------------------------------
+TESTS
+
+    python -m pytest tests/ -q        118 passed
+
+Worth reading rather than trusting: tests/test_roster.py asserts every real
+contractor address resolves to the right person with NO addresses on file at
+all, that the two Ali brothers stay apart, that a display name alone is
+refused, that an ambiguous match is reported and not guessed, and that your own
+forward is not attributed to the person named in it.

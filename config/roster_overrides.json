@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "ONLY what Xero cannot know. The roster itself is built at run time from",
+    "Xero inventory items, payroll employees and repeating bills - see",
+    "src/roster.py. Nobody has to be added here to be found.",
+    "",
+    "Keyed on the inventory item code, because that is the one stable key. A",
+    "person's name arrives as 'Dat Le', 'Dat Tien Le' and 'Le, Dat'; matching",
+    "on a name once split one contractor into two and moved $60,000.",
+    "",
+    "folder   - where their files already live on OneDrive, when it does NOT",
+    "           match <client>_<item name>. Ten years of folders carry typos",
+    "           ('Deepati Bansal') and the misspelling is load-bearing: correct",
+    "           it here and every existing file stops matching. Fix it in",
+    "           OneDrive first if you want it fixed, then here.",
+    "name     - the person as everyone refers to them, where the Xero item name",
+    "           is a fuller legal form.",
+    "cadence  - 'monthly' for the offshore team. Default is fortnightly.",
+    "emails   - a personal address they also send from. Never required: the",
+    "           address is read for their name before this is consulted.",
+    "contact_names - an extra trading name to match, where the repeating bill",
+    "           does not carry it."
+  ],
+  "by_item_code": {
+    "Linfox - DTL": {
+      "name": "Dat Le",
+      "folder": "Linfox_Dat Le"
+    },
+    "Linfox - EK": {
+      "emails": ["emilykimmins@hotmail.com"]
+    },
+    "Linfox - JG": {
+      "emails": ["jerrygonsalves30@gmail.com"]
+    },
+    "Linfox - DBL": {
+      "folder": "Linfox_Deepati Bansal Monthly",
+      "cadence": "monthly"
+    },
+    "Linfox - BV": {
+      "folder": "Linfox_Bhasker Veela Monthly",
+      "cadence": "monthly"
+    },
+    "Linfox - PD": {
+      "folder": "Linfox_Prasanthi Dharanikota Monthly",
+      "cadence": "monthly"
+    },
+    "Linfox - VKC": {
+      "name": "Vivek Kumar Choudhary",
+      "folder": "Linfox_Vivek Choudhary monthly",
+      "cadence": "monthly"
+    }
+  }
+}

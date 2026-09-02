@@ -314,6 +314,19 @@ class XeroClient:
     def items(self) -> list[dict]:
         return self.get(f"{API_BASE}/Items").get("Items", [])
 
+    def repeating_invoices(self) -> list[dict]:
+        """Every repeating sales-invoice and bill template, with its lines.
+
+        This is what links a supplier CONTACT to a CONTRACTOR. "D & L Solutions
+        Pty Ltd" does not say Don Vuong anywhere; the repeating bill's line
+        carries item code Linfox - DV, and that is the link. It is also the
+        thing that actually raises the fortnightly drafts, so a contractor with
+        an inventory item but no template here is set up to be paid and will
+        never be billed - which is how Mazher Ali worked five days in the
+        fortnight ending 30 August 2026 with no invoice behind them.
+        """
+        return self.get(f"{API_BASE}/RepeatingInvoices").get("RepeatingInvoices", [])
+
     def contacts(self) -> list[dict]:
         out, page = [], 1
         while True:

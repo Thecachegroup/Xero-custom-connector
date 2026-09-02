@@ -47,8 +47,17 @@ _ADMIN_HINTS = ("passport", "banking", "bank detail", "super choice", "tfn",
 
 
 def load_contractors(path: str | None = None) -> list[dict]:
-    with open(path or CONFIG_PATH) as fh:
-        return (json.load(fh) or {}).get("contractors", [])
+    """The old hand-maintained roster, kept only as a fallback and for tests.
+
+    The live roster is built from Xero by src/roster.py and passed in. This
+    reads config/contractor_mail.json if it is still there and returns an empty
+    list if it is not - a missing file is not an error any more.
+    """
+    try:
+        with open(path or CONFIG_PATH) as fh:
+            return (json.load(fh) or {}).get("contractors", [])
+    except FileNotFoundError:
+        return []
 
 
 def _addr(value: str) -> str:
@@ -76,6 +85,165 @@ def match_sender(sender: str, contractors: list[dict] | None = None) -> dict | N
         if a in {_addr(e) for e in c.get("emails", [])}:
             return c
     return None
+
+
+# --------------------------------------------------------------------------
+# Matching a message to a person by NAME, when the address is not on file
+# --------------------------------------------------------------------------
+#
+# The address list is gone; the roster now comes from Xero. That buys a roster
+# that cannot drift, and costs the one thing the list was good at - knowing
+# that dat_le@linfox.com is Dat Le. So the address has to be READ instead.
+#
+# Nine of every ten contractor addresses carry the person's own name:
+# devinia_liddelow, jachakkshitija, karenmareecrabb, mudassirali27, donvuong,
+# jhalajay, richaarora16, mdmazherali, jerry_gonsalves. The one that does not -
+# techneitconsulting@gmail.com - carries their Xero CONTACT name instead, which
+# is why contact names are matched too.
+#
+# Everything here returns None rather than a best guess. An unmatched message is
+# reported to Andrew and recoverable in a minute. A wrongly matched one files a
+# contractor's invoice against somebody else's bill, and nobody finds it.
+
+_BILLING_SYSTEMS = ("reckon", "myob", "xero.com", "invoices@", "quickbooks",
+                    "billing@", "noreply@", "no-reply@")
+
+
+def _squash(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _local_part(address: str) -> str:
+    return _addr(address).split("@", 1)[0]
+
+
+def _name_in_string(name: str, hay: str) -> bool:
+    """Is this person's name inside this string, allowing either word order.
+
+    Three ways, tightest first. The length floors matter: "Dat Le" squashes to
+    five characters and would otherwise match inside words that have nothing to
+    do with him.
+    """
+    parts = [p for p in re.split(r"[^a-z0-9]+", str(name or "").lower()) if p]
+    if not parts or not hay:
+        return False
+    flat = "".join(parts)
+    rev = "".join(reversed(parts))
+    if hay == flat or hay == rev:                     # dat_le -> "datle"
+        return True
+    if len(flat) >= 8 and (flat in hay or rev in hay):   # richaarora16
+        return True
+    # Every part, each long enough to mean something, in order: karenmareecrabb
+    if all(len(p) >= 3 for p in parts):
+        pos = 0
+        for p in parts:
+            i = hay.find(p, pos)
+            if i < 0:
+                return False
+            pos = i + len(p)
+        return True
+    return False
+
+
+def name_evidence(msg: dict, person: dict) -> set[str]:
+    """Which kinds of evidence say this message is from this person.
+
+    Tiers, because they are not worth the same. An address is chosen once and
+    then used for years; a display name is whatever the sender typed into
+    Outlook this morning.
+    """
+    found: set[str] = set()
+    names = [person.get("name", "")] + list(person.get("contact_names") or [])
+    names = [n for n in names if n]
+
+    sender_addrs = [msg.get("sender", "")] + list(msg.get("cc", []) or []) \
+        + list(msg.get("reply_to", []) or [])
+    for a in sender_addrs:
+        local = _squash(_local_part(a))
+        if not local:
+            continue
+        for n in names:
+            if _name_in_string(n, local):
+                found.add("address")
+            # techneitconsulting@gmail.com against "Techne IT Consulting Pty Ltd"
+            sq = _squash(n)
+            if len(local) >= 8 and len(sq) >= 8 and (local in sq or sq in local):
+                found.add("address")
+
+    display = _squash(re.sub(r"<[^>]*>", "", str(msg.get("sender_name") or "")))
+    for n in names:
+        if display and _name_in_string(n, display):
+            found.add("display")
+
+    subject = _squash(msg.get("subject", ""))
+    for n in names:
+        if subject and _name_in_string(n, subject):
+            found.add("subject")
+
+    # "ARORA, RICHA" - surname first, upper case, inside the invoice body. The
+    # order-insensitive test above already handles it; this just looks in the
+    # body and the attachment names as well as the subject.
+    body = _squash(str(msg.get("body", "") or "")[:4000])
+    names_blob = _squash(" ".join(str(a.get("name", ""))
+                                 for a in msg.get("attachments", []) or []))
+    for n in names:
+        if body and _name_in_string(n, body):
+            found.add("body")
+        if names_blob and _name_in_string(n, names_blob):
+            found.add("filename")
+    return found
+
+
+def match_by_name(msg: dict, roster: list[dict]) -> tuple[dict | None, str]:
+    """(person, why) - or (None, why not).
+
+    An address, or a contact name in the address, is enough on its own. Nothing
+    else is: a display name, a subject line or a name in the body needs a second
+    piece of evidence agreeing with it, because all three can carry somebody
+    else's name. Andrew's own forward of "RE: louis_soto@linfox.com" would
+    otherwise read as Louis.
+
+    Two people matching equally well is reported, never resolved. Two
+    contractors sharing a surname is a real thing and guessing between them puts
+    one person's money on another person's record.
+    """
+    scored: list[tuple[int, dict, set[str]]] = []
+    for person in roster:
+        ev = name_evidence(msg, person)
+        if not ev:
+            continue
+        if "address" in ev:
+            rank = 3
+        elif len(ev - {"display"}) >= 2:
+            rank = 2
+        elif len(ev) >= 2:                    # display plus one other
+            rank = 1
+        else:
+            continue                          # a single soft signal is not enough
+        scored.append((rank, person, ev))
+
+    if not scored:
+        return None, "no name on this message matches anyone on the roster"
+
+    top = max(r for r, _p, _e in scored)
+    best = [(p, e) for r, p, e in scored if r == top]
+    if len(best) > 1:
+        who = ", ".join(p["name"] for p, _e in best)
+        return None, f"matches more than one person equally well ({who}) - not guessed"
+
+    person, ev = best[0]
+    return person, "name found in " + ", ".join(sorted(ev))
+
+
+def looks_like_a_billing_system(address: str) -> bool:
+    """Reckon, MYOB and the like send on a contractor's behalf.
+
+    Their address carries no person, so a name match will usually fail - and
+    the message must still not be dismissed as junk, because there is an
+    invoice inside it.
+    """
+    a = _addr(address)
+    return any(h in a for h in _BILLING_SYSTEMS)
 
 
 def _generic_name(name: str) -> bool:
@@ -116,20 +284,54 @@ def match_sender_or_forward(msg: dict, contractors: list[dict] | None = None,
     body consulted, because a contractor's own message must never be attributed
     to somebody named inside it.
     """
-    who = match_sender(msg.get("sender", ""), contractors)
+    who, _why = match_message(msg, contractors, own_domains)
+    return who
+
+
+def match_message(msg: dict, contractors: list[dict] | None = None,
+                  own_domains: tuple[str, ...] = ()) -> tuple[dict | None, str]:
+    """As above, but says WHY - which is what the unmatched report needs.
+
+    Order is deliberate and does not change: a known address beats everything,
+    a forward is only followed for our own domains, and reading names out of
+    the message is the last resort rather than the first.
+    """
+    roster = contractors if contractors is not None else load_contractors()
+
+    who = match_sender(msg.get("sender", ""), roster)
     if who:
-        return who
+        return who, "sender address is on file"
+
+    # Reckon and MYOB send on someone's behalf and put them in the CC.
+    for a in list(msg.get("cc", []) or []) + list(msg.get("reply_to", []) or []):
+        who = match_sender(a, roster)
+        if who:
+            return who, "address is on file, in the cc or reply-to"
 
     addr = _addr(msg.get("sender", ""))
     domain = addr.rsplit("@", 1)[-1] if "@" in addr else ""
-    if not own_domains or domain not in {d.strip().lower() for d in own_domains}:
-        return None
+    is_ours = bool(own_domains) and domain in {d.strip().lower() for d in own_domains}
+    if is_ours:
+        for candidate in forwarded_senders(msg.get("body", "")):
+            who = match_sender(candidate, roster)
+            if who:
+                return who, "forwarded from an address on file"
 
-    for candidate in forwarded_senders(msg.get("body", "")):
-        who = match_sender(candidate, contractors)
-        if who:
-            return who
-    return None
+    # Nothing on file. Read the name instead - but never out of a message one of
+    # OUR OWN people sent, unless it is a forward we have already failed to
+    # resolve above. Andrew forwarding "RE: louis_soto@linfox.com" carries
+    # Louis's name and is not from Louis.
+    who, why = match_by_name(msg, roster)
+    if who and not is_ours:
+        return who, why
+    if who and is_ours:
+        return None, ("a forward from us naming " + who["name"]
+                      + " - sender identity leads, so this is not attributed")
+
+    if looks_like_a_billing_system(msg.get("sender", "")):
+        return None, ("sent by a billing system on someone's behalf - "
+                      "OPEN IT, there is a document inside")
+    return None, why
 
 
 # An inline image smaller than this is a signature logo, a divider or a tracking
@@ -435,13 +637,13 @@ def plan_filing(messages: list[dict], period_end: date | str,
     body_staged: list[dict] = []
 
     for msg in messages:
-        who = match_sender_or_forward(msg, roster, own_domains)
+        who, why = match_message(msg, roster, own_domains)
         if not who:
             unmatched.append({
                 "sender": _addr(msg.get("sender", "")),
                 "subject": msg.get("subject", ""),
                 "received": msg.get("received", ""),
-                "reason": "no contractor matches this address",
+                "reason": why,
             })
             continue
         if not in_scope(who, cadence):
