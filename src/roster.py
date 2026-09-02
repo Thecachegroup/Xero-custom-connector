@@ -94,9 +94,33 @@ def _emails(*values: Any) -> list[str]:
     return out
 
 
+def name_aliases(path: str | None = None) -> dict[str, list[str]]:
+    """Other spellings of a person's name, keyed by item code.
+
+    config/employee_codes.json already carries these - it exists so the invoice
+    check can match a payroll employee to an item whatever the spelling, and it
+    is maintained whenever unmatched_employees reports somebody. It lists
+    "Bhasker Veerla" AND "Bhasker Veela" against Linfox - BV, which is exactly
+    the transposition that stopped his email being recognised. Reusing it here
+    costs nothing and means one table is kept, not two.
+    """
+    p = path or os.environ.get("TCG_EMPLOYEE_CODES", "config/employee_codes.json")
+    try:
+        with open(p) as fh:
+            raw = (json.load(fh) or {}).get("map", {}) or {}
+    except Exception:                                          # noqa: BLE001
+        return {}
+    out: dict[str, list[str]] = {}
+    for name, code in raw.items():
+        if name and code:
+            out.setdefault(str(code), []).append(str(name))
+    return out
+
+
 def build(items: Iterable[dict], employees: Iterable[dict],
           repeating: Iterable[dict], contacts: Iterable[dict] | None = None,
-          resolve_employee=None, overrides: dict | None = None) -> list[dict]:
+          resolve_employee=None, overrides: dict | None = None,
+          aliases: dict | None = None) -> list[dict]:
     """The roster, in the same shape the old config file produced.
 
     Every entry: name, item_code, folder, kind, cadence, emails, contact_names.
@@ -109,6 +133,7 @@ def build(items: Iterable[dict], employees: Iterable[dict],
     stays out without being named here.
     """
     overrides = load_overrides() if overrides is None else overrides
+    aliases = name_aliases() if aliases is None else aliases
     by_code: dict[str, dict] = {}
 
     live = {}
@@ -175,21 +200,54 @@ def build(items: Iterable[dict], employees: Iterable[dict],
     roster = []
     for code, entry in by_code.items():
         ov = overrides.get(code, {}) or {}
+        # A payroll employee who is not a swept contractor. Nuria Carricondo is
+        # in the pay run for superannuation only and Samuel Ferrie and Shane
+        # Bell are monthly salaried staff Andrew runs himself - all three are
+        # real employees, so the roster finds them, and all three were being
+        # chased every fortnight for a timesheet that does not exist.
+        if ov.get("skip") or ov.get("ignore"):
+            continue
         name = str(ov.get("name") or entry["name"] or "").strip()
         entry["name"] = name
         entry["cadence"] = str(ov.get("cadence") or "fortnightly").lower()
         entry["kind"] = str(ov.get("kind") or entry["kind"]).upper()
         entry["folder"] = ov.get("folder") or f"{client_of(code)}_{name}"
         entry["emails"] = _emails(*entry["emails"], *(ov.get("emails") or []))
-        for n in ov.get("contact_names") or []:
-            if n not in entry["contact_names"]:
+        for n in list(ov.get("contact_names") or []) + list(aliases.get(code) or []):
+            if n and n not in entry["contact_names"]:
                 entry["contact_names"].append(n)
+        # The payroll name too - "Dat Le" where the item says "Dat Tien Le".
+        pn = entry.pop("payroll_name", "")
+        if pn and pn != name and pn not in entry["contact_names"]:
+            entry["contact_names"].append(pn)
         roster.append(entry)
 
     return sorted(roster, key=lambda c: c["name"].lower())
 
 
-def gaps(items: Iterable[dict], roster: Iterable[dict]) -> list[dict]:
+def looks_like_a_person(name: str) -> bool:
+    """Two to four plain words. A last-resort filter, behind the overrides.
+
+    The coverage report is only read if everything in it is a person. Left
+    unfiltered it carries SEEK ads, LinkedIn training and pass-through expenses,
+    and a report nobody reads catches nothing.
+    """
+    n = str(name or "").strip()
+    if not n or any(ch.isdigit() for ch in n):
+        return False
+    words = n.split()
+    if not 2 <= len(words) <= 4:
+        return False
+    if any(w in _key(n).split() for w in
+           ("ad", "ads", "training", "expenses", "articles", "hourly", "leadership",
+            "standout", "contractor", "seek", "fee", "fees", "licence", "software")):
+        return False
+    return all(w.replace("'", "").replace("-", "").replace(".", "").isalpha()
+               for w in words)
+
+
+def gaps(items: Iterable[dict], roster: Iterable[dict],
+         overrides: dict | None = None) -> list[dict]:
     """Live items with nobody behind them - work that cannot be billed.
 
     An inventory item is NOT enough to raise a draft: the repeating templates
@@ -197,6 +255,7 @@ def gaps(items: Iterable[dict], roster: Iterable[dict]) -> list[dict]:
     spreadsheet row while being completely invisible to list_period_drafts.
     Mazher Ali worked five days that way. This is the check that finds it.
     """
+    overrides = load_overrides() if overrides is None else overrides
     have = {c["item_code"] for c in roster}
     out = []
     for it in items or []:
@@ -205,7 +264,13 @@ def gaps(items: Iterable[dict], roster: Iterable[dict]) -> list[dict]:
             continue
         if str(it.get("Status", "ACTIVE")).upper() not in ("ACTIVE", ""):
             continue
-        out.append({"item_code": code, "name": str(it.get("Name") or "").strip(),
+        ov = overrides.get(code, {}) or {}
+        if ov.get("ignore") or ov.get("skip"):
+            continue
+        name = str(it.get("Name") or "").strip()
+        if not looks_like_a_person(name):
+            continue
+        out.append({"item_code": code, "name": name,
                     "why": "active item with no payroll employee and no repeating bill"})
     return sorted(out, key=lambda g: g["item_code"])
 

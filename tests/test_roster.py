@@ -301,3 +301,90 @@ def test_a_stranger_is_still_a_stranger():
     who, why = mm.match_message(msg("mdeane@seek.com.au", subject="SEEK invoice"),
                                 ROSTER)
     assert who is None
+
+
+# ------------------------------------- skip, ignore and the name aliases
+
+SKIPS = dict(OVERRIDES, **{
+    "TCG - Nuria Carricondo": {"skip": True},
+    "Xenon - SF": {"skip": True},
+    "Passthru - Expenses": {"ignore": True},
+})
+
+
+def test_a_payroll_employee_who_is_not_a_swept_contractor_is_skipped():
+    """Nuria is in the pay run for super only; Sam and Shane are salaried.
+
+    All three are real payroll employees, so the roster finds them, and all
+    three were being chased every fortnight for a timesheet that does not exist.
+    """
+    items = ITEMS + [item("TCG - Nuria Carricondo", "Nuria Carricondo"),
+                     item("Xenon - SF", "Samuel Ferrie")]
+    emps = EMPLOYEES + [
+        {"FirstName": "Nuria", "LastName": "Carricondo", "Email": "n@x.com"},
+        {"FirstName": "Samuel", "LastName": "Ferrie", "Email": "s@x.com"}]
+
+    def res(n):
+        return {"nuria carricondo": "TCG - Nuria Carricondo",
+                "samuel ferrie": "Xenon - SF"}.get(n.lower()) or resolve(n)
+
+    people = rst.build(items, emps, REPEATING, resolve_employee=res,
+                       overrides=SKIPS, aliases={})
+    names = {p["name"] for p in people}
+    assert "Nuria Carricondo" not in names
+    assert "Samuel Ferrie" not in names
+    assert "Devinia Liddelow" in names
+
+
+def test_the_coverage_report_lists_people_not_products():
+    items = ITEMS + [item("Seek-STD", "Seek standout ad"),
+                     item("xCGT_LinkedIn Training", "LinkedIn Training"),
+                     item("Linfox - NEW", "Priya Raman")]
+    people = rst.build(items, EMPLOYEES, REPEATING, resolve_employee=resolve,
+                       overrides=SKIPS, aliases={})
+    named = {g["item_code"] for g in rst.gaps(items, people, overrides=SKIPS)}
+    assert "Linfox - NEW" in named
+    assert "Seek-STD" not in named
+    assert "xCGT_LinkedIn Training" not in named
+    assert "Passthru - Expenses" not in named
+
+
+def test_employee_code_aliases_are_carried_onto_the_roster():
+    """config/employee_codes.json already lists the other spellings of a name -
+    "Luis Guerrero Soto" for Louis Soto, "Bhasker Veerla" for Bhasker Veela. It
+    is maintained whenever unmatched_employees reports somebody, so reusing it
+    here means one table is kept, not two."""
+    items = ITEMS + [item("Linfox - BV", "Bhasker Veela")]
+    rep = REPEATING + [bill("VVR Consulting", "", "Linfox - BV")]
+    people = rst.build(items, EMPLOYEES, rep, resolve_employee=resolve,
+                       overrides=OVERRIDES,
+                       aliases={"Linfox - BV": ["Bhasker Veerla"]})
+    assert "Bhasker Veerla" in by_code(people)["Linfox - BV"]["contact_names"]
+
+
+def test_bhaskers_address_cannot_be_matched_by_name_and_needs_an_override():
+    """He signs his email "Veerla Bhaskar" - surname and given name swapped AND
+    spelled differently from both Xero spellings (Bhaskar vs Bhasker).
+
+    Nothing here should bridge that. A matcher loose enough to join bhaskar to
+    bhasker is loose enough to join two real people, and these documents move
+    money. The honest fix is his address in config/roster_overrides.json, which
+    is why that field exists.
+    """
+    items = ITEMS + [item("Linfox - BV", "Bhasker Veela")]
+    rep = REPEATING + [bill("VVR Consulting", "", "Linfox - BV")]
+    people = rst.build(items, EMPLOYEES, rep, resolve_employee=resolve,
+                       overrides=OVERRIDES,
+                       aliases={"Linfox - BV": ["Bhasker Veerla"]})
+
+    # by name alone: correctly refuses
+    bare = [{**p, "emails": []} for p in people]
+    assert mm.match_by_name(msg("veerlabhaskar1996@gmail.com"), bare)[0] is None
+
+    # with the override address on file: matched, and by the address, not a guess
+    with_addr = [{**p, "emails": (["veerlabhaskar1996@gmail.com"]
+                                  if p["item_code"] == "Linfox - BV" else [])}
+                 for p in people]
+    who, why = mm.match_message(msg("veerlabhaskar1996@gmail.com"), with_addr)
+    assert who is not None and who["item_code"] == "Linfox - BV"
+    assert why == "sender address is on file"

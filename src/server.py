@@ -521,8 +521,145 @@ def graph_diagnostics() -> str:
 
 
 @mcp.tool()
+def list_repeating_templates(kinds: str = "both", contains: str = "") -> str:
+    """Every repeating invoice and bill template, with the QUANTITY each one
+    generates. READ ONLY.
+
+    THE POINT OF THIS. The repeating templates are what raise the fortnightly
+    and monthly drafts, and `fill_period_drafts` only fills a line whose
+    quantity is currently ZERO - that guard is what makes four sweeps across a
+    billing week safe. A template that generates a NON-ZERO quantity is
+    therefore invisible to the fill: nothing corrects it, and it quietly
+    invoices the client that quantity every period until somebody happens to
+    look at the number.
+
+    Bhasker Veela's sales template generates at 1. His August invoice went to
+    Awaiting Approval at ONE day, $320, against 21 days actually worked - about
+    $6,573 under-billed, one approval from going out the door.
+
+    Anything flagged below is the same failure waiting to happen. Fix it with
+    set_repeating_quantity(item_code, 0).
+
+    KINDS: 'both' | 'sales' | 'bills'.
+    CONTAINS filters on the contact name or the item code.
+    """
+    c = client()
+    want = str(kinds or "both").lower()
+    needle = str(contains or "").strip().lower()
+
+    rows, flagged = [], 0
+    for r in c.repeating_invoices():
+        typ = str(r.get("Type") or "").upper()
+        if want == "sales" and typ != "ACCREC":
+            continue
+        if want == "bills" and typ != "ACCPAY":
+            continue
+        contact = str((r.get("Contact") or {}).get("Name") or "")
+        sched = r.get("Schedule") or {}
+        unit = str(sched.get("Unit") or "").title()
+        period = sched.get("Period")
+        every = f"every {period} {unit}".strip() if period else unit or "?"
+        for line in r.get("LineItems") or []:
+            code = str(line.get("ItemCode") or "")
+            if needle and needle not in contact.lower() and needle not in code.lower():
+                continue
+            qty = line.get("Quantity")
+            qty = 0.0 if qty is None else float(qty)
+            bad = qty != 0.0
+            flagged += 1 if bad else 0
+            rows.append({
+                "": "  <<<" if bad else "",
+                "Kind": "sales" if typ == "ACCREC" else "bill",
+                "Contact": contact[:34],
+                "Item": code,
+                "Qty": qty,
+                "Unit": line.get("UnitAmount"),
+                "Repeats": every,
+                "Status": str(r.get("Status") or ""),
+            })
+
+    if not rows:
+        return "No repeating templates matched."
+
+    rows.sort(key=lambda x: (x[""] == "", x["Kind"], x["Contact"]))
+    out = [f"{len(rows)} repeating template line(s)", "",
+           pd.DataFrame(rows).to_markdown(index=False), ""]
+    if flagged:
+        out += [f"{flagged} line(s) marked <<< generate a NON-ZERO quantity.",
+                "fill_period_drafts will never touch these - it only fills lines",
+                "sitting at zero - so they go out at whatever is shown above,",
+                "every period, until someone reads the number.",
+                "",
+                "Fix each with: set_repeating_quantity('<item code>', 0)"]
+    else:
+        out.append("Every template generates at zero. Nothing to fix.")
+    return "\n".join(out)
+
+
+@mcp.tool()
+def set_repeating_quantity(item_code: str, quantity: float = 0,
+                           kinds: str = "both", dry_run: bool = True) -> str:
+    """Set the quantity a repeating template generates. DRY BY DEFAULT.
+
+    Almost always used to put a template back to ZERO so that
+    `fill_period_drafts` can do its job. A template is read back from Xero
+    first and re-posted with its own values, so nothing but the quantity moves.
+
+    Matched on ITEM CODE, never a name.
+    """
+    c = client()
+    want = str(kinds or "both").lower()
+    code_l = str(item_code or "").strip().lower()
+    if not code_l:
+        return "Give an item code. Nothing has been changed."
+
+    hits = []
+    for r in c.repeating_invoices():
+        typ = str(r.get("Type") or "").upper()
+        if want == "sales" and typ != "ACCREC":
+            continue
+        if want == "bills" and typ != "ACCPAY":
+            continue
+        if any(str(l.get("ItemCode") or "").lower() == code_l
+               for l in r.get("LineItems") or []):
+            hits.append(r)
+
+    if not hits:
+        return (f"No repeating template carries item code {item_code!r}. "
+                "Nothing has been changed.")
+
+    lines = [f"{'DRY RUN - nothing written' if dry_run else 'UPDATED'}: "
+             f"{len(hits)} template(s) for {item_code}", ""]
+    for r in hits:
+        typ = "sales" if str(r.get("Type")).upper() == "ACCREC" else "bill"
+        contact = str((r.get("Contact") or {}).get("Name") or "")
+        changed = []
+        for l in r.get("LineItems") or []:
+            if str(l.get("ItemCode") or "").lower() != code_l:
+                continue
+            was = l.get("Quantity")
+            was = 0.0 if was is None else float(was)
+            if was == float(quantity):
+                lines.append(f"  {typ:<5} {contact[:32]:<34} already {was:g}")
+                continue
+            l["Quantity"] = float(quantity)
+            changed.append(f"  {typ:<5} {contact[:32]:<34} {was:g} -> {float(quantity):g}")
+        if not changed:
+            continue
+        lines += changed
+        if not dry_run:
+            c.post_repeating_invoice(r)
+
+    if dry_run:
+        lines += ["", "Re-run with dry_run=False to apply."]
+    else:
+        lines += ["", "Run list_repeating_templates() to confirm."]
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int = 45,
-                     cadence: str = "fortnightly") -> str:
+                     cadence: str = "all") -> str:
     """File contractor timesheets and invoices from the payroll mailbox.
 
     DRY BY DEFAULT. dry_run=True reports what it WOULD file and writes nothing.
@@ -536,7 +673,10 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
         lookback_days: how far back to search. Default 45, deliberately much
             wider than the fortnight - people send early, late and out of order,
             and a message outside the window is silently never filed.
-        cadence: 'fortnightly' or 'monthly'.
+        cadence: 'all' (default), 'fortnightly' or 'monthly'. Monthly
+            contractors file into the CURRENT FORTNIGHT folder alongside
+            everyone else - Andrew's decision, 2 Sep 2026 - so 'all' is the
+            normal way to run this and the other two are for narrowing down.
     """
     from datetime import timedelta
     from . import mail_mappers as mmap
@@ -571,10 +711,13 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
     lo, hi = mmap.period_window(end)
 
     in_play = [p for p in people if mmap.in_scope(p, cadence)]
+    monthly = [p["name"] for p in in_play if str(p.get("cadence")) == "monthly"]
     head = [
         f"Fortnight ending {end.isoformat()}  (period {mmap.period_start(end)} to {end})",
         f"Searched {folder_used} from {since}: {len(msgs)} messages",
-        f"Roster from Xero: {len(in_play)} {cadence} of {len(people)} people",
+        f"Roster from Xero: {len(in_play)} of {len(people)} people swept"
+        + (f", {len(monthly)} of them monthly ({', '.join(sorted(monthly))})"
+           if monthly else ""),
         f"Folder: Contractors/Timesheets/{mmap.fortnight_folder(end)}/",
         "",
     ]

@@ -451,8 +451,22 @@ def target_path(contractor: dict, kind: str, period_end: date | str,
     ])
 
 
-def in_scope(contractor: dict, cadence: str = "fortnightly") -> bool:
-    return str(contractor.get("cadence", "fortnightly")).lower() == cadence.lower()
+def in_scope(contractor: dict, cadence: str = "all") -> bool:
+    """Is this person swept on this run.
+
+    'all' is the default and the normal case. Andrew's decision, 2 Sep 2026:
+    MONTHLY CONTRACTORS FILE INTO THE CURRENT FORTNIGHT FOLDER, the same as
+    everyone else. One folder to look in, not two, and no second folder
+    template for attach_period_files to know about.
+
+    Before this, the fortnightly sweep filtered them out entirely: Bhasker
+    Veela's August invoices sat unmatched and unfiled, and his bill had to be
+    given its evidence by hand.
+    """
+    c = str(cadence or "all").lower()
+    if c in ("all", "", "both"):
+        return True
+    return str(contractor.get("cadence", "fortnightly")).lower() == c
 
 
 
@@ -595,7 +609,7 @@ def period_window(period_end: date | str, grace_days: int = 10) -> tuple[date, d
 
 def plan_filing(messages: list[dict], period_end: date | str,
                 contractors: list[dict] | None = None,
-                cadence: str = "fortnightly",
+                cadence: str = "all",
                 grace_days: int = 10,
                 file_admin: bool = False,
                 own_domains: tuple[str, ...] = ()) -> dict:

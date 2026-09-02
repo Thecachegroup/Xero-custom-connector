@@ -11,15 +11,21 @@
     "folder   - where their files already live on OneDrive, when it does NOT",
     "           match <client>_<item name>. Ten years of folders carry typos",
     "           ('Deepati Bansal') and the misspelling is load-bearing: correct",
-    "           it here and every existing file stops matching. Fix it in",
-    "           OneDrive first if you want it fixed, then here.",
+    "           it here and every existing file stops matching.",
     "name     - the person as everyone refers to them, where the Xero item name",
     "           is a fuller legal form.",
-    "cadence  - 'monthly' for the offshore team. Default is fortnightly.",
-    "emails   - a personal address they also send from. Never required: the",
-    "           address is read for their name before this is consulted.",
-    "contact_names - an extra trading name to match, where the repeating bill",
-    "           does not carry it."
+    "cadence  - 'monthly' for the offshore team. Default is fortnightly. Monthly",
+    "           people still file into the CURRENT FORTNIGHT folder - Andrew's",
+    "           decision, 2 Sep 2026 - so there is one folder to look in, not two.",
+    "emails   - an address they also send from. Normally not needed: the address",
+    "           is read for their name first. Needed only where the address",
+    "           cannot carry the name, e.g. Bhasker Veela signs 'Veerla Bhaskar'.",
+    "skip     - true for a payroll employee who is NOT a swept contractor:",
+    "           super-only records and monthly salaried staff Andrew runs himself.",
+    "           They are real employees, so the roster finds them; without this",
+    "           they are chased every fortnight for a timesheet they never send.",
+    "ignore   - true for an inventory item that is not a person at all. Keeps",
+    "           SEEK ads and training products out of the coverage report."
   ],
   "by_item_code": {
     "Linfox - DTL": {
@@ -27,27 +33,79 @@
       "folder": "Linfox_Dat Le"
     },
     "Linfox - EK": {
-      "emails": ["emilykimmins@hotmail.com"]
+      "emails": [
+        "emilykimmins@hotmail.com"
+      ]
     },
     "Linfox - JG": {
-      "emails": ["jerrygonsalves30@gmail.com"]
+      "emails": [
+        "jerrygonsalves30@gmail.com"
+      ]
     },
     "Linfox - DBL": {
       "folder": "Linfox_Deepati Bansal Monthly",
-      "cadence": "monthly"
+      "cadence": "monthly",
+      "emails": [
+        "bansal.deepti90@gmail.com"
+      ]
     },
     "Linfox - BV": {
       "folder": "Linfox_Bhasker Veela Monthly",
-      "cadence": "monthly"
+      "cadence": "monthly",
+      "emails": [
+        "veerlabhaskar1996@gmail.com"
+      ]
     },
     "Linfox - PD": {
       "folder": "Linfox_Prasanthi Dharanikota Monthly",
-      "cadence": "monthly"
+      "cadence": "monthly",
+      "emails": [
+        "prasanthidharanikota362@gmail.com"
+      ]
     },
     "Linfox - VKC": {
       "name": "Vivek Kumar Choudhary",
       "folder": "Linfox_Vivek Choudhary monthly",
-      "cadence": "monthly"
+      "cadence": "monthly",
+      "emails": [
+        "vivekchoudhary1989@gmail.com"
+      ]
+    },
+    "Passthru - Expenses": {
+      "ignore": true,
+      "_why": "pass-through expenses, not a person"
+    },
+    "Seek-STD": {
+      "ignore": true,
+      "_why": "SEEK standout ad"
+    },
+    "xCGT_LinkedIn Training": {
+      "ignore": true,
+      "_why": "training product"
+    },
+    "xCGT_Thought Leadership": {
+      "ignore": true,
+      "_why": "training product"
+    },
+    "HSV - MC Hourly": {
+      "ignore": true,
+      "_why": "Matt Cordner hourly - billed ad hoc, no template"
+    },
+    "Linfox - BV oncall": {
+      "ignore": true,
+      "_why": "Bhasker's on-call rate, second item for the same person"
+    },
+    "Xenon - SF": {
+      "skip": true,
+      "_why": "Samuel Ferrie - monthly salaried Xenon staff, Andrew runs it himself"
+    },
+    "Xenon - SB": {
+      "skip": true,
+      "_why": "Shane Bell - monthly salaried Xenon staff, Andrew runs it himself"
+    },
+    "TCG - Nuria Carricondo": {
+      "skip": true,
+      "_why": "in the pay run for superannuation only, zero earnings - never sends a timesheet"
     }
   }
 }

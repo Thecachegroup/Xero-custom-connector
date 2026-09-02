@@ -199,6 +199,36 @@ class XeroClient:
             return resp.json()
         raise RuntimeError(f"Xero request failed after retries: {url}")
 
+    def post(self, url: str, body: dict) -> dict:
+        """Same transport as get(), same backoff. Writes only."""
+        for attempt in range(6):
+            self._limiter.acquire()
+            resp = self._session.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self._access_token()}",
+                    "Xero-tenant-id": self.tenant_id,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=60,
+            )
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("Retry-After", "60")) + 1
+                log.warning("429 from Xero; backing off %ss", wait)
+                time.sleep(wait)
+                continue
+            if resp.status_code >= 500:
+                time.sleep(2 ** attempt)
+                continue
+            if resp.status_code >= 400:
+                raise requests.HTTPError(
+                    f"{resp.status_code} for POST {url}: {resp.text[:400]}", response=resp
+                )
+            return resp.json()
+        raise RuntimeError(f"Xero write failed after retries: {url}")
+
     # ---------- accounting ----------
 
     def iter_invoices(
@@ -326,6 +356,17 @@ class XeroClient:
         fortnight ending 30 August 2026 with no invoice behind them.
         """
         return self.get(f"{API_BASE}/RepeatingInvoices").get("RepeatingInvoices", [])
+
+    def post_repeating_invoice(self, payload: dict) -> dict:
+        """Update a repeating template. Xero POSTs with the ID to modify.
+
+        Only ever called with a template that has been read back first, so the
+        payload carries Xero's own values and changes exactly the one field
+        intended. A repeating template writes an invoice every period without
+        anybody looking at it, which is precisely why it must not be guessed at.
+        """
+        return self.post(f"{API_BASE}/RepeatingInvoices",
+                         {"RepeatingInvoices": [payload]})
 
     def contacts(self) -> list[dict]:
         out, page = [], 1

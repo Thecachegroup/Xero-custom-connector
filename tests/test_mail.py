@@ -127,10 +127,25 @@ def test_plan_reports_who_has_not_sent_anything():
     assert "Dat Le" not in plan["missing"]
 
 
-def test_monthly_contractors_are_out_of_scope_for_a_fortnightly_sweep():
+def test_monthly_contractors_file_into_the_current_fortnight_folder():
+    """Andrew's decision, 2 Sep 2026: one folder to look in, not two.
+
+    Before this the fortnightly sweep filtered them out entirely, so Bhasker
+    Veela's August invoices were never filed and his bill had to be given its
+    evidence by hand.
+    """
     plan = mm.plan_filing([_msg("bansal.deepti90@gmail.com", "August Invoice",
                                 [{"id": "a", "name": "invoice.pdf"}])],
                           date(2026, 8, 16), ROSTER)
+    assert len(plan["files"]) == 1
+    assert plan["files"][0]["path"].startswith("Fortnight  Ending 16082026/")
+    assert plan["unmatched"] == []
+
+
+def test_a_cadence_can_still_be_named_to_narrow_the_sweep():
+    plan = mm.plan_filing([_msg("bansal.deepti90@gmail.com", "August Invoice",
+                                [{"id": "a", "name": "invoice.pdf"}])],
+                          date(2026, 8, 16), ROSTER, cadence="fortnightly")
     assert plan["files"] == []
     assert plan["unmatched"] == []          # recognised, just not this run
     assert "Deepti Bansal" not in plan["missing"]

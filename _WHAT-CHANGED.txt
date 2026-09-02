@@ -1,132 +1,113 @@
-TCG Xero connector - the roster now comes from Xero
+TCG Xero connector - roster from Xero, monthly filing, repeating template audit
 Built for Andrew Hurnard, 2 September 2026, Melbourne. Off main.
 
 DO NOT UPLOAD _WHAT-CHANGED.txt. Everything else is the repo.
+This zip CONTAINS everything in the two earlier ones. Use only this one.
 
 ------------------------------------------------------------------------------
-RUN THIS FIRST AFTER DEPLOYING
+AFTER DEPLOYING
 
-    roster_diagnostics()
+The connector serves new CODE immediately, but the MCP tool LIST is cached.
+Three tools are new, so reconnect the connector (bump the URL version and start
+a fresh session) or they will not appear:
 
-It is read-only. It prints the roster Xero produces, the addresses it will
-match, anyone set up but unbillable, and anyone carrying more than one live
-item. Check it against who you expect BEFORE the Friday sweep relies on it.
-
-The roster logic is proven against fixtures built from your real item codes and
-addresses - 118 tests, up from 85 - but it has never yet run against live Xero.
-roster_diagnostics is how you find out, without a sweep acting on the answer.
+    roster_diagnostics()          who is on the roster and why
+    list_repeating_templates()    RUN THIS FIRST - see below
+    set_repeating_quantity()      put a template back to zero
 
 ------------------------------------------------------------------------------
-WHAT CHANGED
+1. THE REPEATING TEMPLATE AUDIT - the reason to deploy today
 
-1. THE ROSTER IS DERIVED, NOT LISTED.  new file src/roster.py
+fill_period_drafts only fills a line whose quantity is currently ZERO. That
+guard is what makes four sweeps across a billing week safe: a filled line is
+never refilled.
 
-   config/contractor_mail.json is no longer read by anything in the sweep. The
-   roster is built at run time:
+The corollary was never checked. A template that generates a NON-ZERO quantity
+is invisible to the fill. Nothing corrects it, and it invoices the client that
+quantity every period until somebody reads the number.
 
-     PAYG   - payroll employees, name resolved to an item code through the same
-              map the invoice check has used for months
-     ABN    - the contact on a repeating BILL, linked by the item code on its
-              line. "D & L Solutions Pty Ltd" says Don Vuong nowhere; the line
-              says Linfox - DV, and that is the only reliable link.
+Bhasker Veela's sales template generates at 1. His August invoice reached
+Awaiting Approval at ONE day, $320, against 21 days worked - about $6,573
+under-billed, one approval from going out.
 
-   Archived (z-prefixed) and inactive items are dropped. An item with neither a
-   payroll record nor a repeating bill is dropped too, which is how
-   Passthru - Expenses stays out without being named anywhere.
+    list_repeating_templates()
 
-   A joiner appears the moment they are set up to be paid. A leaver drops off
-   when their template stops. Nobody edits a file.
+marks every line that generates non-zero with <<<. Fix each one:
 
-2. SENDERS ARE MATCHED BY NAME.  src/mail_mappers.py
+    set_repeating_quantity('Linfox - BV', 0)        dry by default
 
-   Order, and it does not change: a known address wins; then the cc and
-   reply-to; then a forward from one of our own domains; then the name.
+The template is read back from Xero and re-posted with its own values, so
+nothing but the quantity moves.
 
-   Nine of ten of your contractor addresses carry the person's own name -
-   devinia_liddelow, jachakkshitija, karenmareecrabb, mudassirali27, donvuong,
-   jhalajay, richaarora16, mdmazherali, jerry_gonsalves. The tenth,
-   techneitconsulting@gmail.com, carries their Xero CONTACT name, which is
-   matched too. All nine are in the tests, by address, asserting the right
-   person.
+You do not yet know how many others are like this. That is the point.
 
-   Guard rails, because names are looser than addresses:
-     - an address (or contact name in the address) is enough on its own
-     - a display name, a subject line or a name in the body is NOT. Each needs
-       a second signal agreeing with it
-     - a display name alone is never accepted, at any strength
-     - two people matching equally well is REPORTED, never resolved. Mudassir
-       Ali and Mazher Ali are brothers, one seat, item codes one character
-       apart - there is a test for exactly that
-     - a forward from one of our own addresses is never attributed by name.
-       Your own "FW: Don Vuong timesheet" is not from Don Vuong
-     - Reckon, MYOB and the like are flagged "OPEN IT, there is a document
-       inside" rather than dropped as junk - and resolve properly when the
-       contractor is in the cc, which is how Reckon sends
+------------------------------------------------------------------------------
+2. MONTHLY CONTRACTORS NOW FILE WITH EVERYONE ELSE
 
-3. A TIMESHEET TYPED INTO THE EMAIL BODY IS NO LONGER INVISIBLE.
+Your decision, 2 September: monthly people go into the CURRENT FORTNIGHT folder.
+One folder to look in, not two, and no second folder template for
+attach_period_files to learn.
 
-   The sweep's unit of work was an attachment, so a matched contractor who
-   attached nothing produced no plan entry and fell through to NOT SENT
-   ANYTHING - identical to someone who never wrote. That is how Devinia
-   Liddelow was reported missing for the fortnight ending 30/08 when her
-   timesheet had been in the mailbox since the Tuesday.
+The fortnightly sweep used to filter them out entirely, which is why Bhasker's
+August invoices were never filed and his bill had to be given its evidence by
+hand this afternoon. sweep_timesheets now defaults to cadence="all"; passing
+'fortnightly' or 'monthly' still narrows it if you want that.
 
-   Those now come back under "body_only": the message is saved whole as .eml
-   into her own folder, named like everything else, and she stops counting as
-   missing. The sweep prints it loudly:
+Bhasker, Prasanthi, Vivek and Deepti all file and attach on their own from here.
 
-     TIMESHEET IS IN THE EMAIL BODY (n) - no attachment to file, so the
-     message itself is saved as .eml.
-     READ IT AND KEY THE DAYS BY HAND - nothing here counts the days
+------------------------------------------------------------------------------
+3. THREE FIXES FROM THIS MORNING'S TEST
 
-   It cannot count hours out of a typed table and does not pretend to. What it
-   can do is stop her disappearing.
+NURIA, SAMUEL AND SHANE ARE NO LONGER CHASED FOR TIMESHEETS. All three are real
+payroll employees, so the Xero roster found them - Nuria is in the pay run for
+superannuation only, Sam and Shane are the monthly Xenon salaries you run
+yourself. They now carry "skip": true. The old config file excluded them only by
+not listing them, which is not a rule, just an omission.
 
-   New GraphClient.message_mime() fetches the raw message. No new Graph
-   permission - Mail.Read already covers it, so none of this is gated on the
-   Exchange access policy you have not run yet.
+THE COVERAGE REPORT LISTS PEOPLE, NOT PRODUCTS. "SET UP BUT CANNOT BE BILLED"
+came back with twelve entries this morning, six of them SEEK ads, LinkedIn
+Training, Thought Leadership and pass-through expenses. A report nobody reads
+catches nothing. Non-people are marked "ignore": true, with a name heuristic
+behind it as a backstop.
 
-4. THE COVERAGE GAP IS REPORTED IN THE SWEEP ITSELF.
+BHASKER AND VIVEK HAVE THEIR ADDRESSES ON FILE. Bhasker signs his email "Veerla
+Bhaskar" - surname and given name swapped AND spelled differently from both Xero
+spellings (bhaskAr against bhaskEr). Nothing here bridges that, deliberately: a
+matcher loose enough to join those two is loose enough to join two real people.
+His address in config/roster_overrides.json is the honest fix, and there is a
+test asserting the name path still refuses him.
 
-   SET UP BUT CANNOT BE BILLED - an active inventory item with no payroll
-   record and no repeating bill. Mazher Ali worked five days that way in the
-   fortnight ending 30/08 and no draft was ever raised. An item is NOT enough;
-   the repeating templates are what raise drafts, and nothing checked for that
-   before.
-
-   roster_diagnostics also lists people carrying more than one live item -
-   yours currently shows Mazher Ali on three (Linfox - MAZ at 1000/1225, plus
-   zLinfox - MA and zLinfox - MAZ still Active at an old 900/1103).
-
-5. The UNMATCHED block now prints WHY each message did not match, rather than
-   "nobody in config/contractor_mail.json has these addresses".
+Also: employee_codes.json aliases are now carried onto the roster. That file
+already lists the other spellings ("Luis Guerrero Soto" for Louis Soto) and is
+maintained whenever unmatched_employees reports somebody - so one table is kept,
+not two.
 
 ------------------------------------------------------------------------------
 FILES
 
-  new      src/roster.py
-  new      config/roster_overrides.json
+  new      src/roster.py                    roster built from Xero
+  new      config/roster_overrides.json     16 entries, only what Xero cannot know
   new      tests/test_roster.py
-  changed  src/mail_mappers.py      name matching, body-only, match_message()
-  changed  src/graph_client.py      cc / reply-to / display name, message_mime
-  changed  src/xero_client.py       repeating_invoices()
-  changed  src/server.py            _live_roster(), roster_diagnostics(), sweep
-  changed  tests/test_mail.py       nine body-only and new-starter tests
-  changed  config/contractor_mail.json   annotated as dead; safe to delete
+  changed  src/mail_mappers.py              name matching, body-only, cadence
+  changed  src/graph_client.py              cc / reply-to / display name, message_mime
+  changed  src/xero_client.py               repeating_invoices(), post(), post_repeating_invoice()
+  changed  src/server.py                    roster_diagnostics, list_repeating_templates,
+                                            set_repeating_quantity, sweep wiring
+  changed  tests/test_mail.py
+  changed  config/contractor_mail.json      dead; safe to delete
 
-config/roster_overrides.json holds ONLY what Xero cannot know: the folder names
-that do not match the person ("Deepati Bansal" - the typo is load-bearing,
-correct it and every existing file stops matching), "Dat Le" where the item
-says "Dat Tien Le", the monthly cadence of the offshore team, and two personal
-addresses. Seven entries. Nobody needs one to be found.
+------------------------------------------------------------------------------
+NOT BUILT, AND WHY
+
+create_repeating_template. You asked whether the connector could raise the
+repeating invoice and bill after the inventory item, which is the step that was
+missing for Mazher Ali. It can be built - Xero's API supports it - but a
+template created wrong writes a wrong invoice every period until somebody
+notices, which is the same failure this zip exists to catch. It needs the
+schedule, the Linfox cost centre and the account codes settled per client
+first, and I would rather do that with you looking at it than guess.
 
 ------------------------------------------------------------------------------
 TESTS
 
-    python -m pytest tests/ -q        118 passed
-
-Worth reading rather than trusting: tests/test_roster.py asserts every real
-contractor address resolves to the right person with NO addresses on file at
-all, that the two Ali brothers stay apart, that a display name alone is
-refused, that an ambiguous match is reported and not guessed, and that your own
-forward is not attributed to the person named in it.
+    python -m pytest tests/ -q        123 passed, up from 85
