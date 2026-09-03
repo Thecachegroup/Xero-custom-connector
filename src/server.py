@@ -483,9 +483,10 @@ def _live_roster() -> tuple[list[dict], list[dict], list[dict]]:
     return people, rst.gaps(items, people), rst.duplicates(items)
 
 
-def _prior_invoice_numbers(period_end: date, months: int = 12) -> dict:
+def _prior_invoice_numbers(period_end: date, months: int = 12,
+                           window_days: int = 10) -> dict:
     """{item code: {invoice number: the period it was billed for}} for every
-    contractor bill dated BEFORE this fortnight started.
+    contractor bill belonging to an EARLIER fortnight than this one.
 
     This is what makes a duplicate detectable. The bill carries the
     contractor's OWN invoice number - fill_period_drafts puts it there - so
@@ -498,11 +499,29 @@ def _prior_invoice_numbers(period_end: date, months: int = 12) -> dict:
 
     Both the raw code and the normalised one are keyed, so a person whose
     retired item was renamed with a leading z still resolves.
+
+    THE CUTOFF IS THE BILLING DATE, NOT THE WORK PERIOD. This was wrong when
+    the guard shipped and the guard could therefore never fire once, for
+    anybody. It cut at period_end - 13 days, i.e. the Monday this fortnight's
+    WORK started - 17 August for the fortnight ending 30 August - and required
+    a bill to be dated strictly before that. But TCG dates a bill the Monday
+    AFTER the fortnight it pays for, so the previous fortnight's bills are dated
+    17 August too, and every one of them was excluded by a single day. Proved
+    live on 3 September: Bilal Virk's INV-0016 and Jay Jhala's 20260802 both sit
+    on bills dated 2026-08-17, both PAID, both re-sent and both filed without a
+    murmur by the very sweep built to refuse them.
+
+    Cutting at period_end - window_days instead separates the two fortnights on
+    the axis that actually distinguishes them. It works because fortnights are
+    exactly 14 days apart: the previous fortnight's billing Monday is 13 days
+    before this period_end, and this fortnight's own bills land within a few
+    days either side of it. WINDOW_DAYS MUST STAY BELOW 14 or the previous
+    fortnight starts being read as this one.
     """
     from datetime import timedelta
 
     c = client()
-    cutoff = period_end - timedelta(days=13)          # this fortnight's Monday
+    cutoff = period_end - timedelta(days=window_days)
     start = cutoff - timedelta(days=31 * months)
     out: dict = {}
     for d in c.iter_invoices("ACCPAY", start.isoformat(), cutoff.isoformat(),
