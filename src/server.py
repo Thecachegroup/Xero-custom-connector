@@ -32,7 +32,7 @@ import pandas as pd
 from mcp.server.fastmcp import FastMCP
 
 from .xero_client import XeroClient
-from . import mappers, checks, writes, roster
+from . import mappers, checks, writes, roster, coverage
 
 log = logging.getLogger(__name__)
 
@@ -182,10 +182,12 @@ def _pull(fy: str | None):
     else:
         payroll = mappers.payrun_summaries_to_rows(runs)
 
+    exempt_codes, _unresolved = _payroll_tax_exempt_codes(items)
     data = mappers.build_data_frame(
         sales, bills, payroll, items,
         customer_lookup=_customer_lookup(),
         no_payroll_tax=_no_payroll_tax(),
+        no_payroll_tax_codes=exempt_codes,
         current_fy_start=current_start,
     )
     return data, items, sales, bills, payroll
@@ -253,9 +255,61 @@ def _customer_lookup() -> dict[str, str]:
     return json.load(open(path)) if os.path.exists(path) else {}
 
 
-def _no_payroll_tax() -> set[str]:
+def _payroll_tax_config() -> tuple[set[str], set[str]]:
+    """(exempt names, explicitly exempt item codes) from no_payroll_tax.json.
+
+    Both shapes are accepted. The file was a bare list of names; it is now
+    {"names": [...], "item_codes": [...]} so a person with no inventory item, or
+    an item whose Xero Name does not read like the person's name, can be named
+    directly. A bare list still loads, so an old copy of the config cannot
+    silently empty the exemption list.
+    """
     path = os.environ.get("TCG_NO_PAYROLL_TAX", "config/no_payroll_tax.json")
-    return set(json.load(open(path))) if os.path.exists(path) else set()
+    if not os.path.exists(path):
+        return set(), set()
+    try:
+        raw = json.load(open(path))
+    except Exception as e:                                        # noqa: BLE001
+        log.warning("Could not read %s (%s). No payroll-tax exemptions applied "
+                    "- the base will be OVERSTATED until this is fixed.", path, e)
+        return set(), set()
+    if isinstance(raw, list):
+        return set(raw), set()
+    if isinstance(raw, dict):
+        return set(raw.get("names") or []), set(raw.get("item_codes") or [])
+    return set(), set()
+
+
+def _no_payroll_tax() -> set[str]:
+    return _payroll_tax_config()[0]
+
+
+def _payroll_tax_exempt_codes(items) -> tuple[set[str], list[str]]:
+    """Every normalised item code that is exempt from payroll tax, and the
+    exempt names no item could be found for.
+
+    The names are resolved against the Xero item list once, here, so the config
+    stays a list of people and the matching still happens on the item code. See
+    mappers.exempt_item_codes for why the name match is strict, and
+    build_data_frame for what the old description-only match cost.
+    """
+    names, explicit = _payroll_tax_config()
+    resolved, unresolved = mappers.exempt_item_codes(items, names)
+    return resolved | {mappers.normalise_code(c) for c in explicit}, unresolved
+
+
+def _ignored_item_codes() -> set[str]:
+    """Item codes flagged `ignore` in roster_overrides.json - SEEK ads, training
+    products, pass-through expenses. Things, not people, so never adjustments."""
+    return {c for c, ov in (roster.load_overrides() or {}).items()
+            if (ov or {}).get("ignore")}
+
+
+def _monthly_item_codes() -> set[str]:
+    """Item codes whose person bills monthly. Cadence already lives in
+    roster_overrides.json keyed on item code; nothing else needs to know."""
+    return {c for c, ov in (roster.load_overrides() or {}).items()
+            if str((ov or {}).get("cadence") or "").strip().lower() == "monthly"}
 
 
 # ---------------------------------------------------------------- tools
@@ -1193,7 +1247,7 @@ def tracking_diagnostics(fy: str = "current") -> str:
     else:
         note = ""
 
-    _, _, sales, bills, _ = _load(fy)
+    _, items, sales, bills, _ = _load(fy)
     out = [f"Xero tracking categories, in order: {cats or '(none returned)'}"]
     if note:
         out.append(note)
@@ -1202,6 +1256,23 @@ def tracking_diagnostics(fy: str = "current") -> str:
                    f"{mappers.TRACKING_ORDER_OVERRIDE}")
     out.append(f"Payroll-tax category matched on name: "
                f"{mappers.PAYROLL_TAX_CATEGORY!r}")
+
+    # The exemption list is a list of PEOPLE and the matching happens on ITEM
+    # CODE. A name that resolves to no item falls back to matching the line
+    # description exactly, which is what missed $95,876.29 in July FY27 - so
+    # every unresolved name is printed, not counted.
+    names, explicit = _payroll_tax_config()
+    exempt_codes, unresolved = _payroll_tax_exempt_codes(items)
+    out.append(f"Payroll-tax exemptions: {len(names)} name(s) + "
+               f"{len(explicit)} explicit code(s) -> {len(exempt_codes)} item "
+               "code(s) exempt")
+    if unresolved:
+        out.append(f"  NO ITEM CODE FOUND for {len(unresolved)} exempt name(s) - "
+                   "these still match on description only, which misses any "
+                   "line carrying a role title or a PO number. Add them to "
+                   '"item_codes" in config/no_payroll_tax.json:')
+        for n in sorted(unresolved):
+            out.append(f"    - {n}")
     out.append("")
 
     for label, df in (("Sales", sales), ("Bills", bills)):
@@ -1375,6 +1446,95 @@ def list_period_drafts(period_end: str, window_days: int = 10) -> str:
         out.append("")
 
     out.append(f"Lines with no quantity: {grand_empty}")
+    return "\n".join(out)
+
+
+@mcp.tool()
+def inventory_coverage(period_end: str, window_days: int = 10) -> str:
+    """Did the Phase 5 inventory adjustment actually get posted for everybody?
+
+    READ-ONLY. Nothing is written and there is nothing to dry-run.
+
+    Phase 5 of the fortnightly run moves each TRACKED contractor's wage cost out
+    of 477 into 630 so the sales invoice can consume it. Xero has no API for it,
+    so it is a manual item-by-item loop in Products and services - and a manual
+    loop with no completion check stops wherever it stops and leaves no trace.
+    For the fortnight ending 30 August 2026 it ran once and stopped: DL posted,
+    DTL, KBJ and EK not. $24,670 of wage cost sat in the wrong account for a
+    week and three invoices sat in Awaiting Approval against zero stock. A human
+    found it, a week late, by noticing that one item had quantity and three had
+    zero. This is that comparison, done every time instead of once by luck.
+
+    It reads every sales line in the window, keeps the ones whose item is
+    tracked, and compares each item's QuantityOnHand to the days billed on the
+    invoices that have NOT yet been approved.
+
+      OK        quantity on hand covers what is pending
+      SHORT n   n less than billed. THE ADJUSTMENT WAS NOT POSTED.
+      OVER n    more stock than billed. Usually a duplicate adjustment.
+      NEGATIVE  below zero. An invoice was already approved against stock that
+                was never there. Loudest case.
+      APPROVED  the only invoice for it is approved, so the stock it billed has
+                already been consumed and a zero balance is correct.
+
+    ONLY DRAFT AND SUBMITTED QUANTITIES ARE DEMAND, and that is the whole trick.
+    Approving a sales invoice makes Xero take the stock straight back out, so a
+    correctly adjusted item reads zero afterwards and is indistinguishable from
+    one that was never adjusted. Counting approved quantities as demand reported
+    Bhasker Veela SHORT 21 against an item in perfect order on 3 September 2026.
+    Approved documents are still read - a NEGATIVE balance means an approval
+    already went through against nothing - but their quantity is shown in its
+    own column instead of being weighed against what is left.
+
+    UNTRACKED ITEMS DO NOT APPEAR AT ALL. They need no adjustment, ever, and
+    listing them as OK buries the ones that matter. Jerry Gonsalves and Mazher
+    Ali were created untracked in August and are the model: from 25 August 2026
+    TCG creates no new tracked contractor items, so this report shrinks every
+    time somebody finishes.
+
+    Matching is on ITEM CODE only. One human arrives as "Dat Le", "Dat Tien Le"
+    and "Le, Dat"; matching on a name once split one contractor into two and
+    moved $60,000.
+    """
+    c = client()
+    end = date.fromisoformat(period_end)
+    lo = (end - timedelta(days=window_days)).isoformat()
+    hi = (end + timedelta(days=window_days)).isoformat()
+
+    docs = list(c.iter_invoices("ACCREC", lo, hi,
+                                statuses=["DRAFT", "SUBMITTED", "AUTHORISED"]))
+    items = _stage("items", c.items)
+    rows = coverage.plan_coverage(docs, items, _ignored_item_codes())
+
+    out = [f"Tracked-inventory coverage, sales invoices dated {lo} to {hi}",
+           f"{len(docs)} sales document(s) read.", ""]
+    if not rows:
+        out.append("No tracked item was billed in this window. Nothing to "
+                   "adjust - and if that is a surprise, the invoices are not "
+                   "filled yet: run list_period_drafts.")
+        return "\n".join(out)
+
+    faults = [r for r in rows if r["_fault"]]
+    if faults:
+        out += ["*** ADJUSTMENT MISSING - READ THIS ***",
+                "Post these by hand in Xero: Business > Products and services >"
+                " click the item > New inventory adjustment > Increase, dated "
+                "the period end. There is no API for it.",
+                "",
+                pd.DataFrame([{k: v for k, v in r.items()
+                               if not k.startswith("_")} for r in faults]
+                             ).to_markdown(index=False),
+                ""]
+
+    out += [f"ALL TRACKED ITEMS BILLED ({len(rows)}):",
+            pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")}
+                          for r in rows]).to_markdown(index=False),
+            ""]
+    out.append(f"{len(faults)} needing an adjustment, "
+               f"{len(rows) - len(faults)} clear.")
+    if not faults:
+        out.append("Every tracked item billed in this window has the stock "
+                   "behind it. Phase 5 is complete.")
     return "\n".join(out)
 
 
@@ -1777,7 +1937,10 @@ def attach_period_files(period_end: str, dry_run: bool = True,
 @mcp.tool()
 def submit_period_invoices(period_end: str, dry_run: bool = True,
                            window_days: int = 10, kinds: str = "both",
-                           require_attachment: bool = False) -> str:
+                           require_attachment: bool = False,
+                           require_stock: bool = True,
+                           cadence: str = "fortnightly",
+                           exclude: str = "") -> str:
     """Move the finished sales invoices from Draft to Awaiting Approval.
 
     The point is that Drafts becomes a to-do list. An invoice that is filled and
@@ -1797,8 +1960,30 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
 
     REQUIRE_ATTACHMENT=True restores the stricter rule.
 
+    NO STOCK HOLDS IT BACK - new 3 September 2026. A sales line carrying a
+    TRACKED item whose QuantityOnHand is below the line quantity means the
+    manual Phase 5 inventory adjustment was never posted. Approving it drives
+    the item negative and throws the cost of sales onto the wrong side. Three
+    invoices reached Awaiting Approval that way for the fortnight ending
+    30 August and nothing noticed for a week. Submitting is where an invoice
+    leaves the to-do list, so this is the last automated point the fault can be
+    caught. REQUIRE_STOCK=False overrides it for one run.
+
+    CADENCE defaults to 'fortnightly' - also new, and it is a behaviour change.
+    A monthly document dated inside the fortnight's window used to be swept up
+    with the fortnightly ones; TCG-21205 (Bhasker Veela) went out that way on
+    2 September 2026 and had to be pulled back to Draft by hand. Monthly
+    documents are now held, named, and told how to include them. The MONTHLY run
+    passes cadence='monthly'; cadence='all' restores the old behaviour. Nothing
+    is lost either way - a held document stays a Draft.
+
+    EXCLUDE is the manual escape hatch: comma-separated text matched against the
+    invoice number, contact name, reference or item code.
+
     KINDS: 'both' | 'sales' | 'bills'. Bills move too, for the same reason - a
     bill with no supplier invoice behind it is one that has not been checked.
+    The stock guard applies to SALES ONLY: a bill is what creates the cost, and
+    it is the sales invoice that consumes the stock.
 
     Approving, paying and sending all remain Andrew's; this only moves
     DRAFT -> SUBMITTED, and he can move it back.
@@ -1812,15 +1997,31 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
              "sales": [("ACCREC", "invoice")], "bills": [("ACCPAY", "bill")]}
     if kinds not in types:
         return "kinds must be 'both', 'sales' or 'bills'."
+    if (cadence or "").strip().lower() not in ("all", "fortnightly", "monthly"):
+        return "cadence must be 'fortnightly', 'monthly' or 'all'."
 
-    ready, held = [], []
+    stock = coverage.stock_index(_stage("items", c.items)) if require_stock else {}
+    monthly_codes = _monthly_item_codes()
+    patterns = [p for p in (exclude or "").split(",") if p.strip()]
+
+    ready, held, skipped = [], [], []
     for kind, label in types[kinds]:
         docs = list(c.iter_invoices(kind, lo, hi, statuses=["DRAFT"]))
         if not docs:
             continue
+        docs, out_of_run = writes.split_excluded(docs, patterns, monthly_codes,
+                                                 cadence)
+        for row in out_of_run:
+            row["Kind"] = label
+        skipped += out_of_run
+        if not docs:
+            continue
         att = {d["InvoiceID"]: writes.existing_attachments(c, d["InvoiceID"])
                for d in docs}
-        r, h = writes.plan_submission(docs, att, require_attachment)
+        r, h = writes.plan_submission(
+            docs, att, require_attachment,
+            stock=stock if kind == "ACCREC" else None,
+            require_stock=require_stock)
         for row in r:
             row["Kind"] = label
         for row in h:
@@ -1828,7 +2029,7 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
         ready += r
         held += h
 
-    if not ready and not held:
+    if not ready and not held and not skipped:
         return f"No draft documents dated {lo} to {hi}."
 
     errors = []
@@ -1843,6 +2044,7 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
         ready = done
 
     tax_held = [h for h in held if "TAX INCLUSIVE" in str(h.get("Why"))]
+    stock_held = [h for h in held if "INSUFFICIENT STOCK" in str(h.get("Why"))]
     out = [f"Fortnight ending {end.isoformat()}",
            "DRY RUN - nothing moved." if dry_run else
            "MOVED to Awaiting Approval. Approving and sending is still yours.",
@@ -1864,8 +2066,27 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
         out += ["", f"LEFT IN DRAFTS ({len(held)}) - these are the ones to look at:",
                 pd.DataFrame([{k: v for k, v in h.items() if k != "InvoiceID"}
                               for h in held]).to_markdown(index=False)]
+    if skipped:
+        out += ["", f"NOT IN THIS RUN ({len(skipped)}) - still Drafts, nothing "
+                "touched:",
+                pd.DataFrame([{k: v for k, v in s.items() if k != "InvoiceID"}
+                              for s in skipped]).to_markdown(index=False)]
     if errors:
         out += ["", "ERRORS:"] + [f"  {e}" for e in errors]
+    if stock_held:
+        out += ["", "*** HELD BECAUSE THE INVENTORY ADJUSTMENT IS MISSING ***",
+                "",
+                "These bill a TRACKED item that has less stock on hand than the",
+                "invoice bills. That means Phase 5 never ran for them. Approved,",
+                "the item goes negative and the cost of sales lands on the wrong",
+                "side - $24,670 sat in the wrong account for a week after the",
+                "fortnight ending 30 August 2026 for exactly this reason.",
+                "",
+                "Post the adjustment by hand: Xero > Business > Products and",
+                "services > click the item > New inventory adjustment >",
+                "Increase, dated the period end. There is no API for it.",
+                "Then run inventory_coverage(period_end) to confirm, and this",
+                "again to submit. require_stock=False overrides if you are sure."]
     if tax_held:
         out += ["", "*** HELD BECAUSE THE TAX BASIS IS WRONG ***",
                 "",
@@ -1943,9 +2164,14 @@ def payroll_entry_plan(days_worked: str, period_start: str, period_end: str) -> 
 @mcp.tool()
 def post_draft_timesheet(employee_name: str, period_start: str, period_end: str,
                          earnings_rate_id: str, units_by_date: str,
-                         payroll_calendar_id: str = "") -> str:
+                         payroll_calendar_id: str = "",
+                         dry_run: bool = True) -> str:
     """Create a DRAFT timesheet in Xero. It is not approved and does not pay
     anyone until you approve it in Xero yourself.
+
+    DRY BY DEFAULT. A draft is still a thing that appears in Xero and has to be
+    found and deleted when the name matched the wrong employee, so the match and
+    the units are shown first. Pass dry_run=False to create it.
 
     Args:
         employee_name: enough of the name to match exactly one employee
@@ -1971,6 +2197,15 @@ def post_draft_timesheet(employee_name: str, period_start: str, period_end: str,
         return (f"NOTHING POSTED. These dates fall outside {period_start} to "
                 f"{period_end}: {', '.join(stray)}. Fix the dates or the period.")
     units = [by_date.get(day, 0.0) for day in span]
+
+    if dry_run:
+        return ("DRY RUN - nothing created. Re-run with dry_run=False.\n"
+                f"Employee matched: {emp.get('FirstName')} {emp.get('LastName')} "
+                f"({emp.get('EmployeeID')})\n"
+                f"Period: {period_start} to {period_end} ({len(span)} days)\n"
+                f"Units: {sum(units):g} across "
+                f"{len([u for u in units if u])} worked day(s)\n"
+                + "\n".join(f"  {d}: {u:g}" for d, u in zip(span, units) if u))
 
     res = writes.create_draft_timesheet(
         c, emp["EmployeeID"], period_start, period_end, earnings_rate_id, units)
@@ -2011,10 +2246,15 @@ def list_payroll_setup() -> str:
 @mcp.tool()
 def post_pay_period(days_worked: str, period_start: str, period_end: str,
                     payroll_calendar_id: str, earnings_rate_id: str,
-                    invoice_date: str = "", invoice_due_date: str = "") -> str:
+                    invoice_date: str = "", invoice_due_date: str = "",
+                    dry_run: bool = True) -> str:
     """Create BOTH sides of a pay period in Xero as drafts, from one set of days:
     the payroll timesheets AND the matching sales invoice lines. Because both
     come from the same days figure, payroll and the invoice cannot diverge.
+
+    DRY BY DEFAULT. This is the largest write in the connector - a timesheet per
+    person, in one pass, with no undo but deleting each one by hand. Pass
+    dry_run=False once the figures below read right.
 
     Everything created is a DRAFT. Nothing is approved, sent or paid.
 
@@ -2065,8 +2305,10 @@ def post_pay_period(days_worked: str, period_start: str, period_end: str,
         span = (d1 - d0).days + 1
         units = [0.0] * span
         units[-1] = days          # booked to the period end date
-        res = writes.create_draft_timesheet(
-            c, emp["EmployeeID"], period_start, period_end, earnings_rate_id, units)
+        if not dry_run:
+            writes.create_draft_timesheet(
+                c, emp["EmployeeID"], period_start, period_end,
+                earnings_rate_id, units)
         ts_done.append(name)
         inv_lines.append({
             "ItemCode": r["*ItemCode"],
@@ -2078,29 +2320,68 @@ def post_pay_period(days_worked: str, period_start: str, period_end: str,
             f"  {name}: {days:g} days | pay ${days*float(r['PurchasesUnitPrice']):,.2f} "
             f"| invoice ${days*float(r['SalesUnitPrice']):,.2f}")
 
-    out = [f"DRAFT timesheets created: {len(ts_done)}", *log_lines, ""]
+    out = [("DRY RUN - nothing created. Re-run with dry_run=False.\n"
+            f"WOULD create {len(ts_done)} draft timesheet(s):") if dry_run
+           else f"DRAFT timesheets created: {len(ts_done)}", *log_lines, ""]
     out.append("Draft invoice lines prepared (one invoice per customer still needs "
                "a contact ID - run create_draft_invoice per customer, or tell me the "
                "customer and I will do it):")
     for l in inv_lines:
         out.append(f"  {l['ItemCode']}: {l['Quantity']:g} x ${l['UnitAmount']:,.2f} "
                    f"= ${l['Quantity']*l['UnitAmount']:,.2f}")
-    out += ["", "ALL DRAFTS. Nothing approved, sent or paid.",
-            "Review: Xero > Payroll > Timesheets, and Business > Invoices > Draft."]
-    _cache.clear()
+    if dry_run:
+        out += ["", "DRY RUN - nothing was written to Xero."]
+    else:
+        out += ["", "ALL DRAFTS. Nothing approved, sent or paid.",
+                "Review: Xero > Payroll > Timesheets, and Business > Invoices > Draft."]
+        _cache.clear()
     return "\n".join(out)
 
 
 @mcp.tool()
 def set_rate_card(item_code: str, cost_rate: float = None,
-                  sell_rate: float = None) -> str:
-    """Update a contractor's cost and/or sell rate on the Xero item rate card."""
-    res = writes.update_item_rates(client(), item_code, cost_rate, sell_rate)
+                  sell_rate: float = None, dry_run: bool = True) -> str:
+    """Update a contractor's cost and/or sell rate on the Xero item rate card.
+
+    DRY BY DEFAULT, like every other write here. It was the odd one out: a
+    mistyped rate went straight into Xero and then onto every invoice and bill
+    the item touches from that moment. Pass dry_run=False to write.
+
+    An item that is TRACKED and has ever been invoiced cannot be changed through
+    the API at all - Xero locks those to the web UI. The dry run says so before
+    you find out the hard way.
+    """
+    c = client()
+    wanted = (item_code or "").strip().lower()
+    existing = next((i for i in c.items()
+                     if (i.get("Code") or "").strip().lower() == wanted), None)
+    if existing is None:
+        return (f"No Xero item with code {item_code!r}. Check get_rate_card for "
+                "the exact code - they are case and space sensitive.")
+    if cost_rate is None and sell_rate is None:
+        return "Give at least one of cost_rate or sell_rate."
+
+    now_cost = (existing.get("PurchaseDetails") or {}).get("UnitPrice")
+    now_sell = (existing.get("SalesDetails") or {}).get("UnitPrice")
+    plan = [f"{existing['Code']} - {existing.get('Name') or ''}",
+            f"  cost  {now_cost} -> "
+            f"{cost_rate if cost_rate is not None else 'unchanged'}",
+            f"  sell  {now_sell} -> "
+            f"{sell_rate if sell_rate is not None else 'unchanged'}"]
+
+    if dry_run:
+        plan.insert(0, "DRY RUN - nothing written. Re-run with dry_run=False.")
+        if existing.get("IsTrackedAsInventory"):
+            plan += ["", "This item is TRACKED. If it has ever been invoiced, "
+                     "Xero will refuse the write and it has to be changed by "
+                     "hand: Business > Products and services > click the item > "
+                     "edit the price > Save."]
+        return "\n".join(plan)
+
+    res = writes.update_item_rates(c, item_code, cost_rate, sell_rate)
     _cache.clear()
-    return (f"Rate card updated for {item_code}: "
-            f"cost={cost_rate if cost_rate is not None else 'unchanged'}, "
-            f"sell={sell_rate if sell_rate is not None else 'unchanged'}. "
-            f"Xero returned: {str(res)[:200]}")
+    return "\n".join(["WRITTEN to Xero.", *plan[0:],
+                      f"Xero returned: {str(res)[:200]}"])
 
 
 if __name__ == "__main__":

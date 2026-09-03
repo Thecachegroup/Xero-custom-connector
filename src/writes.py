@@ -793,8 +793,72 @@ def tax_basis_problems(docs: list[dict], label: str = "invoice") -> list[dict]:
     return out
 
 
+def split_excluded(docs: list[dict], patterns: list[str] | None = None,
+                   monthly_codes: set[str] | frozenset[str] = frozenset(),
+                   cadence: str = "all") -> tuple[list[dict], list[dict]]:
+    """Pull documents out of a submit run BEFORE anything is judged, and say why.
+
+    Two reasons a document does not belong in this run:
+
+    CADENCE. A monthly document dated inside the fortnight's date window is
+    swept up with the fortnightly ones and pushed to Awaiting Approval beside
+    them. TCG-21205 (Bhasker Veela) went through exactly that way on 2 September
+    2026 and had to be pulled back to Draft by hand. The date window cannot tell
+    them apart - the cadence can, and it already lives in roster_overrides.json
+    keyed on item code, which is the one stable key. A document is monthly when
+    any of its lines carries a monthly person's item code.
+
+    PATTERNS. The manual escape hatch: an invoice number, a contact name, a
+    reference or an item code, matched case-insensitively as a substring. For
+    the one-off that no rule describes.
+
+    Nothing is lost by either - an excluded document stays a DRAFT and is named
+    in the report with the exact override that would include it. Deferred with a
+    reason beats sent by accident.
+
+    Returns (kept, excluded).
+    """
+    pats = [p.strip().lower() for p in (patterns or []) if str(p).strip()]
+    monthly = {str(c).strip().lower() for c in (monthly_codes or ())}
+    want = (cadence or "all").strip().lower()
+
+    kept: list[dict] = []
+    excluded: list[dict] = []
+    for d in docs:
+        num = d.get("InvoiceNumber") or str(d.get("InvoiceID", ""))[:8]
+        contact = (d.get("Contact") or {}).get("Name", "?")
+        codes = [str(li.get("ItemCode") or "").strip().lower()
+                 for li in (d.get("LineItems") or [])]
+        is_monthly = any(c in monthly for c in codes if c)
+
+        if want == "fortnightly" and is_monthly:
+            excluded.append({"Doc": num, "Contact": contact,
+                             "InvoiceID": d.get("InvoiceID"),
+                             "Why": "monthly cadence - run again with "
+                                    "cadence='monthly' or 'all' to include it"})
+            continue
+        if want == "monthly" and not is_monthly:
+            excluded.append({"Doc": num, "Contact": contact,
+                             "InvoiceID": d.get("InvoiceID"),
+                             "Why": "fortnightly cadence - not this run"})
+            continue
+
+        haystack = " ".join([str(num), str(contact),
+                             str(d.get("Reference") or ""), *codes]).lower()
+        hit = next((p for p in pats if p in haystack), None)
+        if hit:
+            excluded.append({"Doc": num, "Contact": contact,
+                             "InvoiceID": d.get("InvoiceID"),
+                             "Why": f"excluded by {hit!r}"})
+            continue
+        kept.append(d)
+    return kept, excluded
+
+
 def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
-                    require_attachment: bool = False) -> tuple[list[dict], list[dict]]:
+                    require_attachment: bool = False,
+                    stock: dict[str, dict] | None = None,
+                    require_stock: bool = True) -> tuple[list[dict], list[dict]]:
     """Which invoices are finished enough to submit, and why the rest are not.
 
     A LINE WITH NO QUANTITY ALWAYS HOLDS IT BACK. That is the real test of
@@ -810,9 +874,36 @@ def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
 
     REQUIRE_ATTACHMENT restores the stricter rule where it matters more.
 
+    NO STOCK HOLDS IT BACK. Added 3 September 2026, after the fortnight ending
+    30 August: the manual Phase 5 inventory adjustment ran once and stopped, and
+    three sales invoices reached Awaiting Approval against TRACKED items with
+    zero on hand. Approving any of them would have driven the item negative and
+    thrown the cost of sales onto the wrong side. Submitting is where an invoice
+    leaves the to-do list - once it sits in Awaiting Approval it looks finished -
+    so this is the last automated point at which a missing adjustment can be
+    caught before Andrew approves it.
+
+    STOCK is coverage.stock_index(): code_key -> {Code, Name, Tracked, OnHand}.
+    Untracked items are never held; they post the cost straight to the expense
+    account off the bill or the pay run and need no adjustment, ever. Pass
+    require_stock=False to override for one run.
+
+    The stock is ONE POOL and it is spent in document order. Two invoices each
+    billing ten days of one item against ten on hand each look fine alone and
+    take the item to minus ten together, so a document that goes out draws its
+    quantities down and the next is measured against what is left. A document
+    held back for any reason spends nothing - being held for a missing quantity
+    must not also starve the invoice behind it.
+
     Returns (ready, held). Rows carry Evidence so the caller can say which went
     out bare.
     """
+    from . import coverage
+
+    index = stock or {}
+    guarding = bool(index) and require_stock
+    pool = coverage.opening_pool(index) if guarding else {}
+
     ready: list[dict] = []
     held: list[dict] = []
     for d in docs:
@@ -836,6 +927,13 @@ def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
         if require_attachment and not has_doc:
             held.append({**row, "Why": "nothing attached"})
             continue
+        if guarding:
+            short = coverage.shortfalls(index, lines, pool)
+            if short:
+                held.append({**row,
+                             "Why": "INSUFFICIENT STOCK - " + "; ".join(short)})
+                continue
+            coverage.spend(lines, index, pool)
         ready.append({**row, "Total": d.get("Total") or d.get("SubTotal"),
                       "Evidence": "attached" if has_doc else "NONE YET"})
     return ready, held

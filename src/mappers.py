@@ -495,6 +495,59 @@ def build_employee_code_map(items: pd.DataFrame) -> dict:
     return {"_resolve": resolve}
 
 
+def exempt_item_codes(items: pd.DataFrame,
+                      names) -> tuple[set[str], list[str]]:
+    """Turn a list of payroll-tax-exempt NAMES into the set of item codes they
+    own, and the names no item could be found for.
+
+    Why this exists: config/no_payroll_tax.json is a list of people, which is
+    how Andrew thinks about the exemption and how he will keep maintaining it.
+    The comparison, though, has to happen on the item code - a line description
+    carrying a role title or a PO number is not a name and never matched.
+    Resolving names to codes ONCE, here, against the Xero item list keeps the
+    config human and the matching stable.
+
+    MATCHING IS STRICT EQUALITY on the normalised name, plus the reversed
+    "Surname First" form, and nothing else. No prefix match, no
+    every-word-appears match - build_employee_code_map uses those to find a
+    contractor's cost, where a near miss costs a join. Here a near miss grants
+    somebody else's exemption and takes money out of the payroll tax base, so
+    the bar is higher and a name that does not match exactly is reported rather
+    than guessed at.
+
+    A name matching SEVERAL items returns all of them. That is not ambiguity to
+    be dropped: 'Mazher Ali' owns 'Linfox - MAZ', 'zLinfox - MA' and
+    'zLinfox - MAZ', and every one of them is his. Codes come back normalised
+    (leading z stripped, case-folded), which is the join key the data frame uses.
+
+    Returns (codes, unresolved_names).
+    """
+    named = items.dropna(subset=["Name"]).copy() if not items.empty else items
+    lookup: dict[str, set[str]] = {}
+    if not items.empty:
+        for key, code in zip(named["Name"].map(_name_key), named["*ItemCode"]):
+            if key:
+                lookup.setdefault(key, set()).add(normalise_code(code))
+
+    codes: set[str] = set()
+    unresolved: list[str] = []
+    for raw in names or []:
+        k = _name_key(raw)
+        if not k:
+            continue
+        hit = lookup.get(k)
+        if not hit:
+            parts = k.split()
+            if len(parts) >= 2:
+                hit = lookup.get(" ".join(reversed(parts)))
+        if hit:
+            codes |= hit
+        else:
+            unresolved.append(str(raw))
+    codes.discard("")
+    return codes, unresolved
+
+
 def suggest_codes_for(employee: str, items: pd.DataFrame, limit: int = 3) -> list:
     """Candidate item codes for an unmatched employee, scored on initials and
     surname appearing in the code (TCG codes them 'Linfox - LSOTO' for Louis
@@ -570,8 +623,15 @@ def build_data_frame(
     customer_lookup: dict[str, str],
     no_payroll_tax: set[str],
     current_fy_start: date,
+    no_payroll_tax_codes: set[str] | frozenset[str] = frozenset(),
 ) -> pd.DataFrame:
-    """Union Sales + Bills + Payroll into the normalised `Data` schema."""
+    """Union Sales + Bills + Payroll into the normalised `Data` schema.
+
+    no_payroll_tax       - exempt people by NAME, matched against Description.
+                           Kept for the names no item code can be found for.
+    no_payroll_tax_codes - exempt people by ITEM CODE. See the payroll-tax
+                           branch below for why this had to be added.
+    """
     frames = []
 
     # Prefer Active rows, then last-written, when an item code appears twice.
@@ -651,11 +711,36 @@ def build_data_frame(
     data["Month"] = data["Date"].dt.strftime("%b-%y")
     data["Contractor type"] = data["Source"].map({"Bills": "ABN", "Payroll": "PAYG"}).fillna("ABN")
     data["Type"] = "Contractor"
-    data["Payroll Tax Payable"] = data.apply(
-        lambda r: "Not Payable" if str(r["Description"]).strip() in no_payroll_tax
-        else (r.get("Payroll Tax Payable") or "Payable"),
-        axis=1,
-    )
     data["Match key"] = data["Inventory code"].map(normalise_code)
+
+    # Payroll tax exemptions are keyed on ITEM CODE first, name second.
+    #
+    # The list used to be compared to Description and nothing else. On a payroll
+    # row Description IS the employee's name, so it worked there and looked
+    # fine. On a sales or bill line Description is whatever the invoice line
+    # says - "Rajeev Jindal - Solution Architect", "P/O 4500123456", a date
+    # range - and an exact string comparison misses every one of them. Those
+    # lines fell through to "Payable": $95,876.29 wrongly in the Victorian base
+    # in July FY27 alone.
+    #
+    # The item code is the one stable key, and normalise_code folds the retired
+    # 'zLinfox - X' back onto 'Linfox - X' so an exemption follows a person into
+    # the archive instead of lapsing the day they are renamed.
+    #
+    # The name path is kept, not replaced: it is what still covers anyone with
+    # no inventory item, and removing it would trade one silent miss for
+    # another. server._payroll_tax_exemptions() reports every name it could not
+    # resolve to a code, so the gap is visible rather than assumed empty.
+    exempt_codes = {normalise_code(c) for c in (no_payroll_tax_codes or ())}
+    exempt_codes.discard("")
+
+    def _payroll_tax(r):
+        if r["Match key"] in exempt_codes:
+            return "Not Payable"
+        if str(r["Description"]).strip() in no_payroll_tax:
+            return "Not Payable"
+        return r.get("Payroll Tax Payable") or "Payable"
+
+    data["Payroll Tax Payable"] = data.apply(_payroll_tax, axis=1)
     data["Place"] = range(1, len(data) + 1)
     return data.reset_index(drop=True)
