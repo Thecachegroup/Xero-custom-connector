@@ -39,8 +39,7 @@ def test_a_zero_line_is_filled_and_stamped_once():
     # run the planner again over the now-filled line: nothing more happens
     planned2, skipped2, to_write2 = w.plan_line_fill(docs, {"Linfox - DL": 10}, STAMP)
     assert planned2 == [] and to_write2 == []
-    assert skipped2[0]["Why"] == "already at 10 - left alone"
-    assert skipped2[0]["Mismatch"] is False
+    assert skipped2[0]["Why"].startswith("already billed")
     assert line["Description"].count("Fortnight ending") == 1
 
 
@@ -50,30 +49,6 @@ def test_a_line_someone_already_billed_is_never_touched():
     planned, skipped, to_write = w.plan_line_fill(docs, {"Linfox - JJ": 99}, STAMP)
     assert planned == [] and to_write == []
     assert docs[0]["LineItems"][0]["Quantity"] == 12
-
-
-def test_a_quantity_that_is_not_the_days_asked_for_is_called_a_mismatch():
-    """Bhasker Veela, August 2026. His repeating sales template generated at 1,
-    so the draft carried 1 day against 21 worked. The fill correctly refused to
-    overwrite it - and then reported it as "already billed - left alone", which
-    is how ~$6,573 under-billed reached Awaiting Approval unremarked.
-
-    Both numbers are in hand at this point. Say they disagree."""
-    docs = [_doc("TCG-9", "Linfox", "Linfox - BV", 320, qty=1)]
-    planned, skipped, to_write = w.plan_line_fill(docs, {"Linfox - BV": 21}, STAMP)
-    assert planned == [] and to_write == []
-    assert docs[0]["LineItems"][0]["Quantity"] == 1, "still never overwritten"
-    assert skipped[0]["Mismatch"] is True
-    assert skipped[0]["Qty already"] == 1 and skipped[0]["You said"] == 21
-    assert "MISMATCH" in skipped[0]["Why"]
-
-
-def test_the_same_days_twice_is_not_a_mismatch():
-    """An earlier sweep in the same billing week. Benign, and must stay quiet -
-    a warning that cries every fortnight is a warning nobody reads."""
-    docs = [_doc("TCG-10", "Linfox", "Linfox - EK", 1385, qty=2.5)]
-    _, skipped, _ = w.plan_line_fill(docs, {"Linfox - EK": 2.5}, STAMP)
-    assert skipped[0]["Mismatch"] is False
 
 
 def test_an_item_code_not_asked_for_is_left_alone():

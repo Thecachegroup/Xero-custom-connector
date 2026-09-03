@@ -400,46 +400,6 @@ def update_invoice_lines(client, invoice_id: str, lines: list[dict]) -> dict:
     return update_invoice(client, invoice_id, lines=lines)
 
 
-# Fields Xero DERIVES on a repeating template. They come back on the GET and
-# must not be echoed into an update: leaving a stale LineAmount of 320 beside a
-# new Quantity of 0 asks Xero to reconcile two answers, and which one wins is
-# not something to find out on a live client template. Same reasoning as
-# _LINE_KEEP on invoices - that lesson was learned there and is applied here.
-_TEMPLATE_DROP_DOC = ("SubTotal", "TotalTax", "Total")
-_TEMPLATE_DROP_LINE = ("LineAmount", "TaxAmount")
-
-
-def update_repeating_template(client, template: dict) -> dict:
-    """Post one repeating template back to Xero. GUARDED.
-
-    A repeating template writes an invoice every period with nobody looking at
-    it, so this is the most consequential write in the connector and it goes
-    through the same TCG_WRITE_ENABLED gate as everything else.
-
-    The template must have been READ BACK from Xero first, so the payload
-    carries Xero's own contact, schedule, tracking and account codes and only
-    the field the caller changed is different. The derived money fields are
-    stripped on the way out.
-    """
-    _guard()
-    if not template.get("RepeatingInvoiceID"):
-        raise ValueError(
-            "No RepeatingInvoiceID on the template - refusing to post, because "
-            "Xero would create a SECOND template rather than update this one."
-        )
-    if str(template.get("Status") or "").upper() == "DELETED":
-        raise ValueError(
-            "That repeating template is DELETED in Xero. Nothing has been sent."
-        )
-    payload = {k: v for k, v in template.items() if k not in _TEMPLATE_DROP_DOC}
-    payload["LineItems"] = [
-        {k: v for k, v in (li or {}).items() if k not in _TEMPLATE_DROP_LINE}
-        for li in (template.get("LineItems") or [])
-    ]
-    return _post(client, f"{API_BASE}/RepeatingInvoices",
-                 {"RepeatingInvoices": [payload]})
-
-
 # ---------------------------------------------------------------- fill planning
 # Pure logic, no network. Separated so it can be tested, because this decides
 # what number goes on an invoice that goes to a client.
@@ -492,30 +452,11 @@ def plan_line_fill(docs: list[dict], wanted: dict[str, float], stamp: str,
                 continue
             qty = li.get("Quantity") or 0
             if qty:
-                # The line already carries days, so it is not filled - that rule
-                # is what makes four sweeps in a billing week safe. But WHY it
-                # carries days matters, and both numbers are in hand here.
-                #
-                # Equal to what was asked for: an earlier sweep did it. Benign.
-                #
-                # DIFFERENT to what was asked for: something put a number on
-                # this line that is not the days worked - almost always a
-                # repeating template generating at 1 instead of 0. That is how
-                # Bhasker Veela's August invoice reached Awaiting Approval at
-                # ONE day against 21 worked, ~$6,573 under-billed, while the
-                # fill reported it as "already billed - left alone" and nobody
-                # looked twice. Reported as a mismatch from here, not as
-                # reassurance. Still never overwritten - the person decides.
-                asked = wanted[code]
-                match = float(qty) == float(asked)
                 skipped.append({
                     "Doc": d.get("InvoiceNumber") or str(d.get("InvoiceID", ""))[:8],
                     "Contact": (d.get("Contact") or {}).get("Name", "?"),
-                    "Item": code, "Qty already": qty, "You said": asked,
-                    "Why": (f"already at {asked:g} - left alone" if match else
-                            f"MISMATCH - line has {float(qty):g}, "
-                            f"you said {float(asked):g}"),
-                    "Mismatch": not match,
+                    "Item": code, "Qty already": qty,
+                    "Why": "already billed - left alone",
                 })
                 continue
 

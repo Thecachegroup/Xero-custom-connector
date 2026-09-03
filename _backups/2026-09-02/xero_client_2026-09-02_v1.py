@@ -358,22 +358,15 @@ class XeroClient:
         return self.get(f"{API_BASE}/RepeatingInvoices").get("RepeatingInvoices", [])
 
     def post_repeating_invoice(self, payload: dict) -> dict:
-        """CLOSED. Use writes.update_repeating_template(client, template).
+        """Update a repeating template. Xero POSTs with the ID to modify.
 
-        This wrote a repeating template straight from the read client, which
-        meant the single most consequential write in the connector - a template
-        that raises an invoice every period with nobody looking at it - was the
-        one write that did NOT pass the TCG_WRITE_ENABLED gate, and the one that
-        echoed Xero's own derived LineAmount back beside a changed Quantity.
-
-        Both problems are solved in writes.py for invoices already. There is one
-        write path now, and this is not it.
+        Only ever called with a template that has been read back first, so the
+        payload carries Xero's own values and changes exactly the one field
+        intended. A repeating template writes an invoice every period without
+        anybody looking at it, which is precisely why it must not be guessed at.
         """
-        raise NotImplementedError(
-            "Use writes.update_repeating_template(client, template) - it is "
-            "guarded by TCG_WRITE_ENABLED and strips the derived money fields. "
-            "Nothing has been sent to Xero."
-        )
+        return self.post(f"{API_BASE}/RepeatingInvoices",
+                         {"RepeatingInvoices": [payload]})
 
     def contacts(self) -> list[dict]:
         out, page = [], 1

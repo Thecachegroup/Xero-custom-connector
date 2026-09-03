@@ -620,8 +620,6 @@ def set_repeating_quantity(item_code: str, quantity: float = 0,
             continue
         if want == "bills" and typ != "ACCPAY":
             continue
-        if str(r.get("Status") or "").upper() == "DELETED":
-            continue        # deleted in Xero; it generates nothing and is not ours to touch
         if any(str(l.get("ItemCode") or "").lower() == code_l
                for l in r.get("LineItems") or []):
             hits.append(r)
@@ -632,8 +630,6 @@ def set_repeating_quantity(item_code: str, quantity: float = 0,
 
     lines = [f"{'DRY RUN - nothing written' if dry_run else 'UPDATED'}: "
              f"{len(hits)} template(s) for {item_code}", ""]
-    written: list[tuple[str, str, str]] = []
-    failed: list[str] = []
     for r in hits:
         typ = "sales" if str(r.get("Type")).upper() == "ACCREC" else "bill"
         contact = str((r.get("Contact") or {}).get("Name") or "")
@@ -652,41 +648,12 @@ def set_repeating_quantity(item_code: str, quantity: float = 0,
             continue
         lines += changed
         if not dry_run:
-            try:
-                writes.update_repeating_template(c, r)
-                written.append((str(r.get("RepeatingInvoiceID") or ""), typ, contact))
-            except Exception as e:                                 # noqa: BLE001
-                failed.append(f"  {typ:<5} {contact[:32]:<34} NOT CHANGED - {e}")
-
-    if failed:
-        lines += ["", "FAILED:"] + failed
+            c.post_repeating_invoice(r)
 
     if dry_run:
         lines += ["", "Re-run with dry_run=False to apply."]
-    elif written:
-        # Read the templates back and prove the number actually moved. This is
-        # the one tool whose whole reason for existing is that nobody reads the
-        # quantity, so it is not going to ask somebody to go and read it.
-        after = {str(t.get("RepeatingInvoiceID") or ""): t
-                 for t in c.repeating_invoices()}
-        verified, wrong = [], []
-        for tid, typ, contact in written:
-            t = after.get(tid)
-            if not t:
-                wrong.append(f"  {typ:<5} {contact[:32]:<34} could not be read back")
-                continue
-            now = [float(l.get("Quantity") or 0) for l in (t.get("LineItems") or [])
-                   if str(l.get("ItemCode") or "").lower() == code_l]
-            if now and all(q == float(quantity) for q in now):
-                verified.append(f"  {typ:<5} {contact[:32]:<34} confirmed at {float(quantity):g}")
-            else:
-                wrong.append(f"  {typ:<5} {contact[:32]:<34} reads back as "
-                             f"{', '.join(f'{q:g}' for q in now) or '(no line)'}")
-        lines += ["", "READ BACK FROM XERO:"] + verified + wrong
-        if wrong:
-            lines += ["", "One or more templates do NOT read back at the value "
-                          "asked for. Do not assume the change took - open the "
-                          "template in Xero before the next period generates."]
+    else:
+        lines += ["", "Run list_repeating_templates() to confirm."]
     return "\n".join(lines)
 
 
@@ -1423,32 +1390,7 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
                 pd.DataFrame([{k: v for k, v in n.items() if k != "InvoiceID"}
                               for n in renumbered]).to_markdown(index=False)]
     if skipped:
-        # A line already carrying days is never overwritten. But a line carrying
-        # a DIFFERENT number to the days you gave is not "already billed" - it
-        # is a number nobody put there on purpose, and it goes out at that
-        # number. Bhasker Veela's August sales invoice sat at 1 day against 21
-        # worked because the repeating template generated at 1; the fill left it
-        # alone, said "already billed", and ~$6,573 got one approval from going
-        # out the door. Mismatches lead, on their own, above the benign ones.
-        mism = [r for r in skipped if r.get("Mismatch")]
-        benign = [r for r in skipped if not r.get("Mismatch")]
-        if mism:
-            out += ["", "*** QUANTITY MISMATCH - READ THIS ***",
-                    pd.DataFrame([{k: v for k, v in r.items() if k != "Mismatch"}
-                                  for r in mism]).to_markdown(index=False),
-                    "",
-                    "These lines already carry a quantity that is NOT the days",
-                    "you gave, so the fill has left them alone and they will",
-                    "invoice at the number shown. Usually a repeating template",
-                    "generating at something other than zero - check it with",
-                    "list_repeating_templates() and fix it with",
-                    "set_repeating_quantity('<item code>', 0). Correct the",
-                    "current draft in Xero by hand; nothing here overwrites a",
-                    "line somebody may have set deliberately."]
-        if benign:
-            out += ["", "LEFT ALONE (already at the days you gave):",
-                    pd.DataFrame([{k: v for k, v in r.items() if k != "Mismatch"}
-                                  for r in benign]).to_markdown(index=False)]
+        out += ["", "LEFT ALONE:", pd.DataFrame(skipped).to_markdown(index=False)]
     if missing:
         out += ["", "NO DRAFT FOUND for these item codes: " + ", ".join(missing)]
     if errors:

@@ -1,0 +1,6 @@
+mcp[cli]>=1.2.0,<2.0.0
+requests>=2.32
+pandas>=2.2
+openpyxl>=3.1
+tabulate>=0.9
+python-dotenv>=1.0
