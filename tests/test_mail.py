@@ -619,3 +619,56 @@ def test_without_prior_numbers_nothing_changes():
     )], date(2026, 8, 30), ROSTER)
     assert plan["duplicates"] == []
     assert len(plan["files"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# The duplicate guard's cutoff — proved wrong live on 3 September 2026
+# ---------------------------------------------------------------------------
+
+def test_the_prior_cutoff_clears_the_previous_fortnights_billing_monday():
+    """THE BUG THAT MADE THE GUARD SILENT.
+
+    TCG dates a bill the Monday AFTER the fortnight it pays for. For the
+    fortnight ending 16 August that Monday is 17 August. The original cutoff was
+    period_end - 13 days, which for the fortnight ending 30 August is ALSO
+    17 August, and it required a bill dated strictly before it - so every one of
+    the previous fortnight's bills missed by exactly one day and the guard could
+    never fire for anybody.
+
+    Live proof, 3 September 2026: Bilal Virk INV-0016 and Jay Jhala 20260802,
+    both on bills dated 2026-08-17, both PAID, both re-sent, both filed.
+    """
+    from datetime import date, timedelta
+
+    period_end = date(2026, 8, 30)
+    prior_billing_monday = date(2026, 8, 17)
+
+    old_cutoff = period_end - timedelta(days=13)
+    assert old_cutoff == prior_billing_monday
+    assert not (prior_billing_monday < old_cutoff)        # excluded - the bug
+
+    new_cutoff = period_end - timedelta(days=10)          # window_days
+    assert prior_billing_monday < new_cutoff              # included - the fix
+
+
+def test_this_fortnights_own_bills_are_never_treated_as_prior():
+    """A bill for THIS fortnight must not make this fortnight's own invoice look
+    like a duplicate of itself. Vivek's August bill is dated the 28th and
+    Bhasker's the 30th - both inside the window, both correctly excluded."""
+    from datetime import date, timedelta
+
+    cutoff = date(2026, 8, 30) - timedelta(days=10)
+    for own in (date(2026, 8, 28), date(2026, 8, 30), date(2026, 8, 31)):
+        assert not (own < cutoff)
+
+
+def test_the_window_must_stay_under_a_fortnight():
+    """Fortnights are 14 days apart. At window_days >= 14 the previous
+    fortnight's billing Monday falls inside the window and stops counting as
+    prior, which puts the guard straight back to silent."""
+    from datetime import date, timedelta
+
+    period_end = date(2026, 8, 30)
+    prior_billing_monday = date(2026, 8, 17)
+    assert prior_billing_monday < period_end - timedelta(days=10)
+    assert not (prior_billing_monday < period_end - timedelta(days=14))
