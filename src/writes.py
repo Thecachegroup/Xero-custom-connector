@@ -858,7 +858,9 @@ def split_excluded(docs: list[dict], patterns: list[str] | None = None,
 def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
                     require_attachment: bool = False,
                     stock: dict[str, dict] | None = None,
-                    require_stock: bool = True) -> tuple[list[dict], list[dict]]:
+                    require_stock: bool = True,
+                    reserved: list[dict] | None = None
+                    ) -> tuple[list[dict], list[dict]]:
     """Which invoices are finished enough to submit, and why the rest are not.
 
     A LINE WITH NO QUANTITY ALWAYS HOLDS IT BACK. That is the real test of
@@ -895,6 +897,14 @@ def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
     held back for any reason spends nothing - being held for a missing quantity
     must not also starve the invoice behind it.
 
+    RESERVED is the documents already in Awaiting Approval. Xero takes tracked
+    stock out on APPROVAL, not on submit, so their quantities still read as on
+    hand and have to be subtracted before anything new is measured against what
+    is left. Two ten-day invoices on one item with ten on hand - one submitted
+    Wednesday, one filled Friday - both cleared the guard and both drove the
+    item to minus ten. inventory_coverage had this right from the start; this
+    is the two tools agreeing on identical facts.
+
     Returns (ready, held). Rows carry Evidence so the caller can say which went
     out bare.
     """
@@ -902,7 +912,7 @@ def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
 
     index = stock or {}
     guarding = bool(index) and require_stock
-    pool = coverage.opening_pool(index) if guarding else {}
+    pool = coverage.opening_pool(index, reserved) if guarding else {}
 
     ready: list[dict] = []
     held: list[dict] = []

@@ -1591,7 +1591,14 @@ def inventory_coverage(period_end: str, window_days: int = 10) -> str:
 
     docs = list(c.iter_invoices("ACCREC", lo, hi,
                                 statuses=["DRAFT", "SUBMITTED", "AUTHORISED"]))
-    items = _stage("items", c.items)
+    # NOT _stage("items", ...). QuantityOnHand is the one number this tool
+    # exists to read, the cache holds it for 15 minutes, and the whole workflow
+    # is "post the adjustment by hand in Xero, then run this to confirm". Off
+    # the cache that confirmation returns the PRE-adjustment snapshot, tells the
+    # operator the adjustment is still missing, and the next line of advice is
+    # require_stock=False - which switches the guard off over a stale read. One
+    # extra Xero call is the right price.
+    items = c.items()
     rows = coverage.plan_coverage(docs, items, _ignored_item_codes())
 
     out = [f"Tracked-inventory coverage, sales invoices dated {lo} to {hi}",
@@ -1961,7 +1968,25 @@ def attach_period_files(period_end: str, dry_run: bool = True,
     if not files:
         return f"No files in {folder}. Run sweep_timesheets first."
 
+    # From the LIVE roster, not config/contractor_mail.json. sweep_timesheets
+    # files into folders derived from Xero; this step mapped those folders back
+    # through the retired hand-maintained JSON, whose own header says nothing
+    # reads it and it is safe to delete. Delete it and every attachment silently
+    # reports "folder does not map to a contractor" and nothing is attached;
+    # keep it and anyone set up in Xero but never added to it has their
+    # timesheet swept, filed, and then never attached - the Jerry Gonsalves and
+    # Mazher Ali drift that roster.py exists to end, reintroduced one step later.
+    # The JSON is still merged underneath so an entry only it knows about is not
+    # lost, but Xero wins on any folder both describe.
     folder_to_code = {ct["folder"]: ct["item_code"] for ct in mmap.load_contractors()}
+    try:
+        folder_to_code.update({r["folder"]: r["item_code"]
+                               for r in _live_roster()[0]
+                               if r.get("folder") and r.get("item_code")})
+    except Exception as e:                                         # noqa: BLE001
+        log.warning("Could not build the folder map from the live roster (%s). "
+                    "Falling back to config/contractor_mail.json, which is "
+                    "retired and may be missing recent starters.", e)
 
     # Not only drafts. A timesheet that turns up after the invoice has gone out
     # still belongs on it - Andrew's rule is that the invoice does not wait for
@@ -2088,7 +2113,13 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
     if (cadence or "").strip().lower() not in ("all", "fortnightly", "monthly"):
         return "cadence must be 'fortnightly', 'monthly' or 'all'."
 
-    stock = coverage.stock_index(_stage("items", c.items)) if require_stock else {}
+    # Live items, for the same reason inventory_coverage does not use the cache.
+    stock = coverage.stock_index(c.items()) if require_stock else {}
+    # Everything already in Awaiting Approval is going to eat this stock the
+    # moment it is approved - Xero only decrements on approval - so its demand
+    # is subtracted before any new draft is measured against what is left.
+    reserved = (list(c.iter_invoices("ACCREC", lo, hi, statuses=["SUBMITTED"]))
+                if require_stock else [])
     monthly_codes = _monthly_item_codes()
     patterns = [p for p in (exclude or "").split(",") if p.strip()]
 
@@ -2109,7 +2140,8 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
         r, h = writes.plan_submission(
             docs, att, require_attachment,
             stock=stock if kind == "ACCREC" else None,
-            require_stock=require_stock)
+            require_stock=require_stock,
+            reserved=reserved if kind == "ACCREC" else None)
         for row in r:
             row["Kind"] = label
         for row in h:

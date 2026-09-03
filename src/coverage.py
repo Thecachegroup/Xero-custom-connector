@@ -289,6 +289,21 @@ def spend(lines: list[dict], index: dict[str, dict],
         pool[k] = pool.get(k, 0.0) - _num(li.get("Quantity"))
 
 
-def opening_pool(index: dict[str, dict]) -> dict[str, float]:
-    """A fresh stock pool: every tracked item at its current QuantityOnHand."""
-    return {k: v["OnHand"] for k, v in index.items() if v["Tracked"]}
+def opening_pool(index: dict[str, dict],
+                 reserved: list[dict] | None = None) -> dict[str, float]:
+    """A fresh stock pool: every tracked item at its current QuantityOnHand,
+    less anything already spoken for.
+
+    RESERVED is the documents that are going to consume this stock but have not
+    consumed it yet - in practice everything already sitting in Awaiting
+    Approval. Xero decrements tracked stock on APPROVAL, not on submit, so an
+    invoice submitted on Wednesday still shows its quantity as available on
+    Friday. Without this the guard measured Friday's drafts against stock that
+    Wednesday had already claimed, cleared them, and both went negative on
+    approval - the very outcome it exists to prevent. inventory_coverage got
+    this right from the start and the two tools disagreed on identical facts.
+    """
+    pool = {k: v["OnHand"] for k, v in index.items() if v["Tracked"]}
+    for d in reserved or []:
+        spend(d.get("LineItems") or [], index, pool)
+    return pool

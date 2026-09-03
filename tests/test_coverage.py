@@ -501,3 +501,83 @@ def test_the_shipped_config_parses_and_is_not_empty():
     assert isinstance(blob, dict)
     assert len(blob["names"]) > 40
     assert "item_codes" in blob
+
+
+# ---------------------------------------------------------------------------
+# Awaiting Approval already claims the stock — found 3 September 2026
+# ---------------------------------------------------------------------------
+
+def test_a_submitted_invoice_reserves_its_stock():
+    """Xero decrements tracked stock on APPROVAL, not on submit. An invoice
+    sitting in Awaiting Approval has not taken its quantity out yet, so the raw
+    QuantityOnHand still shows it as available and the next draft is measured
+    against stock that is already spoken for."""
+    stock = coverage.stock_index(ITEMS)                    # Linfox - DL, 10 on hand
+    submitted = [_doc("TCG-1", "Linfox - DL", 10, status="SUBMITTED")]
+    assert coverage.opening_pool(stock)["linfox - dl"] == 10
+    assert coverage.opening_pool(stock, submitted)["linfox - dl"] == 0
+
+
+def test_submit_holds_a_draft_whose_stock_is_already_in_awaiting_approval():
+    """THE DEFECT. Ten on hand, one ten-day invoice submitted Wednesday, another
+    filled Friday. Both cleared the guard and both drove the item to minus ten -
+    while inventory_coverage, on the same two documents, said SHORT 10."""
+    stock = coverage.stock_index(ITEMS)
+    submitted = [_doc("TCG-1", "Linfox - DL", 10, status="SUBMITTED")]
+    drafts = [_doc("TCG-2", "Linfox - DL", 10, status="DRAFT")]
+
+    _, held = writes.plan_submission(drafts, _att(drafts), stock=stock,
+                                     reserved=submitted)
+    assert [h["Doc"] for h in held] == ["TCG-2"]
+    assert "INSUFFICIENT STOCK" in held[0]["Why"]
+
+    # And the two tools now agree on the same facts.
+    rows = coverage.plan_coverage(submitted + drafts, ITEMS)
+    assert rows[0]["Verdict"].startswith("SHORT 10")
+
+
+def test_reserving_nothing_leaves_the_guard_as_it_was():
+    stock = coverage.stock_index(ITEMS)
+    drafts = [_doc("TCG-2", "Linfox - DL", 10, status="DRAFT")]
+    ready, held = writes.plan_submission(drafts, _att(drafts), stock=stock,
+                                         reserved=[])
+    assert [r["Doc"] for r in ready] == ["TCG-2"] and held == []
+
+
+# ---------------------------------------------------------------------------
+# The rate card must index the LIVE item, not the retired one
+# ---------------------------------------------------------------------------
+
+def test_the_rate_card_check_uses_the_live_item_not_the_z_duplicate():
+    """Mazher Ali: 'Linfox - MAZ' at 1225 and 'zLinfox - MAZ' at 1103, both
+    Active, both normalising to the same key. Indexed on the retired one, a
+    correct invoice at 1225 raised a false HIGH and a real underbill at the
+    stale 1103 - $122 a day, $1,220 a fortnight - passed silently. That is the
+    unexplained rate spike this rule was written for."""
+    from datetime import date
+    from src import checks
+
+    # Row order matters and this is the order Xero returns: the z-prefixed code
+    # sorts AFTER the live one, so a plain drop_duplicates(keep="last") lands on
+    # the retired item. Reverse these two rows and the old code passes by luck -
+    # which is exactly how this defect stayed invisible.
+    items = pd.DataFrame([
+        {"Name": "Mazher Ali", "*ItemCode": "Linfox - MAZ", "ItemName": "Mazher Ali",
+         "SalesUnitPrice": 1225.0, "PurchasesUnitPrice": 1000.0, "Status": "Active"},
+        {"Name": "Mazher Ali", "*ItemCode": "zLinfox - MAZ", "ItemName": "Mazher Ali",
+         "SalesUnitPrice": 1103.0, "PurchasesUnitPrice": 900.0, "Status": "Active"},
+    ])
+
+    def _line(rate):
+        return pd.DataFrame([{
+            "Source": "Sales", "Description": "Mazher Ali",
+            "Inventory code": "Linfox - MAZ", "Customer": "Linfox",
+            "Date": pd.Timestamp(date(2026, 8, 31)), "Units": 10.0,
+            "Rate": rate, "Amount": rate * 10, "InvoiceNumber": "TCG-1",
+            "Status": "AUTHORISED", "Month": "Aug-26",
+        }])
+
+    # Billed correctly at the live rate: no exception.
+    assert checks.rate_vs_rate_card(_line(1225.0), items) == []
+    # Billed at the stale retired rate: this is the one that must be caught.
+    assert checks.rate_vs_rate_card(_line(1103.0), items) != []

@@ -625,6 +625,76 @@ def test_without_prior_numbers_nothing_changes():
 # The duplicate guard's cutoff — proved wrong live on 3 September 2026
 # ---------------------------------------------------------------------------
 
+class _StubXero:
+    """Just enough Xero to drive _prior_invoice_numbers.
+
+    Returns the two bills that were actually re-sent and wrongly filed on
+    3 September 2026, at their real dates and numbers, and ignores the date
+    range it is handed - the point of the test is the cutoff the function
+    applies AFTER the fetch, which is where the bug lived.
+    """
+
+    def iter_invoices(self, kind, start, end, statuses=None):
+        assert kind == "ACCPAY"
+        return iter([
+            {"InvoiceNumber": "INV-0016", "Date": "2026-08-17T00:00:00",
+             "Status": "PAID",
+             "LineItems": [{"ItemCode": "Linfox - BVIRK", "Quantity": 10}]},
+            {"InvoiceNumber": "20260802", "Date": "2026-08-17T00:00:00",
+             "Status": "PAID",
+             "LineItems": [{"ItemCode": "Linfox - JJ", "Quantity": 12}]},
+            # This fortnight's own bills. Must NOT come back as prior, or a
+            # contractor's current invoice reads as a duplicate of itself.
+            {"InvoiceNumber": "August 2026", "Date": "2026-08-28T00:00:00",
+             "Status": "AUTHORISED",
+             "LineItems": [{"ItemCode": "Linfox - VKC", "Quantity": 1}]},
+            {"InvoiceNumber": "20260831", "Date": "2026-08-31T00:00:00",
+             "Status": "AUTHORISED",
+             "LineItems": [{"ItemCode": "Linfox - DV", "Quantity": 10}]},
+        ])
+
+
+def test_prior_numbers_finds_the_previous_fortnights_billing_monday(monkeypatch):
+    """THE PIN. Runs the real function, not date arithmetic beside it.
+
+    An earlier version of this test asserted the arithmetic only, so it passed
+    against the unfixed code and proved nothing - the deployed connector filed
+    both duplicates while the suite reported 207 green. A test that cannot fail
+    on the broken code is documentation, not a test.
+    """
+    from datetime import date
+    from src import server
+
+    monkeypatch.setattr(server, "client", lambda: _StubXero())
+    prior = server._prior_invoice_numbers(date(2026, 8, 30))
+
+    assert "INV-0016" in prior.get("Linfox - BVIRK", {})
+    assert "20260802" in prior.get("Linfox - JJ", {})
+    assert prior["Linfox - BVIRK"]["INV-0016"] == "2026-08-17"
+
+
+def test_prior_numbers_excludes_this_fortnights_own_bills(monkeypatch):
+    from datetime import date
+    from src import server
+
+    monkeypatch.setattr(server, "client", lambda: _StubXero())
+    prior = server._prior_invoice_numbers(date(2026, 8, 30))
+
+    assert "Linfox - VKC" not in prior          # bill dated 28 August
+    assert "Linfox - DV" not in prior           # bill dated 31 August
+
+
+def test_prior_numbers_is_silent_at_the_old_cutoff(monkeypatch):
+    """window_days=13 reproduces the shipped bug exactly: the previous
+    fortnight's billing Monday lands ON the cutoff and is excluded, and the
+    guard has nothing to match against."""
+    from datetime import date
+    from src import server
+
+    monkeypatch.setattr(server, "client", lambda: _StubXero())
+    assert server._prior_invoice_numbers(date(2026, 8, 30), window_days=13) == {}
+
+
 def test_the_prior_cutoff_clears_the_previous_fortnights_billing_monday():
     """THE BUG THAT MADE THE GUARD SILENT.
 

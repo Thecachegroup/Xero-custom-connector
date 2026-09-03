@@ -48,7 +48,23 @@ def rate_vs_rate_card(data: pd.DataFrame, items: pd.DataFrame) -> list[dict]:
     # still finds a card entry filed as 'zLinfox - SJ' (the retired-code rename).
     card = items.copy()
     card["_key"] = card["*ItemCode"].map(normalise_code)
+    # WHICH of the two items wins matters, and it used to be whichever Xero
+    # happened to return last - which is the RETIRED one, because the z-prefixed
+    # code sorts after the live one. Mazher Ali has 'Linfox - MAZ' at 1225 and
+    # 'zLinfox - MAZ' at 1103, both Active, and both normalise to the same key.
+    # Indexed on the retired item, a correct invoice at 1225 raised a false HIGH,
+    # and a genuine underbill at the stale 1103 - $122 a day, $1,220 a fortnight -
+    # passed silently. That is the exact "unexplained rate spike" this rule
+    # exists to catch, so it was failing in the one case it was written for.
+    #
+    # build_data_frame already sorts _active before de-duplicating; that alone
+    # does not separate these two, since both are Active. The live item is the
+    # one whose code was never renamed, so that is the tiebreak.
+    card["_active"] = (card.get("Status", "") == "Active").astype(int)
+    card["_live"] = (~card["*ItemCode"].astype(str).str.strip()
+                     .str.lower().str.startswith("z")).astype(int)
     card = (card[card["_key"] != ""]
+            .sort_values(["_active", "_live"])          # preferred row last
             .drop_duplicates("_key", keep="last")
             .set_index("_key")[["SalesUnitPrice", "PurchasesUnitPrice"]])
     out = []
