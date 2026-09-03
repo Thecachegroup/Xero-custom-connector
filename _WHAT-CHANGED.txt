@@ -1,11 +1,11 @@
-TCG Xero connector - closing the loop on the repeating-template failure
-Built for Andrew Hurnard, 2 September 2026 evening, Melbourne. Off the
-1759 zip from this afternoon.
+TCG Xero connector - closing the loop on the repeating-template failure,
+and making the audit short enough to read
+Built for Andrew Hurnard, 3 September 2026, Melbourne. Off the 1759 zip.
 
 DO NOT UPLOAD _WHAT-CHANGED.txt. Everything else is the repo.
 This zip CONTAINS everything in the 1759 zip. Use only this one.
 
-Tests: python -m pytest tests/ -q     129 passed, up from 123.
+Tests: python -m pytest tests/ -q     133 passed, up from 123.
 
 ------------------------------------------------------------------------------
 WHY THERE IS ANOTHER ZIP
@@ -17,6 +17,41 @@ Awaiting Approval at one day against 21 worked.
 That is an audit. An audit only works when somebody runs it. Four of the five
 changes below make the same failure impossible to walk past on the ordinary
 fortnightly run, whether or not anybody remembers to audit.
+
+------------------------------------------------------------------------------
+0. THE AUDIT WAS FLAGGING 80 LINES OF WHICH ONE WAS WRONG
+
+Found by running it against the live org on 3 September. list_repeating
+_templates() returned 364 lines and marked 80 <<<. Working through them:
+
+   62   DELETED templates. They generate nothing at all.
+   18   fixed-fee lines - the Xenon Media monthly billing, the office
+        cleaning, and Deepti and Vivek, who are on an annual fee split over
+        twelve and billed as ONE UNIT of a monthly amount. Quantity 1 is
+        CORRECT on all of those. Zeroing Deepti's would have stopped a
+        $9,583.33 monthly invoice.
+    1   actually wrong: Bhasker.
+
+A report where nine flags in ten are noise catches nothing - the same failure
+the coverage report had when it came back with six SEEK ads in it. So:
+
+  - DELETED templates hidden. include_deleted=True to see them.
+  - fixed-fee lines listed separately under "NOT a fault, do not zero these",
+    summarised by contact. include_fixed_fee=True for the full table.
+  - the flag itself is now ASYMMETRY, not just non-zero. A line is day-rate
+    when the SAME item code has another LIVE template sitting at zero - the
+    matching bill, or the matching sale. One of the pair was reset and the
+    other was missed. That is exactly Bhasker: VVR bill at 0, Linfox sale at
+    1. Deepti and Vivek have both sides at 1 and no zero anywhere, which is
+    what a fixed fee looks like.
+
+Live output is now one row. It was eighty.
+
+CONFIRM ONE THING: that Deepti (Linfox - DBL) and Vivek (Linfox - VKC) really
+are fixed monthly fees rather than days x a rate. The arithmetic says so -
+$9,583.33 is $115,000/12 and $8,333.33 is $100,000/12 - but it is your call,
+and if either is meant to be day-rate their template needs zeroing like
+Bhasker's.
 
 ------------------------------------------------------------------------------
 1. THE FILL NOW SAYS WHEN THE NUMBER ON THE LINE IS NOT THE NUMBER YOU GAVE
@@ -101,6 +136,10 @@ NEW TESTS  (129, up from 123)
       Schedule, Contact, LineItemID, AccountCode, TaxType all survive
       a template with no ID is refused
       a DELETED template is refused
+      the asymmetric day-rate line is flagged
+      a fixed monthly fee is NOT flagged
+      DELETED lines hidden by default, shown on request
+      a line with no item code is never flagged
 
   tests/test_fill.py            + Bhasker's exact case: line at 1, asked for 21,
                                   not overwritten, reported as a MISMATCH
@@ -114,6 +153,8 @@ FILES
   changed  src/server.py         set_repeating_quantity - guarded write, DELETED
                                  skip, per-template failure, read-back verify;
                                  fill_period_drafts - mismatch block
+  changed  src/server.py         list_repeating_templates - deleted hidden,
+                                 fixed-fee split out, asymmetry flag
   changed  src/xero_client.py    post_repeating_invoice closed off
   changed  tests/test_fill.py
   changed  requirements.txt      upper bounds
