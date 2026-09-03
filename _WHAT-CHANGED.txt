@@ -1,11 +1,13 @@
 TCG Xero connector - closing the loop on the repeating-template failure,
 and making the audit short enough to read
 Built for Andrew Hurnard, 3 September 2026, Melbourne. Off the 1759 zip.
+Second pass: the monthly-reference guard, and Prasanthi's offset
+cycle written properly (section 0b).
 
 DO NOT UPLOAD _WHAT-CHANGED.txt. Everything else is the repo.
 This zip CONTAINS everything in the 1759 zip. Use only this one.
 
-Tests: python -m pytest tests/ -q     133 passed, up from 123.
+Tests: python -m pytest tests/ -q     141 passed, up from 123.
 
 ------------------------------------------------------------------------------
 WHY THERE IS ANOTHER ZIP
@@ -52,6 +54,57 @@ are fixed monthly fees rather than days x a rate. The arithmetic says so -
 $9,583.33 is $115,000/12 and $8,333.33 is $100,000/12 - but it is your call,
 and if either is meant to be day-rate their template needs zeroing like
 Bhasker's.
+
+------------------------------------------------------------------------------
+0b. THE FILL WAS STAMPING A FORTNIGHT REFERENCE ON MONTHLY PEOPLE
+
+Found while checking Prasanthi. reference="auto" builds a FORTNIGHT range -
+"17 August to 30 August 2026" - and it was applied to every sales draft
+carrying an item code in the quantities list, monthly people included.
+
+Two things wrong with that. Prasanthi's month runs the 12TH TO THE 11TH, not
+the calendar month, so a fortnight range on her invoice is wrong in length AND
+in dates. And the house reference for a monthly person is a MONTH LABEL, not a
+range - "Deepti Bansal May 2026" is the real format.
+
+Monthly people are now excluded from the auto reference and their CURRENT
+reference is reported instead, under MONTHLY - REFERENCE NOT TOUCHED, so a
+broken one is visible rather than silently overwritten. Her live draft
+TCG-21207 currently reads "Prasanthi Dharanikota  August Year]" - a merge field
+that did not resolve in the Xero template. That needs fixing in Xero; nothing
+here will now paper over it.
+
+The days are still filled. Only the reference is withheld.
+
+Cadence is read from config/roster_overrides.json, which is where it already
+lives - no network, no second table. NOTE: roster.load_overrides() returns the
+by_item_code map, not the whole file. Getting that wrong made the guard return
+False for everybody and do nothing at all; there is now a test pinning it.
+
+NEW FIELD - period_day, and it is now WRITTEN, not just recorded.
+
+Prasanthi is 12: the 12th of the preceding month to the 11th of the current
+one. Your words, 3 September - "the twelfth of August to the eleventh of
+September would be what you put in her reference." So fill_period_drafts now
+generates exactly that:
+
+    Linfox - JJ   fortnightly   "17 August to 30 August 2026"
+    Linfox - PD   offset month  "12 August to 11 September 2026"
+    Linfox - BV   calendar month - left alone, reported
+
+Same formatter as the fortnightly reference, so the invoices read
+consistently, and the year-end case ("12 December 2026 to 11 January 2027")
+comes free. The cycle chosen is the one CONTAINING period_end, matching how
+the fortnightly reference describes the period being billed rather than the
+one before it - the 11th belongs to the cycle that opened on the 12th of the
+month before, and there is a test for that boundary.
+
+Absent period_day means calendar month, and NO reference is written for those:
+Bhasker, Deepti and Vivek keep whatever their template generated and it is
+reported so you can see it. Their house format is a month label - "Deepti
+Bansal May 2026" - not a range, and the connector is not going to invent one.
+
+Prasanthi is the only offset person as at 3 September 2026. Confirmed by you.
 
 ------------------------------------------------------------------------------
 1. THE FILL NOW SAYS WHEN THE NUMBER ON THE LINE IS NOT THE NUMBER YOU GAVE
@@ -158,8 +211,22 @@ FILES
   changed  src/xero_client.py    post_repeating_invoice closed off
   changed  tests/test_fill.py
   changed  requirements.txt      upper bounds
+  changed  config/roster_overrides.json  period_day on Prasanthi
   new      tests/test_repeating.py
+  new      tests/test_monthly.py
   backups  _backups/2026-09-02/  the 1759 versions of all five changed files
+
+------------------------------------------------------------------------------
+ONE THING TO FIX IN XERO, NOT HERE
+
+Prasanthi's live draft TCG-21207 carries the reference
+
+    "Prasanthi Dharanikota  August Year]"
+
+- a merge field in the Xero repeating template that did not resolve. The fill
+now overwrites it with the correct cycle, so the symptom disappears, but the
+template will keep generating it on every future draft until the template
+itself is corrected.
 
 ------------------------------------------------------------------------------
 STILL NOT BUILT, SAME REASON AS THIS AFTERNOON

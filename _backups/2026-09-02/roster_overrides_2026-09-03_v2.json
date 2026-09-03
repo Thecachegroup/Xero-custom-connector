@@ -18,13 +18,6 @@
     "           people still file into the CURRENT FORTNIGHT folder - Andrew's",
     "           decision, 2 Sep 2026 - so there is one folder to look in, not two.",
     "emails   - an address they also send from. Normally not needed: the address",
-    "period_day - for a MONTHLY person whose cycle is OFFSET from the calendar",
-    "           month. 12 means the 12th of the preceding month to the 11th of",
-    "           the current one, and fill_period_drafts writes that window as the",
-    "           invoice reference: '12 August to 11 September 2026'. Absent means",
-    "           calendar month, and no reference is written for those - their",
-    "           house format is a month label ('Deepti Bansal May 2026'), not a",
-    "           range. Prasanthi is the only offset person as at 3 Sep 2026.",
     "           is read for their name first. Needed only where the address",
     "           cannot carry the name, e.g. Bhasker Veela signs 'Veerla Bhaskar'.",
     "skip     - true for a payroll employee who is NOT a swept contractor:",
@@ -68,9 +61,7 @@
       "cadence": "monthly",
       "emails": [
         "prasanthidharanikota362@gmail.com"
-      ],
-      "period_day": 12,
-      "_why": "Prasanthi's cycle runs the 12th of the preceding month to the 11th of the current one, not the calendar month - Andrew, 3 Sep 2026. She is the ONLY offset person; Bhasker, Deepti and Vivek are calendar month."
+      ]
     },
     "Linfox - VKC": {
       "name": "Vivek Kumar Choudhary",

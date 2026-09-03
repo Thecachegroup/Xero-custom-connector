@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import logging
+from datetime import timedelta
 
 log = logging.getLogger(__name__)
 
@@ -593,6 +594,38 @@ def period_reference(period_start, period_end) -> str:
     if a.year != b.year:
         return f"{a.day} {a:%B} {a.year} to {b.day} {b:%B} {b.year}"
     return f"{a.day} {a:%B} to {b.day} {b:%B} {b.year}"
+
+
+def monthly_reference(period_end, period_day: int) -> str:
+    """The house reference for a monthly contractor whose cycle is OFFSET from
+    the calendar month.
+
+    Prasanthi Dharanikota's runs the 12th of the preceding month to the 11th of
+    the current one - Andrew, 3 September 2026: "the twelfth of August to the
+    eleventh of September would be what you put in her reference." Same shape
+    as the fortnightly reference, so it is formatted by the same function and
+    the invoices read consistently.
+
+    The cycle is the one CONTAINING period_end, matching how the fortnightly
+    reference describes the period being billed rather than the one before it.
+    A period_end of 30 August sits inside 12 August - 11 September; so does
+    the 11th of September itself, which is that cycle's last day.
+    """
+    d = int(period_day)
+    end = period_end
+    # start = the <period_day>th on or before period_end
+    if end.day >= d:
+        start = end.replace(day=d)
+    else:
+        prev = end.replace(day=1) - timedelta(days=1)
+        start = prev.replace(day=d)
+    # finish = the day before the next <period_day>th
+    if start.month == 12:
+        nxt = start.replace(year=start.year + 1, month=1)
+    else:
+        nxt = start.replace(month=start.month + 1)
+    finish = nxt - timedelta(days=1)
+    return period_reference(start, finish)
 
 
 def plan_reference_change(docs: list[dict], reference: str) -> list[dict]:

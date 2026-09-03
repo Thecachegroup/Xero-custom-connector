@@ -32,7 +32,7 @@ import pandas as pd
 from mcp.server.fastmcp import FastMCP
 
 from .xero_client import XeroClient
-from . import mappers, checks, writes, roster
+from . import mappers, checks, writes
 
 log = logging.getLogger(__name__)
 
@@ -521,41 +521,24 @@ def graph_diagnostics() -> str:
 
 
 @mcp.tool()
-def list_repeating_templates(kinds: str = "both", contains: str = "",
-                             include_deleted: bool = False,
-                             include_fixed_fee: bool = False) -> str:
-    """Repeating templates that generate a NON-ZERO quantity. READ ONLY.
+def list_repeating_templates(kinds: str = "both", contains: str = "") -> str:
+    """Every repeating invoice and bill template, with the QUANTITY each one
+    generates. READ ONLY.
 
-    THE POINT OF THIS. The repeating templates raise the fortnightly and
-    monthly drafts, and `fill_period_drafts` only fills a line whose quantity is
-    currently ZERO - that guard is what makes four sweeps across a billing week
-    safe. A day-rate template that generates a non-zero quantity is therefore
-    invisible to the fill: nothing corrects it, and it invoices the client that
-    quantity every period until somebody reads the number. Bhasker Veela's
-    sales template generated at 1: his August invoice reached Awaiting Approval
-    at ONE day, $320, against 21 days worked, ~$6,573 under-billed.
+    THE POINT OF THIS. The repeating templates are what raise the fortnightly
+    and monthly drafts, and `fill_period_drafts` only fills a line whose
+    quantity is currently ZERO - that guard is what makes four sweeps across a
+    billing week safe. A template that generates a NON-ZERO quantity is
+    therefore invisible to the fill: nothing corrects it, and it quietly
+    invoices the client that quantity every period until somebody happens to
+    look at the number.
 
-    WHAT IS NOT A FAULT, and why this does not just list every non-zero line.
-    A first pass over the live org flagged 80 lines of which one was wrong.
+    Bhasker Veela's sales template generates at 1. His August invoice went to
+    Awaiting Approval at ONE day, $320, against 21 days actually worked - about
+    $6,573 under-billed, one approval from going out the door.
 
-      DELETED templates generate nothing at all. 62 of those 80. Hidden unless
-      include_deleted=True.
-
-      FIXED-FEE lines are billed as one unit of a monthly amount, not days x a
-      rate - the Xenon Media monthly billing, the office cleaning, the offshore
-      people on an annual fee split over twelve. Quantity 1 is CORRECT on
-      those and setting it to zero would stop them billing. They carry no item
-      code, or an item code whose only live template is this one. Listed
-      separately, not flagged. include_fixed_fee=True to see them.
-
-      A DAY-RATE line is the one that matters, and the giveaway is asymmetry:
-      the same item code has another live template - the matching bill, or the
-      matching sale - sitting at ZERO. One of the pair was reset and the other
-      was missed. That is exactly Bhasker: his VVR bill at 0, his Linfox sale
-      at 1.
-
-    A report where nine flags in ten are noise catches nothing. This one is
-    meant to be short enough to read.
+    Anything flagged below is the same failure waiting to happen. Fix it with
+    set_repeating_quantity(item_code, 0).
 
     KINDS: 'both' | 'sales' | 'bills'.
     CONTAINS filters on the contact name or the item code.
@@ -564,101 +547,52 @@ def list_repeating_templates(kinds: str = "both", contains: str = "",
     want = str(kinds or "both").lower()
     needle = str(contains or "").strip().lower()
 
-    templates = c.repeating_invoices()
-
-    # An item code is "day rate" when a LIVE template somewhere carries it at
-    # zero - something is filling that line from a timesheet. Built across
-    # every template first, because the evidence for a sales line is usually on
-    # the bill and the other way round.
-    zero_somewhere: set[str] = set()
-    for r in templates:
-        if str(r.get("Status") or "").upper() == "DELETED":
-            continue
-        for line in r.get("LineItems") or []:
-            code = str(line.get("ItemCode") or "").strip()
-            qty = line.get("Quantity")
-            if code and float(qty or 0) == 0.0:
-                zero_somewhere.add(code.lower())
-
-    flagged, fixed, deleted_hits = [], [], 0
-    for r in templates:
+    rows, flagged = [], 0
+    for r in c.repeating_invoices():
         typ = str(r.get("Type") or "").upper()
         if want == "sales" and typ != "ACCREC":
             continue
         if want == "bills" and typ != "ACCPAY":
             continue
-        status = str(r.get("Status") or "").upper()
         contact = str((r.get("Contact") or {}).get("Name") or "")
         sched = r.get("Schedule") or {}
         unit = str(sched.get("Unit") or "").title()
         period = sched.get("Period")
         every = f"every {period} {unit}".strip() if period else unit or "?"
-
         for line in r.get("LineItems") or []:
-            code = str(line.get("ItemCode") or "").strip()
+            code = str(line.get("ItemCode") or "")
             if needle and needle not in contact.lower() and needle not in code.lower():
                 continue
             qty = line.get("Quantity")
             qty = 0.0 if qty is None else float(qty)
-            if qty == 0.0:
-                continue
-            if status == "DELETED":
-                deleted_hits += 1
-                if not include_deleted:
-                    continue
-            row = {
+            bad = qty != 0.0
+            flagged += 1 if bad else 0
+            rows.append({
+                "": "  <<<" if bad else "",
                 "Kind": "sales" if typ == "ACCREC" else "bill",
                 "Contact": contact[:34],
-                "Item": code or "(no item code)",
+                "Item": code,
                 "Qty": qty,
                 "Unit": line.get("UnitAmount"),
                 "Repeats": every,
-                "Status": status,
-            }
-            if code and code.lower() in zero_somewhere:
-                # the matching template for this person sits at zero
-                row[""] = "  <<<"
-                flagged.append(row)
-            elif status == "DELETED":
-                flagged.append({**row, "": ""})
-            else:
-                fixed.append(row)
+                "Status": str(r.get("Status") or ""),
+            })
 
-    out: list[str] = []
+    if not rows:
+        return "No repeating templates matched."
+
+    rows.sort(key=lambda x: (x[""] == "", x["Kind"], x["Contact"]))
+    out = [f"{len(rows)} repeating template line(s)", "",
+           pd.DataFrame(rows).to_markdown(index=False), ""]
     if flagged:
-        cols = ["", "Kind", "Contact", "Item", "Qty", "Unit", "Repeats", "Status"]
-        df = pd.DataFrame(flagged)
-        out += [f"{len([f for f in flagged if f.get('')])} DAY-RATE TEMPLATE(S) "
-                "GENERATING A NON-ZERO QUANTITY", "",
-                df[[c_ for c_ in cols if c_ in df.columns]].to_markdown(index=False), "",
-                "Marked <<<: the SAME item code has another live template sitting",
-                "at zero - the matching bill or the matching sale. One of the pair",
-                "was reset and the other was missed, so this line invoices at the",
-                "quantity shown every period and fill_period_drafts will never",
-                "touch it.", "",
+        out += [f"{flagged} line(s) marked <<< generate a NON-ZERO quantity.",
+                "fill_period_drafts will never touch these - it only fills lines",
+                "sitting at zero - so they go out at whatever is shown above,",
+                "every period, until someone reads the number.",
+                "",
                 "Fix each with: set_repeating_quantity('<item code>', 0)"]
     else:
-        out.append("No day-rate template is generating a non-zero quantity. "
-                   "Nothing to fix.")
-
-    if fixed:
-        out += ["", f"{len(fixed)} FIXED-FEE line(s) - NOT a fault, do not zero these."]
-        if include_fixed_fee:
-            out += ["", pd.DataFrame(fixed).to_markdown(index=False)]
-        else:
-            by = {}
-            for f in fixed:
-                by[f["Contact"]] = by.get(f["Contact"], 0) + 1
-            out.append("  " + ", ".join(f"{k} ({v})" for k, v in sorted(by.items())))
-        out += ["", "One unit of a monthly amount rather than days x a rate - the",
-                "monthly billing, the cleaning, an annual fee split over twelve.",
-                "Quantity 1 is correct and zeroing one stops it billing. Nothing",
-                "here carries an item code that any live template bills by the",
-                "day. include_fixed_fee=True for the full list."]
-
-    if deleted_hits and not include_deleted:
-        out += ["", f"{deleted_hits} non-zero line(s) on DELETED templates hidden - "
-                    "they generate nothing. include_deleted=True to see them."]
+        out.append("Every template generates at zero. Nothing to fix.")
     return "\n".join(out)
 
 
@@ -686,8 +620,6 @@ def set_repeating_quantity(item_code: str, quantity: float = 0,
             continue
         if want == "bills" and typ != "ACCPAY":
             continue
-        if str(r.get("Status") or "").upper() == "DELETED":
-            continue        # deleted in Xero; it generates nothing and is not ours to touch
         if any(str(l.get("ItemCode") or "").lower() == code_l
                for l in r.get("LineItems") or []):
             hits.append(r)
@@ -698,8 +630,6 @@ def set_repeating_quantity(item_code: str, quantity: float = 0,
 
     lines = [f"{'DRY RUN - nothing written' if dry_run else 'UPDATED'}: "
              f"{len(hits)} template(s) for {item_code}", ""]
-    written: list[tuple[str, str, str]] = []
-    failed: list[str] = []
     for r in hits:
         typ = "sales" if str(r.get("Type")).upper() == "ACCREC" else "bill"
         contact = str((r.get("Contact") or {}).get("Name") or "")
@@ -718,41 +648,12 @@ def set_repeating_quantity(item_code: str, quantity: float = 0,
             continue
         lines += changed
         if not dry_run:
-            try:
-                writes.update_repeating_template(c, r)
-                written.append((str(r.get("RepeatingInvoiceID") or ""), typ, contact))
-            except Exception as e:                                 # noqa: BLE001
-                failed.append(f"  {typ:<5} {contact[:32]:<34} NOT CHANGED - {e}")
-
-    if failed:
-        lines += ["", "FAILED:"] + failed
+            c.post_repeating_invoice(r)
 
     if dry_run:
         lines += ["", "Re-run with dry_run=False to apply."]
-    elif written:
-        # Read the templates back and prove the number actually moved. This is
-        # the one tool whose whole reason for existing is that nobody reads the
-        # quantity, so it is not going to ask somebody to go and read it.
-        after = {str(t.get("RepeatingInvoiceID") or ""): t
-                 for t in c.repeating_invoices()}
-        verified, wrong = [], []
-        for tid, typ, contact in written:
-            t = after.get(tid)
-            if not t:
-                wrong.append(f"  {typ:<5} {contact[:32]:<34} could not be read back")
-                continue
-            now = [float(l.get("Quantity") or 0) for l in (t.get("LineItems") or [])
-                   if str(l.get("ItemCode") or "").lower() == code_l]
-            if now and all(q == float(quantity) for q in now):
-                verified.append(f"  {typ:<5} {contact[:32]:<34} confirmed at {float(quantity):g}")
-            else:
-                wrong.append(f"  {typ:<5} {contact[:32]:<34} reads back as "
-                             f"{', '.join(f'{q:g}' for q in now) or '(no line)'}")
-        lines += ["", "READ BACK FROM XERO:"] + verified + wrong
-        if wrong:
-            lines += ["", "One or more templates do NOT read back at the value "
-                          "asked for. Do not assume the change took - open the "
-                          "template in Xero before the next period generates."]
+    else:
+        lines += ["", "Run list_repeating_templates() to confirm."]
     return "\n".join(lines)
 
 
@@ -1329,38 +1230,6 @@ def list_period_drafts(period_end: str, window_days: int = 10) -> str:
     return "\n".join(out)
 
 
-def _cadence_of(item_code: str) -> tuple[bool, int | None]:
-    """(is_monthly, period_day) for an item code, from roster_overrides.json -
-    no network, and cadence lives nowhere else.
-
-    Default is fortnightly, which is what everybody not listed is.
-
-    period_day is set only where the monthly cycle is OFFSET from the calendar
-    month. Prasanthi's is 12 - the 12th of the preceding month to the 11th of
-    the current one. None means calendar month, and the connector does not
-    write a reference for those: Deepti's house format is a month label,
-    "Deepti Bansal May 2026", not a range.
-    """
-    try:
-        # load_overrides() already returns the by_item_code map, not the file.
-        by_code = roster.load_overrides() or {}
-    except Exception:                                              # noqa: BLE001
-        return False, None
-    entry = by_code.get(str(item_code or "").strip()) or {}
-    monthly = str(entry.get("cadence") or "fortnightly").lower() == "monthly"
-    day = entry.get("period_day")
-    try:
-        day = int(day) if day is not None else None
-    except (TypeError, ValueError):
-        day = None
-    return monthly, (day if monthly else None)
-
-
-def _is_monthly(item_code: str) -> bool:
-    """Back-compatible shorthand."""
-    return _cadence_of(item_code)[0]
-
-
 # ---------------------------------------------------------------- write tools
 # Every one of these creates a DRAFT. Andrew approves in Xero.
 
@@ -1441,7 +1310,6 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
 
     planned, skipped, errors, renumbered, rereferenced = [], [], [], [], []
     seen_codes: set[str] = set()
-    monthly_left: list[dict] = []
 
     for kind in types[kinds]:
         label = "invoice" if kind == "ACCREC" else "bill"
@@ -1474,49 +1342,12 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
         # runs across a billing week: an invoice filled on Wednesday must still
         # get its reference on Friday. Scoped by item code, so an untouched
         # draft - a leaver's, the empty expenses one - keeps whatever it had.
-        # The auto reference is a FORTNIGHT range - "17 August to 30 August
-        # 2026". It must never land on a monthly contractor. Prasanthi's cycle
-        # runs the 12th to the 11th, so a fortnight range on her invoice is
-        # wrong twice over: wrong length, and wrong dates. Deepti's house
-        # reference is "Deepti Bansal May 2026", a month label, not a range.
-        # Monthly people are left with whatever their template generated and
-        # the reference is REPORTED instead, so a broken one is visible.
-        in_scope, monthly_refs, monthly_ref = set(), [], {}
-        for d in docs:
-            codes = [(li.get("ItemCode") or "").strip()
-                     for li in (d.get("LineItems") or [])]
-            hit = [c for c in codes if c in wanted]
-            if not hit:
-                continue
-            cad = [_cadence_of(c) for c in hit]
-            if any(m for m, _ in cad):
-                # An OFFSET monthly cycle can be written exactly - Prasanthi's
-                # 12th-to-11th window is a date range in the same house format
-                # as the fortnightly one. A calendar-month person is left
-                # alone: their house reference is a month label, not a range.
-                days = {dd for m, dd in cad if m and dd}
-                if len(days) == 1 and all(m for m, _ in cad):
-                    monthly_ref[d["InvoiceID"]] = writes.monthly_reference(
-                        end, days.pop())
-                else:
-                    monthly_refs.append({
-                        "Doc": d.get("InvoiceNumber") or str(d.get("InvoiceID", ""))[:8],
-                        "Contact": (d.get("Contact") or {}).get("Name", "?"),
-                        "Item": ", ".join(hit),
-                        "Reference now": str(d.get("Reference") or "(none)"),
-                    })
-                continue
-            in_scope.add(d["InvoiceID"])
+        in_scope = {d["InvoiceID"] for d in docs
+                    if any((li.get("ItemCode") or "").strip() in wanted
+                           for li in (d.get("LineItems") or []))}
         ref_changes = writes.plan_reference_change(
             [d for d in docs if d.get("InvoiceID") in in_scope], ref
         ) if (kind == "ACCREC" and ref) else []
-        if kind == "ACCREC" and ref:
-            for d in docs:
-                own = monthly_ref.get(d.get("InvoiceID"))
-                if own:
-                    ref_changes += writes.plan_reference_change([d], own)
-        if kind == "ACCREC":
-            monthly_left += monthly_refs
         rereferenced += ref_changes
         new_ref = {r["InvoiceID"]: r["Now"] for r in ref_changes}
 
@@ -1551,48 +1382,15 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
     elif not renumbered and not rereferenced:
         out.append("Nothing to fill - every matching line already has a quantity.")
     if rereferenced:
-        out += ["", "REFERENCE set on:",
+        out += ["", f'REFERENCE set to "{ref}" on:',
                 pd.DataFrame([{k: v for k, v in r.items() if k != "InvoiceID"}
                               for r in rereferenced]).to_markdown(index=False)]
-    if monthly_left:
-        out += ["", "MONTHLY - REFERENCE NOT TOUCHED:",
-                pd.DataFrame(monthly_left).to_markdown(index=False),
-                "",
-                "The auto reference is a fortnight range and these people are",
-                "billed monthly, so it has been left alone. Check the reference",
-                "above reads the way you send it - the house format for a",
-                "monthly person is a month label, e.g. \"Deepti Bansal May 2026\"."]
     if renumbered:
         out += ["", "BILL NUMBERS set to the contractor's own:",
                 pd.DataFrame([{k: v for k, v in n.items() if k != "InvoiceID"}
                               for n in renumbered]).to_markdown(index=False)]
     if skipped:
-        # A line already carrying days is never overwritten. But a line carrying
-        # a DIFFERENT number to the days you gave is not "already billed" - it
-        # is a number nobody put there on purpose, and it goes out at that
-        # number. Bhasker Veela's August sales invoice sat at 1 day against 21
-        # worked because the repeating template generated at 1; the fill left it
-        # alone, said "already billed", and ~$6,573 got one approval from going
-        # out the door. Mismatches lead, on their own, above the benign ones.
-        mism = [r for r in skipped if r.get("Mismatch")]
-        benign = [r for r in skipped if not r.get("Mismatch")]
-        if mism:
-            out += ["", "*** QUANTITY MISMATCH - READ THIS ***",
-                    pd.DataFrame([{k: v for k, v in r.items() if k != "Mismatch"}
-                                  for r in mism]).to_markdown(index=False),
-                    "",
-                    "These lines already carry a quantity that is NOT the days",
-                    "you gave, so the fill has left them alone and they will",
-                    "invoice at the number shown. Usually a repeating template",
-                    "generating at something other than zero - check it with",
-                    "list_repeating_templates() and fix it with",
-                    "set_repeating_quantity('<item code>', 0). Correct the",
-                    "current draft in Xero by hand; nothing here overwrites a",
-                    "line somebody may have set deliberately."]
-        if benign:
-            out += ["", "LEFT ALONE (already at the days you gave):",
-                    pd.DataFrame([{k: v for k, v in r.items() if k != "Mismatch"}
-                                  for r in benign]).to_markdown(index=False)]
+        out += ["", "LEFT ALONE:", pd.DataFrame(skipped).to_markdown(index=False)]
     if missing:
         out += ["", "NO DRAFT FOUND for these item codes: " + ", ".join(missing)]
     if errors:
