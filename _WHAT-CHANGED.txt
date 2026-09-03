@@ -1,322 +1,67 @@
-TCG Xero connector - closing the loop on the repeating-template failure,
-and making the audit short enough to read
-Built for Andrew Hurnard, 3 September 2026, Melbourne. Off the 1759 zip.
-Third pass: Xero refuses template writes (0c), and the tax-basis
-checks (0d).
+TCG Xero connector - duplicate invoice number guard
+Built for Andrew Hurnard, 3 September 2026, 16:14 Melbourne.
+Off the deployed package Xero-custom-connector_FULL_templates-and-monthly_2026-09-02_1759.
 
 DO NOT UPLOAD _WHAT-CHANGED.txt. Everything else is the repo.
-This zip CONTAINS everything in the 1759 zip. Use only this one.
 
-Tests: python -m pytest tests/ -q     149 passed, up from 123.
-
-------------------------------------------------------------------------------
-WHY THERE IS ANOTHER ZIP
-
-The 1759 zip gave you list_repeating_templates() to FIND the templates that
-generate a non-zero quantity, after Bhasker Veela's August invoice reached
-Awaiting Approval at one day against 21 worked.
-
-That is an audit. An audit only works when somebody runs it. Four of the five
-changes below make the same failure impossible to walk past on the ordinary
-fortnightly run, whether or not anybody remembers to audit.
-
-------------------------------------------------------------------------------
-0. THE AUDIT WAS FLAGGING 80 LINES OF WHICH ONE WAS WRONG
-
-Found by running it against the live org on 3 September. list_repeating
-_templates() returned 364 lines and marked 80 <<<. Working through them:
-
-   62   DELETED templates. They generate nothing at all.
-   18   fixed-fee lines - the Xenon Media monthly billing, the office
-        cleaning, and Deepti and Vivek, who are on an annual fee split over
-        twelve and billed as ONE UNIT of a monthly amount. Quantity 1 is
-        CORRECT on all of those. Zeroing Deepti's would have stopped a
-        $9,583.33 monthly invoice.
-    1   actually wrong: Bhasker.
-
-A report where nine flags in ten are noise catches nothing - the same failure
-the coverage report had when it came back with six SEEK ads in it. So:
-
-  - DELETED templates hidden. include_deleted=True to see them.
-  - fixed-fee lines listed separately under "NOT a fault, do not zero these",
-    summarised by contact. include_fixed_fee=True for the full table.
-  - the flag itself is now ASYMMETRY, not just non-zero. A line is day-rate
-    when the SAME item code has another LIVE template sitting at zero - the
-    matching bill, or the matching sale. One of the pair was reset and the
-    other was missed. That is exactly Bhasker: VVR bill at 0, Linfox sale at
-    1. Deepti and Vivek have both sides at 1 and no zero anywhere, which is
-    what a fixed fee looks like.
-
-Live output is now one row. It was eighty.
-
-CONFIRM ONE THING: that Deepti (Linfox - DBL) and Vivek (Linfox - VKC) really
-are fixed monthly fees rather than days x a rate. The arithmetic says so -
-$9,583.33 is $115,000/12 and $8,333.33 is $100,000/12 - but it is your call,
-and if either is meant to be day-rate their template needs zeroing like
-Bhasker's.
-
-------------------------------------------------------------------------------
-0b. THE FILL WAS STAMPING A FORTNIGHT REFERENCE ON MONTHLY PEOPLE
-
-Found while checking Prasanthi. reference="auto" builds a FORTNIGHT range -
-"17 August to 30 August 2026" - and it was applied to every sales draft
-carrying an item code in the quantities list, monthly people included.
-
-Two things wrong with that. Prasanthi's month runs the 12TH TO THE 11TH, not
-the calendar month, so a fortnight range on her invoice is wrong in length AND
-in dates. And the house reference for a monthly person is a MONTH LABEL, not a
-range - "Deepti Bansal May 2026" is the real format.
-
-Monthly people are now excluded from the auto reference and their CURRENT
-reference is reported instead, under MONTHLY - REFERENCE NOT TOUCHED, so a
-broken one is visible rather than silently overwritten. Her live draft
-TCG-21207 currently reads "Prasanthi Dharanikota  August Year]" - a merge field
-that did not resolve in the Xero template. That needs fixing in Xero; nothing
-here will now paper over it.
-
-The days are still filled. Only the reference is withheld.
-
-Cadence is read from config/roster_overrides.json, which is where it already
-lives - no network, no second table. NOTE: roster.load_overrides() returns the
-by_item_code map, not the whole file. Getting that wrong made the guard return
-False for everybody and do nothing at all; there is now a test pinning it.
-
-NEW FIELD - period_day, and it is now WRITTEN, not just recorded.
-
-Prasanthi is 12: the 12th of the preceding month to the 11th of the current
-one. Your words, 3 September - "the twelfth of August to the eleventh of
-September would be what you put in her reference." So fill_period_drafts now
-generates exactly that:
-
-    Linfox - JJ   fortnightly   "17 August to 30 August 2026"
-    Linfox - PD   offset month  "12 August to 11 September 2026"
-    Linfox - BV   calendar month - left alone, reported
-
-Same formatter as the fortnightly reference, so the invoices read
-consistently, and the year-end case ("12 December 2026 to 11 January 2027")
-comes free. The cycle chosen is the one CONTAINING period_end, matching how
-the fortnightly reference describes the period being billed rather than the
-one before it - the 11th belongs to the cycle that opened on the 12th of the
-month before, and there is a test for that boundary.
-
-Absent period_day means calendar month, and NO reference is written for those:
-Bhasker, Deepti and Vivek keep whatever their template generated and it is
-reported so you can see it. Their house format is a month label - "Deepti
-Bansal May 2026" - not a range, and the connector is not going to invent one.
-
-Prasanthi is the only offset person as at 3 September 2026. Confirmed by you.
-
-------------------------------------------------------------------------------
-0c. XERO WILL NOT LET THE API CHANGE A REPEATING TEMPLATE
-
-Ran set_repeating_quantity('Linfox - BV', 0, dry_run=False) against production
-on 3 September. Xero rejected it:
-
-    Repeating invoice status must be set to DELETED
-    [A validation exception occurred]
-
-A POST against an existing repeating template is accepted only to DELETE it.
-The quantity cannot be changed through the API at all. Nothing was written -
-the guard, the payload and the error reporting all worked exactly as built,
-and Xero's own message came through intact rather than truncated.
-
-Delete-and-recreate is NOT the workaround. It loses the template's history,
-and a recreate that goes wrong invoices a client every period unattended -
-which is the failure this whole release exists to catch.
-
-So the tool becomes instructions. On that specific rejection it now prints:
-
-    1. Business > Invoices, then the Repeating tab
-       (for a bill: Business > Bills to pay > Repeating)
-    2. Open the template carrying the item code
-    3. Change Qty on that line to 0
-    4. Save
-
-    then list_repeating_templates() to confirm it took.
-
-Also fixed: the header said "UPDATED: 2 template(s)" before a single write had
-been attempted, and still said it after both failed. It now states what was
-found, and success or failure is reported after the fact.
-
-BHASKER'S TEMPLATE IS STILL AT 1. It has to be the four clicks above.
-
-------------------------------------------------------------------------------
-0d. TAX EXCLUSIVE vs INCLUSIVE
-
-Your point, 3 September: everything should be Exclusive, one or two sneak
-through Inclusive, and it causes all sorts of problems. Nothing in the
-connector looked at LineAmountTypes at all - the field appeared nowhere in the
-codebase.
-
-Why it matters, in numbers. $1,000/day, ten days, GST 10%:
-
-    Exclusive   10 x $1,000 = $10,000  + $1,000 GST  = $11,000   correct
-    Inclusive   the $10,000 already CONTAINS the GST
-                                        $9,090.91 + $909.09 = $10,000
-
-TCG invoices $909.09 less than it contracted, the contractor is still paid in
-full, and once the invoice is approved and sent it takes a credit note to
-unwind. There is a test carrying that arithmetic so the reason survives.
-
-Checked in three places, because the fault starts in one and shows up in the
-others:
-
-  list_repeating_templates   flags any live template not set to Exclusive,
-                             with the Xero click path. The template is where
-                             it starts - fix only the invoice and next period
-                             generates the same fault.
-
-  fill_period_drafts         flags every draft it looked at whose basis is
-                             wrong, under *** TAX BASIS - READ THIS ***.
-
-  submit_period_invoices     REFUSES to move an Inclusive document to Awaiting
-                             Approval, held with "TAX INCLUSIVE - must be
-                             Exclusive" and the fix. This is the real guard:
-                             approved and sent is the point of no return.
-
-NoTax is reported, not held - BASEXCLUDED is correct on the offshore bills and
-wrong on anything carrying GST, so it is shown for a human to judge. A missing
-LineAmountTypes is treated as no evidence, not as a fault.
-
-------------------------------------------------------------------------------
-1. THE FILL NOW SAYS WHEN THE NUMBER ON THE LINE IS NOT THE NUMBER YOU GAVE
-
-This is the important one.
-
-fill_period_drafts never overwrites a line that already carries a quantity -
-that rule is what makes four sweeps in a billing week safe, and it has not
-changed. But it reported every such line as:
-
-    "already billed - left alone"
-
-Bhasker's line carried 1 because his repeating template generated at 1, not
-because anybody billed it. You had passed "Linfox - BV: 21" in the very same
-call. Both numbers were in hand and nothing compared them, so ~$6,573
-under-billed was reported as reassurance.
-
-plan_line_fill now compares them:
-
-    same as you asked      "already at 21 - left alone"        quiet
-    different              "MISMATCH - line has 1, you said 21"
-
-and fill_period_drafts prints mismatches in their own block, above everything
-else, headed *** QUANTITY MISMATCH - READ THIS ***, with the fix. Benign repeat
-sweeps stay quiet underneath - a warning that fires every fortnight is a warning
-nobody reads.
-
-Still never overwritten. A line somebody set deliberately is theirs.
-
-2. SET_REPEATING_QUANTITY NOW PASSES THE WRITE GATE
-
-It did not. Every other write in the connector routes through writes.py and
-hits _guard() - TCG_WRITE_ENABLED. This one called xero_client.post_repeating
-_invoice() directly and went straight out. The single most consequential write
-in the codebase, the one that changes what a client is billed every period with
-nobody watching, was the only one TCG_WRITE_ENABLED=false did not stop.
-
-New writes.update_repeating_template() is guarded like everything else.
-xero_client.post_repeating_invoice() now raises NotImplementedError pointing at
-it, so the bypass cannot be used again by accident.
-
-3. THE DERIVED MONEY FIELDS ARE NO LONGER ECHOED BACK
-
-It posted the raw object read from Xero, so a template went back carrying
-Quantity 0 beside LineAmount 320, plus SubTotal / TotalTax / Total from before
-the change. That asks Xero to reconcile two answers about the same line and
-which one wins is not something to discover on a live client template.
-
-writes.py already solved this for invoices - _LINE_KEEP drops LineAmount, with a
-comment explaining why. The lesson had not been carried across to templates. It
-has now: LineAmount and TaxAmount off the line, SubTotal/TotalTax/Total off the
-document, everything Xero needs to keep the template identical retained,
-including LineItemID (without it Xero adds a second line beside the first).
-
-4. IT REFUSES TO WRITE WHAT IT SHOULD NOT, AND PROVES WHAT IT DID
-
-  - a DELETED template is skipped, not posted to
-  - a template with no RepeatingInvoiceID is refused: Xero would create a
-    SECOND template rather than update the one you meant, and then two
-    templates invoice the same client every month
-  - after a real write, every template it touched is READ BACK from Xero and
-    the quantity confirmed, printed under READ BACK FROM XERO. It used to end
-    with "run list_repeating_templates() to confirm" - which asks somebody to go
-    and read a number, on the one tool that exists because nobody reads numbers
-  - a failure on one template no longer stops the rest; it is reported under
-    FAILED with Xero's own validation message
-
-5. DEPENDENCIES PINNED
-
-    requests<3  pandas<3  openpyxl<4  tabulate<0.10  python-dotenv<2
-
-mcp had an upper bound already, added after 2.0.0 relocated FastMCP on 28 July
-and took the server down for a day. The other five were unbounded and could do
-exactly the same thing on any deploy. This was open item 3 in the state doc.
-
-------------------------------------------------------------------------------
-NEW TESTS  (129, up from 123)
-
-  tests/test_repeating.py       new - the write path had none at all
-      writes are refused when TCG_WRITE_ENABLED is not true
-      LineAmount / TaxAmount / SubTotal / TotalTax / Total are not echoed back
-      Schedule, Contact, LineItemID, AccountCode, TaxType all survive
-      a template with no ID is refused
-      a DELETED template is refused
-      the asymmetric day-rate line is flagged
-      a fixed monthly fee is NOT flagged
-      DELETED lines hidden by default, shown on request
-      a line with no item code is never flagged
-
-  tests/test_fill.py            + Bhasker's exact case: line at 1, asked for 21,
-                                  not overwritten, reported as a MISMATCH
-                                + the same days twice is NOT a mismatch
-
-------------------------------------------------------------------------------
-FILES
-
-  changed  src/writes.py         update_repeating_template(); plan_line_fill
-                                 mismatch detection
-  changed  src/server.py         set_repeating_quantity - guarded write, DELETED
-                                 skip, per-template failure, read-back verify;
-                                 fill_period_drafts - mismatch block
-  changed  src/server.py         list_repeating_templates - deleted hidden,
-                                 fixed-fee split out, asymmetry flag
-  changed  src/xero_client.py    post_repeating_invoice closed off
-  changed  tests/test_fill.py
-  changed  requirements.txt      upper bounds
-  changed  config/roster_overrides.json  period_day on Prasanthi
-  new      tests/test_repeating.py
-  new      tests/test_monthly.py
-  new      tests/test_tax_basis.py
-  backups  _backups/2026-09-02/  the 1759 versions of all five changed files
-
-------------------------------------------------------------------------------
-ONE THING TO FIX IN XERO, NOT HERE
-
-Prasanthi's live draft TCG-21207 carries the reference
-
-    "Prasanthi Dharanikota  August Year]"
-
-- a merge field in the Xero repeating template that did not resolve. The fill
-now overwrites it with the correct cycle, so the symptom disappears, but the
-template will keep generating it on every future draft until the template
-itself is corrected.
-
-------------------------------------------------------------------------------
-STILL NOT BUILT, SAME REASON AS THIS AFTERNOON
-
-create_repeating_template. Needs the schedule, the Linfox cost centre and the
-account codes settled per client, with you looking at it. Everything above is
-about templates that already exist being wrong; creating one wrong is the same
-failure with a longer tail.
-
-------------------------------------------------------------------------------
-DEPLOY
-
-Nothing new to configure. vercel --prod --force, check /healthz returns ok, bump
-the connector URL version and start a fresh session so the tool list refreshes,
-then:
-
-    list_repeating_templates()          fix every <<<
-    set_repeating_quantity('Linfox - BV', 0)          then dry_run=False
-
-TCG_WRITE_ENABLED must be true for step two now. That is the point.
+THREE FILES CHANGED. Nothing else in the repo is touched.
+
+  src/mail_mappers.py   + duplicate helpers, + plan_filing gains
+                          prior_invoice_numbers and returns "duplicates"
+  src/server.py         + _prior_invoice_numbers(), wired into
+                          sweep_timesheets, new DUPLICATE - NOT FILED section
+  tests/test_mail.py    + 10 tests
+
+TESTS: 133 passed (was 123). Run: python -m pytest -q
+
+WHY
+An invoice number already billed in an earlier period is not evidence for this
+one. For the fortnight ending 30 August 2026 Bilal Virk re-sent INV-0016 and
+Jay Jhala re-sent 20260802 - both already billed on the 16 August run. The
+sweep filed both without complaint. Their documents were moved to _QUERY by
+hand, and then a RE-SWEEP on 3 September wrote fresh copies straight back into
+the live folders, because the sweep holds no memory of that move.
+attach_period_files then planned to put the wrong fortnight's timesheets onto
+TCG-21200 and TCG-21195. Caught in the dry run, one step before the client
+would have been sent them.
+
+This fixes it at the point the decision is made: the file never lands in the
+live folder, so there is nothing to quarantine and nothing to un-quarantine.
+
+HOW IT WORKS
+_prior_invoice_numbers() reads every ACCPAY bill dated before this fortnight's
+Monday and builds {item code: {invoice number: period it was billed for}}.
+Keyed on ITEM CODE, never a contact name - Mudassir Ali's bills sit under
+Datacraft Consulting Services Pty Ltd. VOIDED bills excluded: a voided number
+is free to reuse.
+
+plan_filing() checks each attachment that classifies as an invoice. On a hit
+the WHOLE MESSAGE is refused, timesheets included - they cover the period that
+invoice covers. The person still counts as having sent, so they are not also
+listed under NOT SENT ANYTHING.
+
+THE TWO RULES THAT STOP FALSE POSITIVES
+1. A number of 5+ characters matches anywhere in the filename. A shorter one
+   ("0013", "0025") matches only as a whole token, so it is not found inside a
+   date or a longer number.
+2. The subject line is consulted ONLY when the attachment filename carries no
+   digits at all. A reply on the old INV-0016 thread carrying INV-0017 is
+   judged on the attachment, not the subject.
+
+FAILS SOFT
+If the Xero lookup throws, the sweep still runs. It loses the guard and says
+so under "DUPLICATE CHECK DID NOT RUN", which is how it behaved before this
+existed. plan_filing without prior_invoice_numbers behaves exactly as before -
+there is a test for that.
+
+TO DEPLOY
+GitHub web UI -> Thecachegroup/Xero-custom-connector -> Add file -> Upload
+files. Drag the src and tests FOLDERS from inside this package (not the
+package folder itself, or they land beside the real ones). Commit to main.
+Vercel redeploys.
+
+TO VERIFY AFTER DEPLOY
+  sweep_timesheets(period_end="2026-08-30", dry_run=True)
+Expect Bilal Virk and Jay Jhala under DUPLICATE - NOT FILED, and neither of
+them in the FILING table. The _QUERY folder is then belt and braces, not the
+only thing standing between a duplicate and the client.

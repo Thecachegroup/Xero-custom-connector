@@ -607,16 +607,109 @@ def period_window(period_end: date | str, grace_days: int = 10) -> tuple[date, d
     return end - timedelta(days=13), end + timedelta(days=grace_days)
 
 
+# ------------------------------------------------------- duplicate paperwork
+
+# A number shorter than this cannot be trusted as a substring. "0013" sitting
+# inside "20260013" is a coincidence, not last fortnight's invoice. Short
+# numbers still match - but only as a whole token.
+_NUMBER_SUBSTRING_FLOOR = 5
+
+
+def _number_tokens(text: str) -> set[str]:
+    """Every alphanumeric run in a string, squashed."""
+    return {_squash(t) for t in re.split(r"[^A-Za-z0-9]+", str(text or "")) if t}
+
+
+def carries_a_number(text: str) -> bool:
+    """Does this string contain a token with a digit in it.
+
+    Decides whether a filename can be judged on its own. "Invoice INV-0016.pdf"
+    can; "invoice.pdf" and "image.png" cannot, and only those fall back to the
+    subject line - which matters, because a reply on an old thread carries the
+    OLD invoice number in its subject and a NEW invoice as its attachment.
+    Judging that message on its subject would refuse a perfectly good invoice.
+    """
+    return any(any(ch.isdigit() for ch in t) for t in _number_tokens(text))
+
+
+def matches_known_number(text: str, known: str) -> bool:
+    """Does `text` carry the invoice number `known`.
+
+    Two rules, and the second is why this does not fire on coincidences.
+
+    A number long enough to be distinctive (5+ characters once squashed)
+    matches anywhere inside the text: "Invoice INV-0016.pdf" squashes to
+    "invoiceinv0016", which contains "inv0016". Splitting on punctuation alone
+    would have produced INVOICE, INV and 0016 and missed it.
+
+    A short number - "0013", "0025" - matches only as a WHOLE TOKEN. Letting
+    "0013" match anywhere would find it inside a date, an ABN or a longer
+    number belonging to somebody else's period.
+    """
+    k = _squash(known)
+    if len(k) < 3:
+        return False
+    if k in _number_tokens(text):
+        return True
+    return len(k) >= _NUMBER_SUBSTRING_FLOOR and k in _squash(text)
+
+
+def duplicate_number(text: str,
+                     known_numbers: dict[str, str] | None) -> tuple[str, str] | None:
+    """(number, the period it was already billed for), or None.
+
+    `known_numbers` is {invoice number: period it was used in} for ONE
+    contractor, built from their earlier bills. Longest number first, so
+    "INV-0016" is reported rather than the "16" inside it.
+    """
+    if not known_numbers:
+        return None
+    for num in sorted(known_numbers, key=lambda n: -len(_squash(n))):
+        if matches_known_number(text, num):
+            return num, known_numbers[num]
+    return None
+
+
+def find_duplicate(msg: dict, prior: dict[str, str] | None,
+                   has_doc_invoice: bool = False) -> tuple[str, str, str] | None:
+    """(filename, number, period it was used in) if this message carries an
+    invoice number already billed in an earlier period. None otherwise.
+
+    Only attachments that classify as an invoice are checked. A timesheet has
+    no number of its own, and Peter Small's hours workbook deliberately carries
+    the invoice number it belongs to - refusing that would refuse his hours.
+    """
+    if not prior:
+        return None
+    subject = str(msg.get("subject", "") or "")
+    for a in msg.get("attachments", []) or []:
+        name = str(a.get("name", "") or "")
+        if classify(name, a.get("contentType", ""), bool(a.get("isInline")),
+                    subject, has_document_invoice=has_doc_invoice,
+                    size=a.get("size")) != "invoice":
+            continue
+        hay = name if carries_a_number(name) else f"{subject} {name}"
+        hit = duplicate_number(hay, prior)
+        if hit:
+            return name, hit[0], hit[1]
+    return None
+
+
 def plan_filing(messages: list[dict], period_end: date | str,
                 contractors: list[dict] | None = None,
                 cadence: str = "all",
                 grace_days: int = 10,
                 file_admin: bool = False,
-                own_domains: tuple[str, ...] = ()) -> dict:
+                own_domains: tuple[str, ...] = (),
+                prior_invoice_numbers: dict[str, dict[str, str]] | None = None) -> dict:
     """Decide where every attachment goes, before anything is written.
 
     Returns {"files": [...], "unmatched": [...], "missing": [...],
-             "out_of_period": [...], "body_only": [...]}.
+             "out_of_period": [...], "body_only": [...], "duplicates": [...]}.
+
+    PRIOR_INVOICE_NUMBERS is {item code: {invoice number: period it was billed
+    for}}, built from Xero by the caller. Pass it and duplicate paperwork is
+    refused at filing time; leave it out and behaviour is exactly as before.
 
     Nothing is uploaded here. A dry plan can be shown to Andrew and checked
     against what he expects, which is the difference between a filing step he
@@ -641,12 +734,26 @@ def plan_filing(messages: list[dict], period_end: date | str,
     "body_only": the message itself is saved as .eml and the person counts as
     having sent. The days still have to be read by a human - which is the
     honest outcome, and a long way better than silence.
+
+    DUPLICATE PAPERWORK. An invoice number that has already been billed in an
+    earlier period is not evidence for this one. Bilal Virk re-sent INV-0016
+    and Jay Jhala re-sent 20260802 for the fortnight ending 30 August 2026;
+    both were filed without complaint, and the wrong fortnight's timesheets
+    were then a single dry-run away from being attached to a client invoice.
+
+    When a message carries a duplicate invoice number the WHOLE MESSAGE is
+    refused - its timesheets too, because they belong to the period the invoice
+    covers, not to this one. That is what the _QUERY folder was doing by hand,
+    done at the point where the decision is actually made. The person still
+    counts as having sent, so they are not also reported as silent; the
+    "duplicates" list is the chase list.
     """
     roster = contractors if contractors is not None else load_contractors()
     in_play = [c for c in roster if in_scope(c, cadence)]
     lo, hi = period_window(period_end, grace_days)
 
     unmatched, out_of_period, seen = [], [], set()
+    duplicates: list[dict] = []
     staged: list[dict] = []
     body_staged: list[dict] = []
 
@@ -691,6 +798,23 @@ def plan_filing(messages: list[dict], period_end: date | str,
             and classify(a.get("name", ""), a.get("contentType", "")) == "invoice"
             for a in msg.get("attachments", []) or []
         )
+
+        # Refuse the whole message if its invoice number has been billed before.
+        # Its timesheets go with it - they cover the period that invoice covers.
+        dup = find_duplicate(msg, (prior_invoice_numbers or {}).get(
+            str(who.get("item_code") or "")), has_doc_invoice)
+        if dup:
+            duplicates.append({
+                "contractor": who["name"], "item_code": who.get("item_code", ""),
+                "file": dup[0], "number": dup[1], "used_for": dup[2],
+                "subject": subject,
+                "received": recv.isoformat() if recv else "",
+                "attachments": len(msg.get("attachments", []) or []),
+            })
+            # They did send something. Saying "NOT SENT ANYTHING" as well would
+            # be two chase lines for one problem, and the quieter one is wrong.
+            seen.add(who["name"])
+            continue
 
         filed_any = False
         saw_attachment = False
@@ -793,7 +917,9 @@ def plan_filing(messages: list[dict], period_end: date | str,
             "unmatched": unmatched,
             "missing": sorted(missing),
             "out_of_period": out_of_period,
-            "body_only": sorted(body_only, key=lambda f: f["path"])}
+            "body_only": sorted(body_only, key=lambda f: f["path"]),
+            "duplicates": sorted(duplicates,
+                                 key=lambda d: (d["contractor"], d["file"]))}
 
 
 def _as_date(value) -> date | None:

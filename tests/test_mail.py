@@ -508,3 +508,114 @@ def test_mazher_ali_is_on_the_roster_and_is_not_mudassir():
     assert maz["item_code"] == "Linfox - MAZ"
     assert mud["item_code"] == "Linfox - Mali"
     assert maz["folder"] != mud["folder"]
+
+
+# ------------------------------------------------- duplicate invoice numbers
+#
+# Both cases below are real. Fortnight ending 30 August 2026: Bilal Virk
+# re-sent INV-0016 and Jay Jhala re-sent 20260802, each already billed on the
+# 16 August run. Both were filed without complaint, and the wrong fortnight's
+# timesheets came within one dry run of being attached to a client invoice.
+
+PRIOR = {
+    "Linfox - BVIRK": {"INV-0016": "2026-08-16"},
+    "Linfox - JJ": {"20260802": "2026-08-16"},
+    "Tec - PS": {"0024": "2026-08-16"},
+    "Linfox - DV": {"20260817": "2026-08-16"},
+}
+
+
+def test_resent_invoice_number_is_refused():
+    plan = mm.plan_filing([_msg(
+        "techneitconsulting@gmail.com", "Invoice and timesheets",
+        [{"id": "a1", "name": "Invoice INV-0016.pdf"},
+         {"id": "a2", "name": "image001.png", "isInline": True}],
+    )], date(2026, 8, 30), ROSTER, prior_invoice_numbers=PRIOR)
+    assert plan["files"] == []
+    assert len(plan["duplicates"]) == 1
+    d = plan["duplicates"][0]
+    assert d["contractor"] == "Bilal Virk"
+    assert d["number"] == "INV-0016"
+    assert d["used_for"] == "2026-08-16"
+
+
+def test_the_timesheets_go_with_the_refused_invoice():
+    """They cover the period that invoice covers, not this one. This is the
+    whole reason the _QUERY folder existed."""
+    plan = mm.plan_filing([_msg(
+        "jhalajay@gmail.com", "August invoice",
+        [{"id": "a1", "name": "89_Dev_IT_Tax_Invoice_20260802.pdf"},
+         {"id": "a2", "name": "image.png", "isInline": True}],
+    )], date(2026, 8, 30), ROSTER, prior_invoice_numbers=PRIOR)
+    assert plan["files"] == []
+    assert plan["duplicates"][0]["attachments"] == 2
+
+
+def test_a_refused_person_is_not_also_reported_as_silent():
+    """Two chase lines for one problem, and the quieter one would be wrong."""
+    plan = mm.plan_filing([_msg(
+        "techneitconsulting@gmail.com", "Invoice",
+        [{"id": "a1", "name": "Invoice INV-0016.pdf"}],
+    )], date(2026, 8, 30), ROSTER, prior_invoice_numbers=PRIOR)
+    assert "Bilal Virk" not in plan["missing"]
+
+
+def test_a_fresh_number_from_the_same_person_is_filed():
+    plan = mm.plan_filing([_msg(
+        "techneitconsulting@gmail.com", "Invoice",
+        [{"id": "a1", "name": "Invoice INV-0017.pdf"}],
+    )], date(2026, 8, 30), ROSTER, prior_invoice_numbers=PRIOR)
+    assert plan["duplicates"] == []
+    assert len(plan["files"]) == 1
+
+
+def test_a_short_number_matches_only_as_a_whole_token():
+    """Peter Small's 0024 must not be found inside 0025, or inside a date."""
+    assert mm.matches_known_number("Invoice_0024-HOURS.xlsx", "0024")
+    assert not mm.matches_known_number("Invoice_0025.pdf", "0024")
+    assert not mm.matches_known_number("Invoice#20260024.pdf", "0024")
+
+
+def test_a_long_number_matches_inside_a_longer_filename():
+    assert mm.matches_known_number("Invoice INV-0016.pdf", "INV-0016")
+    assert mm.matches_known_number("89_Dev_IT_Tax_Invoice_20260802.pdf", "20260802")
+    assert not mm.matches_known_number("Invoice#20260831.pdf", "20260817")
+
+
+def test_an_old_thread_subject_does_not_condemn_a_new_invoice():
+    """A reply on the INV-0016 thread carrying INV-0017. The attachment has a
+    number of its own, so the subject is never consulted."""
+    plan = mm.plan_filing([_msg(
+        "techneitconsulting@gmail.com", "Re: Invoice INV-0016",
+        [{"id": "a1", "name": "INV-0017.pdf"}],
+    )], date(2026, 8, 30), ROSTER, prior_invoice_numbers=PRIOR)
+    assert plan["duplicates"] == []
+
+
+def test_a_generic_filename_falls_back_to_the_subject():
+    plan = mm.plan_filing([_msg(
+        "techneitconsulting@gmail.com", "Invoice INV-0016 for August",
+        [{"id": "a1", "name": "invoice.pdf"}],
+    )], date(2026, 8, 30), ROSTER, prior_invoice_numbers=PRIOR)
+    assert len(plan["duplicates"]) == 1
+
+
+def test_a_timesheet_carrying_an_old_invoice_number_is_not_refused():
+    """Peter Small's hours workbook is named after the invoice it belongs to.
+    Refusing that would refuse his hours."""
+    plan = mm.plan_filing([_msg(
+        "pjs.ucanemailme@gmail.com", "Hours",
+        [{"id": "a1", "name": "Invoice_0024-HOURS.xlsx"}],
+    )], date(2026, 8, 30), ROSTER, prior_invoice_numbers=PRIOR)
+    assert plan["duplicates"] == []
+    assert len(plan["files"]) == 1
+
+
+def test_without_prior_numbers_nothing_changes():
+    """The guard is additive. No lookup, old behaviour."""
+    plan = mm.plan_filing([_msg(
+        "techneitconsulting@gmail.com", "Invoice",
+        [{"id": "a1", "name": "Invoice INV-0016.pdf"}],
+    )], date(2026, 8, 30), ROSTER)
+    assert plan["duplicates"] == []
+    assert len(plan["files"]) == 1
