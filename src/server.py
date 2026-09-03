@@ -580,7 +580,7 @@ def list_repeating_templates(kinds: str = "both", contains: str = "",
             if code and float(qty or 0) == 0.0:
                 zero_somewhere.add(code.lower())
 
-    flagged, fixed, deleted_hits = [], [], 0
+    flagged, fixed, deleted_hits, tax_bad = [], [], 0, []
     for r in templates:
         typ = str(r.get("Type") or "").upper()
         if want == "sales" and typ != "ACCREC":
@@ -589,6 +589,14 @@ def list_repeating_templates(kinds: str = "both", contains: str = "",
             continue
         status = str(r.get("Status") or "").upper()
         contact = str((r.get("Contact") or {}).get("Name") or "")
+        # The tax basis is a fault whatever the quantity is, and the template
+        # is where it starts - fix the invoice only and next period repeats it.
+        if status != "DELETED":
+            for row_ in writes.tax_basis_problems(
+                    [r], "sales" if typ == "ACCREC" else "bill"):
+                row_["Repeats"] = "template"
+                tax_bad.append({k: v for k, v in row_.items()
+                                if k not in ("InvoiceID", "Repeats")})
         sched = r.get("Schedule") or {}
         unit = str(sched.get("Unit") or "").title()
         period = sched.get("Period")
@@ -656,6 +664,19 @@ def list_repeating_templates(kinds: str = "both", contains: str = "",
                 "here carries an item code that any live template bills by the",
                 "day. include_fixed_fee=True for the full list."]
 
+    if tax_bad:
+        out += ["", "*** TEMPLATE TAX BASIS - READ THIS ***",
+                pd.DataFrame(tax_bad).to_markdown(index=False),
+                "",
+                "Every TCG document is TAX EXCLUSIVE. A template set otherwise",
+                "generates every future invoice that way - an INCLUSIVE one",
+                "takes the GST out of the rate rather than adding it on, so a",
+                "$1,000/day line bills $909.09 + $90.91 instead of $1,000 +",
+                "$100. Fix the template in Xero: Business > Invoices >",
+                "Repeating (or Bills to pay > Repeating), open it, set the",
+                "Amounts are dropdown to Tax Exclusive, Save. Fix any draft it",
+                "has already generated as well."]
+
     if deleted_hits and not include_deleted:
         out += ["", f"{deleted_hits} non-zero line(s) on DELETED templates hidden - "
                     "they generate nothing. include_deleted=True to see them."]
@@ -696,10 +717,10 @@ def set_repeating_quantity(item_code: str, quantity: float = 0,
         return (f"No repeating template carries item code {item_code!r}. "
                 "Nothing has been changed.")
 
-    lines = [f"{'DRY RUN - nothing written' if dry_run else 'UPDATED'}: "
-             f"{len(hits)} template(s) for {item_code}", ""]
+    lines = [f"{len(hits)} live template(s) carry {item_code}", ""]
     written: list[tuple[str, str, str]] = []
     failed: list[str] = []
+    api_refused = False
     for r in hits:
         typ = "sales" if str(r.get("Type")).upper() == "ACCREC" else "bill"
         contact = str((r.get("Contact") or {}).get("Name") or "")
@@ -723,12 +744,40 @@ def set_repeating_quantity(item_code: str, quantity: float = 0,
                 written.append((str(r.get("RepeatingInvoiceID") or ""), typ, contact))
             except Exception as e:                                 # noqa: BLE001
                 failed.append(f"  {typ:<5} {contact[:32]:<34} NOT CHANGED - {e}")
+                if "must be set to DELETED" in str(e):
+                    api_refused = True
 
     if failed:
-        lines += ["", "FAILED:"] + failed
+        lines += ["", "NOT CHANGED:"] + failed
+
+    if api_refused:
+        # Xero's RepeatingInvoices endpoint accepts a POST against an existing
+        # template only to DELETE it. The quantity cannot be changed through
+        # the API at all - proven against the live org, 3 Sep 2026, on
+        # Bhasker's template. Deleting and recreating is NOT the workaround:
+        # it loses the template's history and a recreate that goes wrong
+        # invoices a client every period. So this becomes instructions.
+        lines += ["",
+                  "XERO WILL NOT LET THE API CHANGE A REPEATING TEMPLATE.",
+                  "",
+                  "A POST against an existing template is only accepted to",
+                  "DELETE it. Nothing has been changed and nothing will be -",
+                  "deleting and recreating would lose the template's history",
+                  "and a recreate that goes wrong bills a client every period.",
+                  "",
+                  "DO IT IN XERO, it is four clicks:",
+                  "",
+                  "  1. Business > Invoices, then the Repeating tab.",
+                  "     For a bill: Business > Bills to pay > Repeating.",
+                  f"  2. Open the template above carrying {item_code}.",
+                  f"  3. Change Qty on that line to {float(quantity):g}.",
+                  "  4. Save.",
+                  "",
+                  "Then run list_repeating_templates() to confirm it took."]
 
     if dry_run:
-        lines += ["", "Re-run with dry_run=False to apply."]
+        lines += ["", "DRY RUN - nothing written. Re-run with dry_run=False to apply.",
+                  "Note: Xero may refuse the write - see below if it does."]
     elif written:
         # Read the templates back and prove the number actually moved. This is
         # the one tool whose whole reason for existing is that nobody reads the
@@ -1442,6 +1491,7 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
     planned, skipped, errors, renumbered, rereferenced = [], [], [], [], []
     seen_codes: set[str] = set()
     monthly_left: list[dict] = []
+    tax_rows: list[dict] = []
 
     for kind in types[kinds]:
         label = "invoice" if kind == "ACCREC" else "bill"
@@ -1457,6 +1507,10 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
                 if code in wanted:
                     seen_codes.add(code)
 
+        tax_rows += writes.tax_basis_problems(
+            [d for d in docs
+             if any((li.get("ItemCode") or "").strip() in wanted
+                    for li in (d.get("LineItems") or []))], label)
         p_, s_, to_write = writes.plan_line_fill(docs, wanted, stamp, label)
         planned += p_
         skipped += s_
@@ -1536,6 +1590,7 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
                     errors.append(f"{label} {doc.get('InvoiceNumber') or inv_id[:8]}: {e}")
 
     missing = sorted(set(wanted) - seen_codes)
+    tax_bad = [{k: v for k, v in r.items() if k != "InvoiceID"} for r in tax_rows]
 
     out = [f"Fortnight ending {end.isoformat()}   drafts dated {lo} to {hi}",
            "DRY RUN - nothing written." if dry_run else "WRITTEN to Xero. Still DRAFT - approve and send yourself.",
@@ -1593,6 +1648,21 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
             out += ["", "LEFT ALONE (already at the days you gave):",
                     pd.DataFrame([{k: v for k, v in r.items() if k != "Mismatch"}
                                   for r in benign]).to_markdown(index=False)]
+    if tax_bad:
+        out += ["", "*** TAX BASIS - READ THIS ***",
+                pd.DataFrame(tax_bad).to_markdown(index=False),
+                "",
+                "Every TCG document is TAX EXCLUSIVE. Rates are quoted and",
+                "contracted ex GST and the tax goes on top. An INCLUSIVE",
+                "document computes the GST out of the rate instead: $1,000/day",
+                "bills $909.09 + $90.91 rather than $1,000 + $100, so the client",
+                "is short-invoiced, the contractor is not, and it takes a credit",
+                "note to unwind once it has been approved.",
+                "",
+                "Fix it in Xero on the invoice - the Amounts are dropdown at the",
+                "top right of the line table - and on the REPEATING TEMPLATE",
+                "behind it, or the next period generates the same fault.",
+                "submit_period_invoices will not move an Inclusive document."]
     if missing:
         out += ["", "NO DRAFT FOUND for these item codes: " + ", ".join(missing)]
     if errors:
@@ -1772,6 +1842,7 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
                 errors.append(f"{r['Doc']}: {e}")
         ready = done
 
+    tax_held = [h for h in held if "TAX INCLUSIVE" in str(h.get("Why"))]
     out = [f"Fortnight ending {end.isoformat()}",
            "DRY RUN - nothing moved." if dry_run else
            "MOVED to Awaiting Approval. Approving and sending is still yours.",
@@ -1795,6 +1866,19 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
                               for h in held]).to_markdown(index=False)]
     if errors:
         out += ["", "ERRORS:"] + [f"  {e}" for e in errors]
+    if tax_held:
+        out += ["", "*** HELD BECAUSE THE TAX BASIS IS WRONG ***",
+                "",
+                "Every TCG document is TAX EXCLUSIVE - the rate is ex GST and",
+                "the tax goes on top. An INCLUSIVE document takes the GST OUT",
+                "of the rate: a $1,000/day line bills $909.09 + $90.91 instead",
+                "of $1,000 + $100. Approved and sent, that needs a credit note",
+                "to unwind, so it does not move from here.",
+                "",
+                "In Xero, open the invoice, set the Amounts are dropdown above",
+                "the line table to Tax Exclusive, save - then fix the REPEATING",
+                "TEMPLATE behind it or next period generates the same fault.",
+                "Re-run this once both are right."]
     return "\n".join(out)
 
 

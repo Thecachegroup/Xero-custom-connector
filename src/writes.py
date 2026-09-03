@@ -746,6 +746,53 @@ def set_invoice_status(client, invoice_id: str, status: str) -> dict:
                  {"Invoices": [{"InvoiceID": invoice_id, "Status": status}]})
 
 
+# Every TCG document is TAX EXCLUSIVE - rates are quoted and contracted ex GST
+# and the tax is added on top. One that sneaks through as Inclusive computes the
+# GST out of the rate instead of onto it, so a $1,000/day line bills $909.09 +
+# $90.91 rather than $1,000 + $100: the client is short-invoiced, the contractor
+# is not, and it takes a credit note to unwind. Andrew, 3 Sep 2026: "they should
+# be set to exclusive, but sometimes one or two sneak through with inclusive,
+# and that can cause all sorts of problems."
+#
+# NoTax is not wrong everywhere - the offshore bills are BASEXCLUDED - so it is
+# reported rather than held.
+TAX_BASIS_EXPECTED = "Exclusive"
+
+
+def tax_basis(doc: dict) -> str:
+    """Xero's LineAmountTypes on one document. '' when Xero did not send it."""
+    return str(doc.get("LineAmountTypes") or "").strip()
+
+
+def tax_basis_problems(docs: list[dict], label: str = "invoice") -> list[dict]:
+    """Documents whose tax basis is not Exclusive. Pure; no network.
+
+    INCLUSIVE is the dangerous one and is called out as such. NoTax is listed
+    to be looked at, because it is right for the offshore bills and wrong for
+    anything carrying GST.
+    """
+    out: list[dict] = []
+    for d in docs:
+        basis = tax_basis(d)
+        if basis.lower() == TAX_BASIS_EXPECTED.lower():
+            continue
+        if not basis:
+            continue                      # Xero did not send it; not evidence
+        out.append({
+            "Kind": label,
+            "Doc": d.get("InvoiceNumber") or str(d.get("InvoiceID", ""))[:8],
+            "Contact": (d.get("Contact") or {}).get("Name", "?"),
+            "Tax basis": basis,
+            "Why it matters": ("GST computed OUT of the rate, not onto it - "
+                               "the client is short-invoiced"
+                               if basis.lower() == "inclusive" else
+                               "no GST on this document - right for the "
+                               "offshore bills, wrong for anything else"),
+            "InvoiceID": d.get("InvoiceID"),
+        })
+    return out
+
+
 def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
                     require_attachment: bool = False) -> tuple[list[dict], list[dict]]:
     """Which invoices are finished enough to submit, and why the rest are not.
@@ -779,6 +826,11 @@ def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
         empty = [li for li in lines if not (li.get("Quantity") or 0)]
         if empty:
             held.append({**row, "Why": f"{len(empty)} line(s) still at zero"})
+            continue
+        # An Inclusive document must not go to Awaiting Approval. It bills the
+        # wrong number and it takes a credit note to unwind once approved.
+        if tax_basis(d).lower() == "inclusive":
+            held.append({**row, "Why": "TAX INCLUSIVE - must be Exclusive"})
             continue
         has_doc = bool(attachments_by_id.get(d.get("InvoiceID")))
         if require_attachment and not has_doc:
