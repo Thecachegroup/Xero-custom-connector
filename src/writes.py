@@ -905,6 +905,14 @@ def split_excluded(docs: list[dict], patterns: list[str] | None = None,
     keyed on item code, which is the one stable key. A document is monthly when
     any of its lines carries a monthly person's item code.
 
+    CADENCE CAN DIFFER BY SIDE, added 4 September 2026. Peter Small is billed
+    FORTNIGHTLY by TecAlliance and invoiced MONTHLY to Xenon Media - one person,
+    two cycles. Marking him monthly outright would pull his fortnightly bill out
+    of the fortnightly run and stop him being paid on time. So `monthly_codes`
+    may be a plain set, applying to both sides as before, or a mapping
+    {"sales": {...}, "bills": {...}} when they differ. Andrew, 4 September 2026:
+    "there will always be the exception."
+
     PATTERNS. The manual escape hatch: an invoice number, a contact name, a
     reference or an item code, matched case-insensitively as a substring. For
     the one-off that no rule describes.
@@ -916,7 +924,15 @@ def split_excluded(docs: list[dict], patterns: list[str] | None = None,
     Returns (kept, excluded).
     """
     pats = [p.strip().lower() for p in (patterns or []) if str(p).strip()]
-    monthly = {str(c).strip().lower() for c in (monthly_codes or ())}
+
+    def _side_set(key: str) -> set[str]:
+        src = monthly_codes
+        if isinstance(src, dict):
+            src = src.get(key) or ()
+        return {str(c).strip().lower() for c in (src or ())}
+
+    monthly_sales = _side_set("sales")
+    monthly_bills = _side_set("bills")
     want = (cadence or "all").strip().lower()
 
     kept: list[dict] = []
@@ -926,7 +942,13 @@ def split_excluded(docs: list[dict], patterns: list[str] | None = None,
         contact = (d.get("Contact") or {}).get("Name", "?")
         codes = [str(li.get("ItemCode") or "").strip().lower()
                  for li in (d.get("LineItems") or [])]
-        is_monthly = any(c in monthly for c in codes if c)
+        # A bill is judged on the bills cadence and a sales invoice on the
+        # sales one. Where Xero did not send Type, fall back to the sales set:
+        # a sales invoice going out a cycle early is the costlier mistake.
+        side = (monthly_bills
+                if str(d.get("Type") or "").strip().upper() == "ACCPAY"
+                else monthly_sales)
+        is_monthly = any(c in side for c in codes if c)
 
         if want == "fortnightly" and is_monthly:
             excluded.append({"Doc": num, "Contact": contact,

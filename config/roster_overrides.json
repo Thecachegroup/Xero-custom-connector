@@ -17,6 +17,12 @@
     "cadence  - 'monthly' for the offshore team. Default is fortnightly. Monthly",
     "           people still file into the CURRENT FORTNIGHT folder - Andrew's",
     "           decision, 2 Sep 2026 - so there is one folder to look in, not two.",
+    "           MAY DIFFER BY SIDE. Peter Small is billed FORTNIGHTLY by",
+    "           TecAlliance and invoiced MONTHLY to Xenon Media, so his entry",
+    "           reads {\"sales\": \"monthly\", \"bills\": \"fortnightly\"} rather than a",
+    "           plain string. Marking him monthly outright would pull his",
+    "           fortnightly bill out of the fortnightly run and stop him being",
+    "           paid on time. A plain string still means both sides.",
     "emails   - an address they also send from. Normally not needed: the address",
     "period_day - for a MONTHLY person whose cycle is OFFSET from the calendar",
     "           month. 12 means the 12th of the preceding month to the 11th of",
@@ -79,6 +85,14 @@
       "emails": [
         "vivekchoudhary1989@gmail.com"
       ]
+    },
+    "Tec - PS": {
+      "name": "Peter Small",
+      "cadence": {
+        "sales": "monthly",
+        "bills": "fortnightly"
+      },
+      "_why": "SPLIT CADENCE. TecAlliance bill him fortnightly; Xenon Media are invoiced MONTHLY, and the monthly invoice is the sum of the fortnights ENDING in that calendar month - so a month catching three fortnight-ends bills three, not two. August 2026 was one of those: 47.96 + 42.23 + 47.95 = 138.14 hours, against a usual ~90. Without this entry the fortnightly run treated him as fortnightly and would have stamped '17 August to 30 August 2026' over his 'Peter Little August' reference. Andrew, 4 Sep 2026."
     },
     "Passthru - Expenses": {
       "ignore": true,

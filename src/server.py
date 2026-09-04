@@ -333,11 +333,39 @@ def _ignored_item_codes() -> set[str]:
             if (ov or {}).get("ignore")}
 
 
-def _monthly_item_codes() -> set[str]:
-    """Item codes whose person bills monthly. Cadence already lives in
+def _cadence_value(entry: dict, side: str = "") -> str:
+    """The cadence for one side of one person: 'monthly' or 'fortnightly'.
+
+    `cadence` in roster_overrides.json is normally a plain string applying to
+    both sides. It may instead be a mapping {"sales": ..., "bills": ...} for
+    somebody whose two cycles differ - Peter Small is billed fortnightly by
+    TecAlliance and invoiced monthly to Xenon Media. SIDE is 'sales', 'bills',
+    or '' meaning "monthly on either side".
+
+    Anything unreadable reads as fortnightly, which is what everybody not
+    listed is, so a malformed entry cannot silently take somebody out of the
+    fortnightly run.
+    """
+    def _clean(v) -> str:
+        # Only 'monthly' is acted on. Anything else - a typo, a null, a value
+        # nobody has taught this about - reads as fortnightly, so a malformed
+        # entry cannot quietly take somebody out of the fortnightly run.
+        return "monthly" if str(v or "").strip().lower() == "monthly" else "fortnightly"
+
+    raw = (entry or {}).get("cadence")
+    if isinstance(raw, dict):
+        if side in ("sales", "bills"):
+            return _clean(raw.get(side))
+        return ("monthly" if any(_clean(v) == "monthly" for v in raw.values())
+                else "fortnightly")
+    return _clean(raw)
+
+
+def _monthly_item_codes(side: str = "") -> set[str]:
+    """Item codes whose person bills monthly on SIDE. Cadence already lives in
     roster_overrides.json keyed on item code; nothing else needs to know."""
     return {c for c, ov in (roster.load_overrides() or {}).items()
-            if str((ov or {}).get("cadence") or "").strip().lower() == "monthly"}
+            if _cadence_value(ov, side) == "monthly"}
 
 
 # ---------------------------------------------------------------- tools
@@ -1663,9 +1691,12 @@ def inventory_coverage(period_end: str, window_days: int = 10) -> str:
     return "\n".join(out)
 
 
-def _cadence_of(item_code: str) -> tuple[bool, int | None]:
+def _cadence_of(item_code: str, side: str = "") -> tuple[bool, int | None]:
     """(is_monthly, period_day) for an item code, from roster_overrides.json -
     no network, and cadence lives nowhere else.
+
+    SIDE is 'sales', 'bills', or '' for "monthly on either side". It matters
+    only for somebody whose two cycles differ; see _cadence_value.
 
     Default is fortnightly, which is what everybody not listed is.
 
@@ -1681,7 +1712,7 @@ def _cadence_of(item_code: str) -> tuple[bool, int | None]:
     except Exception:                                              # noqa: BLE001
         return False, None
     entry = by_code.get(str(item_code or "").strip()) or {}
-    monthly = str(entry.get("cadence") or "fortnightly").lower() == "monthly"
+    monthly = _cadence_value(entry, side) == "monthly"
     day = entry.get("period_day")
     try:
         day = int(day) if day is not None else None
@@ -1840,7 +1871,12 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
             hit = [c for c in codes if c in wanted]
             if not hit:
                 continue
-            cad = [_cadence_of(c) for c in hit]
+            # The reference being decided here is a SALES reference, so a
+            # split-cadence person is judged on their sales cycle. Peter Small
+            # is fortnightly on the bill and monthly to the client; stamping a
+            # fortnight range on his monthly invoice is wrong twice over -
+            # wrong length and wrong dates.
+            cad = [_cadence_of(c, "sales") for c in hit]
             if any(m for m, _ in cad):
                 # An OFFSET monthly cycle can be written exactly - Prasanthi's
                 # 12th-to-11th window is a date range in the same house format
@@ -2164,7 +2200,8 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
     # is subtracted before any new draft is measured against what is left.
     reserved = (list(c.iter_invoices("ACCREC", lo, hi, statuses=["SUBMITTED"]))
                 if require_stock else [])
-    monthly_codes = _monthly_item_codes()
+    monthly_codes = {"sales": _monthly_item_codes("sales"),
+                     "bills": _monthly_item_codes("bills")}
     patterns = [p for p in (exclude or "").split(",") if p.strip()]
 
     ready, held, skipped = [], [], []

@@ -1,98 +1,100 @@
-XERO CONNECTOR — TAX BASIS ON BILLS, AND BILL NUMBERS ON THEIR OWN
-Built 4 September 2026 Melbourne, off github.com/Thecachegroup/Xero-custom-connector main (17ab1bd).
+XERO CONNECTOR — CADENCE CAN DIFFER BY SIDE
+Off github.com/Thecachegroup/Xero-custom-connector main (3f98d0b).
 
-214 tests before, 230 after. All pass. The 16 new ones were run against the
-UNFIXED code first and 14 failed. The 2 that passed assert behaviour that
-already existed and must not change.
+230 tests before, 241 after. All pass. The 11 new ones were run against the
+DEPLOYED code first and 9 failed. The 2 that passed assert behaviour that
+already holds and must not change.
 
 --------------------------------------------------------------------------
 WHY
 --------------------------------------------------------------------------
-list_repeating_templates flagged six BILL templates as TAX INCLUSIVE against
-the house rule: That's Sparkling Clean, DITYA, Logic Lanes, PRAVID, VVR and
-Karen Crabb. Every one of the six is correct as it stands.
+The cadence register already existed and is the right shape: config/
+roster_overrides.json, keyed on item code, one line per exception, no code
+change to add somebody. The four offshore people are in it.
 
-Five carry no GST at all — the offshore monthlies post BASEXCLUDED and Karen
-Crabb's NZ bill has no Australian GST. On a zero-rated line Inclusive and
-Exclusive are the same number, so the basis cannot do any harm.
+PETER SMALL WAS NOT. He defaulted to fortnightly, and on 4 September 2026 the
+fortnightly fill was one write away from stamping "17 August to 30 August 2026"
+over his "Peter Little August" reference - a fortnight range on a monthly
+invoice, wrong length and wrong dates. Caught in a dry run.
 
-The sixth, That's Sparkling Clean, does carry 10% GST and is Inclusive on
-purpose: the $132 IS the GST-inclusive total on their invoice.
+Adding him as plain "monthly" is not the fix. split_excluded judges a document
+monthly when ANY line carries a monthly item code, whatever the document is, so
+his fortnightly BILL would have been pulled out of the fortnightly submit and he
+would have stopped being paid on time.
 
-And it was not just noise. plan_submission HELD every Inclusive document out
-of Awaiting Approval, so all six bills would be refused every run and the only
-way through was to set them Exclusive — wrong for all six. A guard that blocks
-correct work is a bug.
+He is billed FORTNIGHTLY by TecAlliance and invoiced MONTHLY to Xenon Media.
+One person, two cycles. Andrew, 4 September 2026: "there will always be the
+exception."
 
 --------------------------------------------------------------------------
-BILLS ONLY — read this bit
+THE CHANGE — IT STAYS IN CONFIG
 --------------------------------------------------------------------------
-Neither carve-out touches a TCG SALES INVOICE. A bill is the supplier's
-document and they choose the basis. A sales invoice is ours, contracted ex
-GST, and Inclusive on one of those short-invoices the client and takes a
-credit note to unwind — so it is still reported and still held, whatever the
-tax on it happens to be, and whoever the customer is. Four tests cover that.
+`cadence` may now be a mapping as well as a string:
+
+    "Tec - PS": {
+      "name": "Peter Small",
+      "cadence": { "sales": "monthly", "bills": "fortnightly" }
+    }
+
+A plain "cadence": "monthly" still means both sides, so the offshore four are
+untouched. Only somebody genuinely split needs the longer form. Adding the next
+exception is still one entry in one file.
 
 --------------------------------------------------------------------------
 FILES
 --------------------------------------------------------------------------
-src/writes.py
-  NEW  carries_gst(doc) -> True / False / None
-       TaxAmount across the lines first, then TaxType against a set of
-       zero-rated types. Returns None — NOT False — when the document does not
-       say enough to tell, so a trimmed payload keeps the strict behaviour
-       instead of being waved through as GST-free.
-  NEW  _is_bill(doc, label) — Xero's Type leads; where it is absent the
-       caller's label decides, and anything unrecognised is NOT a bill.
-  NEW  _inclusive_is_deliberate(doc, inclusive_ok) — contact-name match,
-       case and padding insensitive.
-  MOD  tax_basis_problems(docs, label, inclusive_ok=frozenset())
-       On a BILL, skips a document carrying no GST and one whose supplier is
-       named. On a sales invoice, nothing changes.
-  MOD  plan_submission(..., inclusive_ok=frozenset(), kind="")
-       Same two carve-outs, bills only. A real fault — a Linfox day-rate line
-       at 10% set Inclusive — is still held, and there is a test for it.
-  MOD  plan_number_change now marks a row "ByContact" when it matched on the
-       SUPPLIER NAME rather than an item code.
-
 src/server.py
-  NEW  _tax_inclusive_ok() — reads config/tax_inclusive_ok.json. A missing or
-       unreadable file returns nothing, which RESTORES the strict behaviour
-       rather than silently waiving the check.
-  MOD  wired into list_repeating_templates, fill_period_drafts and
-       submit_period_invoices.
-  MOD  fill_period_drafts no longer refuses a call that passes bill_numbers
-       with no quantities. That is the Sparkling Clean case: a fixed-fee line
-       correctly sitting at quantity 1, needing only their invoice number.
-  MOD  A bill matched by SUPPLIER NAME now gets that number in its REFERENCE
-       field as well as its number field. Andrew, 4 September 2026: "that's
-       how that company works out who's paid and who hasn't." Contractor bills
-       matched by item code are untouched.
+  NEW  _cadence_value(entry, side) — 'monthly' or 'fortnightly' for one side.
+       ONLY 'monthly' is acted on; a typo, a null or an unknown value reads as
+       fortnightly, so a malformed entry cannot quietly take somebody out of
+       the fortnightly run. side='' means "monthly on either side".
+  MOD  _monthly_item_codes(side="") and _cadence_of(item_code, side="").
+  MOD  fill_period_drafts asks for the SALES cadence when deciding a sales
+       reference — that is the write that nearly went wrong.
+  MOD  submit_period_invoices passes {"sales": ..., "bills": ...}.
 
-config/tax_inclusive_ok.json   NEW — That's Sparkling Clean.
-tests/test_tax_basis.py        16 new tests.
+src/writes.py
+  MOD  split_excluded accepts a plain set (both sides, as before) or a mapping
+       {"sales", "bills"}. A bill is judged on the bills cadence, a sales
+       invoice on the sales one. A document with no Type falls back to the
+       SALES set — a sales invoice going out a cycle early is the costlier
+       mistake.
+
+config/roster_overrides.json
+  NEW  Tec - PS, with the reasoning and the August arithmetic recorded.
+  MOD  the header comment documents the split form.
+
+tests/test_cadence.py   11 new tests.
+
+--------------------------------------------------------------------------
+WHAT THIS DOES NOT DO — still to build
+--------------------------------------------------------------------------
+This stops a monthly invoice being damaged by the fortnightly run. It does NOT
+raise one, and it does not tell you when one is due and unbilled.
+
+TCG-21192 sat at zero for a week and was noticed by eye, not by a tool. The
+monthly-due check — for each monthly-sales person, is this month's invoice
+raised and still at zero, and what do the fortnightly bills DATED in that month
+total — is a separate build and is not in this package. For Peter that
+calculation returns 138.14 on its own.
 
 --------------------------------------------------------------------------
 DEPLOY
 --------------------------------------------------------------------------
-GitHub web UI -> Thecachegroup/Xero-custom-connector -> Add file -> Upload
-files. Drag the src, tests and config folders from INSIDE this package — not
-the package folder itself, or they land beside the real ones. Commit to main.
-Vercel redeploys, two to three minutes.
+GitHub web UI -> Add file -> Upload files. Drag the src, tests and config
+folders from INSIDE this package — not the package folder itself. Commit to
+main. Vercel redeploys, two to three minutes.
 
 Do not upload _WHAT-CHANGED.txt or _DIFF.txt.
 
 --------------------------------------------------------------------------
 VERIFY AFTER DEPLOY
 --------------------------------------------------------------------------
-1. list_repeating_templates(kinds="bills", include_fixed_fee=True)
-   The TEMPLATE TAX BASIS block should no longer list the six. If one still
-   shows, it is carrying GST and is worth a look.
+1. submit_period_invoices("2026-08-30", dry_run=True)
+   TCG-21192 (Xenon Media) should now appear under NOT IN THIS RUN as monthly
+   cadence, alongside TCG-21207 and the PRAVID bill. Peter's own fortnightly
+   BILL 0025 must NOT be there.
 
-2. submit_period_invoices("2026-08-30", dry_run=True)
-   No document held for "TAX INCLUSIVE - must be Exclusive".
-
-3. fill_period_drafts("2026-08-30", quantities="", dry_run=True,
-                      bill_numbers="That's Sparkling Clean: <their number>")
-   Should plan the number change AND a REFERENCE set on the same bill,
-   instead of returning "No quantities given".
+2. fill_period_drafts("2026-08-30", quantities="Tec - PS: 1", dry_run=True)
+   Must NOT plan a reference change on TCG-21192. Before this, it planned to
+   overwrite "Peter Little August" with a fortnight range.
