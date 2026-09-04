@@ -1,0 +1,484 @@
+diff --git a/src/server.py b/src/server.py
+index 5eb43d9..edbd312 100644
+--- a/src/server.py
++++ b/src/server.py
+@@ -255,6 +255,34 @@ def _customer_lookup() -> dict[str, str]:
+     return json.load(open(path)) if os.path.exists(path) else {}
+ 
+ 
++def _tax_inclusive_ok() -> set[str]:
++    """Suppliers whose Inclusive tax basis is deliberate and correct.
++
++    The house rule is TAX EXCLUSIVE, so Inclusive is normally reported and held
++    back from Awaiting Approval. A handful of suppliers genuinely bill a
++    GST-inclusive total - That's Sparkling Clean is one - and a rule cannot tell
++    those from a mistake, so they are named.
++
++    A missing or unreadable file returns nothing, which restores the stricter
++    behaviour rather than silently waiving the check.
++    """
++    path = os.environ.get("TCG_TAX_INCLUSIVE_OK", "config/tax_inclusive_ok.json")
++    if not os.path.exists(path):
++        return set()
++    try:
++        raw = json.load(open(path))
++    except Exception as e:                                        # noqa: BLE001
++        log.warning("Could not read %s (%s). Every Inclusive document will be "
++                    "reported and held, including the ones that are correct.",
++                    path, e)
++        return set()
++    if isinstance(raw, list):
++        return set(raw)
++    if isinstance(raw, dict):
++        return set(raw.get("names") or [])
++    return set()
++
++
+ def _payroll_tax_config() -> tuple[set[str], set[str]]:
+     """(exempt names, explicitly exempt item codes) from no_payroll_tax.json.
+ 
+@@ -677,6 +705,7 @@ def list_repeating_templates(kinds: str = "both", contains: str = "",
+     needle = str(contains or "").strip().lower()
+ 
+     templates = c.repeating_invoices()
++    inclusive_ok = _tax_inclusive_ok()
+ 
+     # An item code is "day rate" when a LIVE template somewhere carries it at
+     # zero - something is filling that line from a timesheet. Built across
+@@ -705,7 +734,8 @@ def list_repeating_templates(kinds: str = "both", contains: str = "",
+         # is where it starts - fix the invoice only and next period repeats it.
+         if status != "DELETED":
+             for row_ in writes.tax_basis_problems(
+-                    [r], "sales" if typ == "ACCREC" else "bill"):
++                    [r], "sales" if typ == "ACCREC" else "bill",
++                    inclusive_ok=inclusive_ok):
+                 row_["Repeats"] = "template"
+                 tax_bad.append({k: v for k, v in row_.items()
+                                 if k not in ("InvoiceID", "Repeats")})
+@@ -1724,7 +1754,7 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
+     wanted, bad = writes.parse_quantities(quantities)
+     if bad:
+         return "Could not read these lines - expected 'item code: days':\n  " + "\n  ".join(bad)
+-    if not wanted:
++    if not wanted and not str(bill_numbers or "").strip():
+         return "No quantities given. Nothing to do."
+ 
+     ref = (writes.period_reference(end - timedelta(days=13), end)
+@@ -1765,7 +1795,8 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
+         tax_rows += writes.tax_basis_problems(
+             [d for d in docs
+              if any((li.get("ItemCode") or "").strip() in wanted
+-                    for li in (d.get("LineItems") or []))], label)
++                    for li in (d.get("LineItems") or []))], label,
++            inclusive_ok=_tax_inclusive_ok())
+         p_, s_, to_write = writes.plan_line_fill(docs, wanted, stamp, label)
+         planned += p_
+         skipped += s_
+@@ -1777,6 +1808,18 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
+         renumbered += num_changes
+         new_num = {n["InvoiceID"]: n["Now"] for n in num_changes}
+ 
++        # A bill matched by SUPPLIER NAME rather than item code is a cleaning or
++        # subscription bill - no inventory item, no timesheet. Those suppliers
++        # reconcile on their own reference, not on TCG's, so their invoice
++        # number goes in the Reference field as well as the number field.
++        # Andrew, 4 September 2026, on That's Sparkling Clean: "that's how that
++        # company works out who's paid and who hasn't."
++        bill_refs = [
++            {"InvoiceID": n["InvoiceID"], "Contact": n["Contact"],
++             "Was": "(none)", "Now": n["Now"]}
++            for n in num_changes if n.get("ByContact")
++        ] if kind == "ACCPAY" else []
++
+         # The period reference is TCG's, so it goes on sales invoices only, and
+         # on every draft for somebody in THIS period's list - not only the ones
+         # this pass happens to be filling. Filling and referencing are separate
+@@ -1826,8 +1869,8 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
+                     ref_changes += writes.plan_reference_change([d], own)
+         if kind == "ACCREC":
+             monthly_left += monthly_refs
+-        rereferenced += ref_changes
+-        new_ref = {r["InvoiceID"]: r["Now"] for r in ref_changes}
++        rereferenced += ref_changes + bill_refs
++        new_ref = {r["InvoiceID"]: r["Now"] for r in ref_changes + bill_refs}
+ 
+         by_id = {d["InvoiceID"]: d for d in to_write}
+         for inv_id in list(new_num) + list(new_ref):
+@@ -2113,6 +2156,7 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
+     if (cadence or "").strip().lower() not in ("all", "fortnightly", "monthly"):
+         return "cadence must be 'fortnightly', 'monthly' or 'all'."
+ 
++    inclusive_ok = _tax_inclusive_ok()
+     # Live items, for the same reason inventory_coverage does not use the cache.
+     stock = coverage.stock_index(c.items()) if require_stock else {}
+     # Everything already in Awaiting Approval is going to eat this stock the
+@@ -2141,7 +2185,8 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
+             docs, att, require_attachment,
+             stock=stock if kind == "ACCREC" else None,
+             require_stock=require_stock,
+-            reserved=reserved if kind == "ACCREC" else None)
++            reserved=reserved if kind == "ACCREC" else None,
++            inclusive_ok=inclusive_ok, kind=kind)
+         for row in r:
+             row["Kind"] = label
+         for row in h:
+diff --git a/src/writes.py b/src/writes.py
+index 442361e..e4927ad 100644
+--- a/src/writes.py
++++ b/src/writes.py
+@@ -568,14 +568,24 @@ def plan_number_change(docs: list[dict], numbers: dict[str, str]) -> list[dict]:
+                 continue
+             hit = [(d.get("Contact") or {}).get("Name", "").strip()]
+             want = str(lower[contact]).strip()
++            by_contact = True
+         else:
+             want = str(numbers[hit[0]]).strip()
++            by_contact = False
+         have = str(d.get("InvoiceNumber") or "").strip()
+         if have == want:
+             continue
+         out.append({"InvoiceID": d.get("InvoiceID"), "Item": hit[0],
+                     "Contact": (d.get("Contact") or {}).get("Name", "?"),
+-                    "Was": have or "(none)", "Now": want})
++                    "Was": have or "(none)", "Now": want,
++                    # Matched by supplier name, so there is no inventory item
++                    # and no timesheet behind it - a cleaning or subscription
++                    # bill. These suppliers reconcile on THEIR OWN reference,
++                    # so the number goes in the Reference field as well as the
++                    # number field. Andrew, 4 September 2026, on That's
++                    # Sparkling Clean: "that's how that company works out who's
++                    # paid and who hasn't."
++                    "ByContact": by_contact})
+     return out
+ 
+ 
+@@ -758,18 +768,100 @@ def set_invoice_status(client, invoice_id: str, status: str) -> dict:
+ # reported rather than held.
+ TAX_BASIS_EXPECTED = "Exclusive"
+ 
++# Tax types that carry no GST. On a line with one of these, Inclusive and
++# Exclusive are arithmetically identical - there is no tax to compute either
++# out of the rate or onto it - so the basis cannot do any harm and must not be
++# reported or held. This is most of TCG's supplier base: the offshore monthly
++# bills post BASEXCLUDED, and Karen Crabb's NZ bill carries no Australian GST.
++_NO_GST_TAX_TYPES = frozenset({
++    "BASEXCLUDED", "NONE", "ZERORATED", "EXEMPTOUTPUT", "EXEMPTINPUT",
++    "EXEMPTEXPENSES", "EXEMPTREVENUE", "GSTONIMPORTS",
++})
++
++
++def carries_gst(doc: dict) -> bool | None:
++    """Does this document actually carry GST?
++
++    True, False, or None when the document does not say enough to tell.
++
++    NONE IS NOT FALSE, and the difference matters: a repeating template read
++    back without tax fields would otherwise be silently treated as GST-free and
++    waved through. Where it cannot be determined the caller keeps its old,
++    stricter behaviour.
++    """
++    lines = doc.get("LineItems") or []
++    if not lines:
++        return None
++
++    amounts = [li.get("TaxAmount") for li in lines]
++    if all(a is not None for a in amounts):
++        try:
++            return any(float(a or 0) != 0.0 for a in amounts)
++        except (TypeError, ValueError):
++            pass
++
++    types = [str(li.get("TaxType") or "").strip().upper() for li in lines]
++    if not all(types):
++        return None                      # at least one line does not say
++    return any(t not in _NO_GST_TAX_TYPES for t in types)
++
++
++def _is_bill(doc: dict, label: str = "") -> bool:
++    """Is this a BILL from a supplier, rather than a sales invoice of TCG's?
++
++    The tax-basis carve-outs below apply to BILLS ONLY. Andrew, 4 September
++    2026. A bill is somebody else's document - they choose the basis and TCG
++    lives with it. A TCG SALES INVOICE is ours, it is contracted ex GST, and
++    Inclusive on one of those is always a fault however the tax happens to
++    fall. There is no carve-out on the sales side and there should never be.
++
++    Xero's Type leads. Where it is absent - a fixture, a trimmed payload - the
++    caller's own label decides, and anything unrecognised is NOT a bill, so the
++    strict rule stands.
++    """
++    typ = str(doc.get("Type") or "").strip().upper()
++    if typ:
++        return typ == "ACCPAY"
++    return str(label or "").strip().lower() in {"bill", "bills", "accpay"}
++
++
++def _inclusive_is_deliberate(doc: dict, inclusive_ok) -> bool:
++    """Is this supplier one whose Inclusive basis is correct and intended?
++
++    That's Sparkling Clean invoices a GST-inclusive total - the $132 IS the
++    number on their invoice, tax and all. Andrew, 4 September 2026: "Sparkling
++    Clean should be tax inclusive. It's one of those rare ones it is." A rule
++    cannot infer that from the document, so it is named in config.
++    """
++    name = str((doc.get("Contact") or {}).get("Name") or "").strip().lower()
++    return bool(name) and name in {
++        str(n).strip().lower() for n in (inclusive_ok or ())}
++
+ 
+ def tax_basis(doc: dict) -> str:
+     """Xero's LineAmountTypes on one document. '' when Xero did not send it."""
+     return str(doc.get("LineAmountTypes") or "").strip()
+ 
+ 
+-def tax_basis_problems(docs: list[dict], label: str = "invoice") -> list[dict]:
++def tax_basis_problems(docs: list[dict], label: str = "invoice",
++                       inclusive_ok=frozenset()) -> list[dict]:
+     """Documents whose tax basis is not Exclusive. Pure; no network.
+ 
+     INCLUSIVE is the dangerous one and is called out as such. NoTax is listed
+     to be looked at, because it is right for the offshore bills and wrong for
+     anything carrying GST.
++
++    TWO THINGS ARE NOT REPORTED ON A BILL, both added 4 September 2026 after
++    this fired six times in one run and every one of the six was correct as it
++    stood. Neither carve-out applies to a TCG sales invoice.
++
++    A DOCUMENT CARRYING NO GST. Inclusive and Exclusive are the same number on
++    a zero-rated line, so there is nothing to warn about. A report where nine
++    flags in ten are noise catches nothing.
++
++    A SUPPLIER WHOSE INCLUSIVE BASIS IS DELIBERATE, named in
++    config/tax_inclusive_ok.json. That's Sparkling Clean bills a GST-inclusive
++    total and is right to.
+     """
+     out: list[dict] = []
+     for d in docs:
+@@ -778,6 +870,11 @@ def tax_basis_problems(docs: list[dict], label: str = "invoice") -> list[dict]:
+             continue
+         if not basis:
+             continue                      # Xero did not send it; not evidence
++        if _is_bill(d, label):            # BILLS ONLY - see _is_bill
++            if carries_gst(d) is False:
++                continue                  # no tax to put on the wrong side
++            if _inclusive_is_deliberate(d, inclusive_ok):
++                continue                  # named as correct
+         out.append({
+             "Kind": label,
+             "Doc": d.get("InvoiceNumber") or str(d.get("InvoiceID", ""))[:8],
+@@ -859,7 +956,9 @@ def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
+                     require_attachment: bool = False,
+                     stock: dict[str, dict] | None = None,
+                     require_stock: bool = True,
+-                    reserved: list[dict] | None = None
++                    reserved: list[dict] | None = None,
++                    inclusive_ok=frozenset(),
++                    kind: str = ""
+                     ) -> tuple[list[dict], list[dict]]:
+     """Which invoices are finished enough to submit, and why the rest are not.
+ 
+@@ -930,7 +1029,18 @@ def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
+             continue
+         # An Inclusive document must not go to Awaiting Approval. It bills the
+         # wrong number and it takes a credit note to unwind once approved.
+-        if tax_basis(d).lower() == "inclusive":
++        #
++        # UNLESS IT IS A BILL with no GST on it, or a bill from a supplier
++        # named in config/tax_inclusive_ok.json. Without those two carve-outs
++        # this holds every offshore bill and the cleaning bill for ever, and the
++        # only way through is to set them Exclusive - wrong for all of them. A
++        # guard that blocks correct work is not a guard, it is a bug.
++        #
++        # BILLS ONLY. A TCG sales invoice set Inclusive is always held: that one
++        # short-invoices the client and takes a credit note to unwind.
++        carved = _is_bill(d, kind) and (
++            carries_gst(d) is False or _inclusive_is_deliberate(d, inclusive_ok))
++        if tax_basis(d).lower() == "inclusive" and not carved:
+             held.append({**row, "Why": "TAX INCLUSIVE - must be Exclusive"})
+             continue
+         has_doc = bool(attachments_by_id.get(d.get("InvoiceID")))
+diff --git a/tests/test_tax_basis.py b/tests/test_tax_basis.py
+index 3045394..43a588a 100644
+--- a/tests/test_tax_basis.py
++++ b/tests/test_tax_basis.py
+@@ -74,3 +74,180 @@ def test_a_zero_line_still_holds_it_first():
+     an invoice, whatever its tax basis."""
+     ready, held = w.plan_submission([_doc("TCG-7", "Inclusive", qty=0)], {}, False)
+     assert ready == [] and "still at zero" in held[0]["Why"]
++
++
++# ---------------------------------------------------------------------------
++# 4 September 2026. The guard above fired six times in one run and every one of
++# the six was correct as it stood: That's Sparkling Clean, DITYA, Logic Lanes,
++# PRAVID, VVR and Karen Crabb. Five carry no GST at all, so the basis cannot do
++# anything; the sixth bills a GST-inclusive total on purpose.
++#
++# Left alone it does not merely nag - plan_submission HOLDS every one of those
++# bills out of Awaiting Approval, for ever, and the only way through is to set
++# them Exclusive, which is wrong for all six. A guard that blocks correct work
++# is a bug.
++# ---------------------------------------------------------------------------
++
++def _offshore(num, basis="Inclusive", tax_type="BASEXCLUDED", tax_amount=0.0,
++              contact="PRAVID TECHNOLOGIES PVT LTD"):
++    """A bill with no GST on it - the offshore monthlies and Karen Crabb's NZ one."""
++    return {"InvoiceID": f"id-{num}", "InvoiceNumber": num, "Type": "ACCPAY",
++            "Contact": {"Name": contact},
++            "LineAmountTypes": basis,
++            "LineItems": [{"LineItemID": "l1", "ItemCode": "Linfox - PD",
++                           "Quantity": 21, "UnitAmount": 295.0,
++                           "TaxType": tax_type, "TaxAmount": tax_amount}]}
++
++
++def _cleaner(num, basis="Inclusive"):
++    """That's Sparkling Clean: $132 IS the GST-inclusive total, no item code."""
++    return {"InvoiceID": f"id-{num}", "InvoiceNumber": num, "Type": "ACCPAY",
++            "Contact": {"Name": "That's Sparkling Clean"},
++            "LineAmountTypes": basis,
++            "LineItems": [{"LineItemID": "l1", "Description": "Office cleaning",
++                           "Quantity": 1, "UnitAmount": 132.0,
++                           "TaxType": "INPUT", "TaxAmount": 12.0}]}
++
++
++OK = frozenset({"That's Sparkling Clean"})
++
++
++def test_carries_gst_reads_the_tax_amount_first():
++    assert w.carries_gst(_offshore("B1")) is False
++    assert w.carries_gst(_cleaner("B2")) is True
++
++
++def test_carries_gst_falls_back_to_the_tax_type():
++    d = _offshore("B3")
++    for li in d["LineItems"]:
++        li.pop("TaxAmount")
++    assert w.carries_gst(d) is False
++    d["LineItems"][0]["TaxType"] = "INPUT"
++    assert w.carries_gst(d) is True
++
++
++def test_carries_gst_says_it_cannot_tell_rather_than_guessing():
++    """None is not False. A template read back with no tax fields must keep the
++    old, stricter behaviour rather than being waved through as GST-free."""
++    d = _offshore("B4")
++    for li in d["LineItems"]:
++        li.pop("TaxAmount"); li.pop("TaxType")
++    assert w.carries_gst(d) is None
++    assert w.carries_gst({"LineItems": []}) is None
++
++
++def test_a_gst_free_bill_is_not_reported():
++    """Inclusive and Exclusive are the same number on a zero-rated line."""
++    assert w.tax_basis_problems([_offshore("B5")]) == []
++
++
++def test_a_gst_free_bill_is_not_held_back():
++    """The one that was actually costing work."""
++    ready, held = w.plan_submission([_offshore("B6")], {}, False)
++    assert held == [] and ready[0]["Doc"] == "B6"
++
++
++def test_the_cleaner_is_still_flagged_when_not_named():
++    """It really does carry 10% GST, so nothing about it is automatic - it is
++    exempt only because Andrew says so, in config."""
++    out = w.tax_basis_problems([_cleaner("B7")])
++    assert len(out) == 1 and out[0]["Tax basis"] == "Inclusive"
++    ready, held = w.plan_submission([_cleaner("B8")], {}, False)
++    assert ready == [] and held[0]["Why"] == "TAX INCLUSIVE - must be Exclusive"
++
++
++def test_the_cleaner_is_exempt_once_named_in_config():
++    assert w.tax_basis_problems([_cleaner("B9")], inclusive_ok=OK) == []
++    ready, held = w.plan_submission([_cleaner("B10")], {}, False,
++                                    inclusive_ok=OK)
++    assert held == [] and ready[0]["Doc"] == "B10"
++
++
++def test_the_name_match_ignores_case_and_padding():
++    ok = frozenset({"  thats sparkling clean  ".replace("thats", "that's")})
++    assert w.tax_basis_problems([_cleaner("B11")], inclusive_ok=ok) == []
++
++
++def test_a_real_inclusive_fault_still_bites():
++    """The whole point of the guard. A Linfox day-rate line at 10% GST set
++    Inclusive short-invoices the client and must still be held."""
++    d = _doc("TCG-99", "Inclusive")
++    d["LineItems"][0].update(TaxType="OUTPUT", TaxAmount=909.09)
++    assert len(w.tax_basis_problems([d], inclusive_ok=OK)) == 1
++    ready, held = w.plan_submission([d], {}, False, inclusive_ok=OK)
++    assert ready == [] and held[0]["Why"] == "TAX INCLUSIVE - must be Exclusive"
++
++
++def test_an_undeterminable_document_keeps_the_strict_behaviour():
++    """carries_gst returning None must not open the gate."""
++    d = _doc("TCG-98", "Inclusive")          # no TaxType, no TaxAmount
++    assert w.carries_gst(d) is None
++    assert len(w.tax_basis_problems([d])) == 1
++    ready, held = w.plan_submission([d], {}, False)
++    assert ready == [] and held[0]["Why"] == "TAX INCLUSIVE - must be Exclusive"
++
++
++def test_a_zero_line_still_holds_a_gst_free_bill():
++    """The quantity rule is not displaced by any of this."""
++    d = _offshore("B12")
++    d["LineItems"][0]["Quantity"] = 0
++    ready, held = w.plan_submission([d], {}, False)
++    assert ready == [] and "still at zero" in held[0]["Why"]
++
++
++# ---------------------------------------------------------------------------
++# BILLS ONLY. Andrew, 4 September 2026. A bill is the supplier's document and
++# they choose the basis; a TCG sales invoice is ours and is contracted ex GST,
++# so Inclusive on one of those is always a fault and always held.
++# ---------------------------------------------------------------------------
++
++def _gst_free_sale(num):
++    """A TCG SALES invoice, Inclusive, with no GST on the line. Still wrong."""
++    d = _offshore(num, contact="Linfox ADIT - Project Management")
++    d["Type"] = "ACCREC"
++    return d
++
++
++def test_no_carve_out_on_a_sales_invoice_even_with_no_gst():
++    out = w.tax_basis_problems([_gst_free_sale("S1")], "sales")
++    assert len(out) == 1 and out[0]["Tax basis"] == "Inclusive"
++    ready, held = w.plan_submission([_gst_free_sale("S2")], {}, False,
++                                    kind="ACCREC")
++    assert ready == [] and held[0]["Why"] == "TAX INCLUSIVE - must be Exclusive"
++
++
++def test_no_carve_out_on_a_sales_invoice_even_for_a_named_supplier():
++    """The allow-list is a supplier list. It cannot excuse a sales invoice."""
++    d = _cleaner("S3")
++    d["Type"] = "ACCREC"
++    assert len(w.tax_basis_problems([d], "sales", inclusive_ok=OK)) == 1
++
++
++def test_the_label_decides_when_xero_did_not_send_a_type():
++    """A trimmed payload must not silently become a bill."""
++    d = _offshore("S4")
++    d.pop("Type")
++    assert w.tax_basis_problems([d], "bill") == []
++    assert len(w.tax_basis_problems([d], "sales")) == 1
++    assert len(w.tax_basis_problems([d], "invoice")) == 1
++
++
++def test_a_contact_matched_bill_number_is_marked_for_the_reference():
++    """That's Sparkling Clean reconciles on their own reference, so the number
++    has to reach the Reference field too - not just the number field."""
++    docs = [{"InvoiceID": "sc1", "InvoiceNumber": "SC", "Type": "ACCPAY",
++             "Contact": {"Name": "That's Sparkling Clean"},
++             "LineItems": [{"Description": "Office cleaning", "Quantity": 1}]}]
++    got = w.plan_number_change(docs, {"That's Sparkling Clean": "SC-4471"})
++    assert len(got) == 1
++    assert got[0]["Now"] == "SC-4471" and got[0]["ByContact"] is True
++
++
++def test_an_item_matched_bill_number_is_not():
++    """A contractor bill carries TCG's own period reference logic; their
++    invoice number must not overwrite it."""
++    docs = [{"InvoiceID": "b1", "InvoiceNumber": "Inv", "Type": "ACCPAY",
++             "Contact": {"Name": "Techne IT Consulting Pty Ltd"},
++             "LineItems": [{"ItemCode": "Linfox - BVIRK", "Quantity": 10}]}]
++    got = w.plan_number_change(docs, {"Linfox - BVIRK": "INV-0017"})
++    assert len(got) == 1 and got[0]["ByContact"] is False

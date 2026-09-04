@@ -255,6 +255,34 @@ def _customer_lookup() -> dict[str, str]:
     return json.load(open(path)) if os.path.exists(path) else {}
 
 
+def _tax_inclusive_ok() -> set[str]:
+    """Suppliers whose Inclusive tax basis is deliberate and correct.
+
+    The house rule is TAX EXCLUSIVE, so Inclusive is normally reported and held
+    back from Awaiting Approval. A handful of suppliers genuinely bill a
+    GST-inclusive total - That's Sparkling Clean is one - and a rule cannot tell
+    those from a mistake, so they are named.
+
+    A missing or unreadable file returns nothing, which restores the stricter
+    behaviour rather than silently waiving the check.
+    """
+    path = os.environ.get("TCG_TAX_INCLUSIVE_OK", "config/tax_inclusive_ok.json")
+    if not os.path.exists(path):
+        return set()
+    try:
+        raw = json.load(open(path))
+    except Exception as e:                                        # noqa: BLE001
+        log.warning("Could not read %s (%s). Every Inclusive document will be "
+                    "reported and held, including the ones that are correct.",
+                    path, e)
+        return set()
+    if isinstance(raw, list):
+        return set(raw)
+    if isinstance(raw, dict):
+        return set(raw.get("names") or [])
+    return set()
+
+
 def _payroll_tax_config() -> tuple[set[str], set[str]]:
     """(exempt names, explicitly exempt item codes) from no_payroll_tax.json.
 
@@ -677,6 +705,7 @@ def list_repeating_templates(kinds: str = "both", contains: str = "",
     needle = str(contains or "").strip().lower()
 
     templates = c.repeating_invoices()
+    inclusive_ok = _tax_inclusive_ok()
 
     # An item code is "day rate" when a LIVE template somewhere carries it at
     # zero - something is filling that line from a timesheet. Built across
@@ -705,7 +734,8 @@ def list_repeating_templates(kinds: str = "both", contains: str = "",
         # is where it starts - fix the invoice only and next period repeats it.
         if status != "DELETED":
             for row_ in writes.tax_basis_problems(
-                    [r], "sales" if typ == "ACCREC" else "bill"):
+                    [r], "sales" if typ == "ACCREC" else "bill",
+                    inclusive_ok=inclusive_ok):
                 row_["Repeats"] = "template"
                 tax_bad.append({k: v for k, v in row_.items()
                                 if k not in ("InvoiceID", "Repeats")})
@@ -1724,7 +1754,7 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
     wanted, bad = writes.parse_quantities(quantities)
     if bad:
         return "Could not read these lines - expected 'item code: days':\n  " + "\n  ".join(bad)
-    if not wanted:
+    if not wanted and not str(bill_numbers or "").strip():
         return "No quantities given. Nothing to do."
 
     ref = (writes.period_reference(end - timedelta(days=13), end)
@@ -1765,7 +1795,8 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
         tax_rows += writes.tax_basis_problems(
             [d for d in docs
              if any((li.get("ItemCode") or "").strip() in wanted
-                    for li in (d.get("LineItems") or []))], label)
+                    for li in (d.get("LineItems") or []))], label,
+            inclusive_ok=_tax_inclusive_ok())
         p_, s_, to_write = writes.plan_line_fill(docs, wanted, stamp, label)
         planned += p_
         skipped += s_
@@ -1776,6 +1807,18 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
             kind == "ACCPAY" and numbers) else []
         renumbered += num_changes
         new_num = {n["InvoiceID"]: n["Now"] for n in num_changes}
+
+        # A bill matched by SUPPLIER NAME rather than item code is a cleaning or
+        # subscription bill - no inventory item, no timesheet. Those suppliers
+        # reconcile on their own reference, not on TCG's, so their invoice
+        # number goes in the Reference field as well as the number field.
+        # Andrew, 4 September 2026, on That's Sparkling Clean: "that's how that
+        # company works out who's paid and who hasn't."
+        bill_refs = [
+            {"InvoiceID": n["InvoiceID"], "Contact": n["Contact"],
+             "Was": "(none)", "Now": n["Now"]}
+            for n in num_changes if n.get("ByContact")
+        ] if kind == "ACCPAY" else []
 
         # The period reference is TCG's, so it goes on sales invoices only, and
         # on every draft for somebody in THIS period's list - not only the ones
@@ -1826,8 +1869,8 @@ def fill_period_drafts(period_end: str, quantities: str, dry_run: bool = True,
                     ref_changes += writes.plan_reference_change([d], own)
         if kind == "ACCREC":
             monthly_left += monthly_refs
-        rereferenced += ref_changes
-        new_ref = {r["InvoiceID"]: r["Now"] for r in ref_changes}
+        rereferenced += ref_changes + bill_refs
+        new_ref = {r["InvoiceID"]: r["Now"] for r in ref_changes + bill_refs}
 
         by_id = {d["InvoiceID"]: d for d in to_write}
         for inv_id in list(new_num) + list(new_ref):
@@ -2113,6 +2156,7 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
     if (cadence or "").strip().lower() not in ("all", "fortnightly", "monthly"):
         return "cadence must be 'fortnightly', 'monthly' or 'all'."
 
+    inclusive_ok = _tax_inclusive_ok()
     # Live items, for the same reason inventory_coverage does not use the cache.
     stock = coverage.stock_index(c.items()) if require_stock else {}
     # Everything already in Awaiting Approval is going to eat this stock the
@@ -2141,7 +2185,8 @@ def submit_period_invoices(period_end: str, dry_run: bool = True,
             docs, att, require_attachment,
             stock=stock if kind == "ACCREC" else None,
             require_stock=require_stock,
-            reserved=reserved if kind == "ACCREC" else None)
+            reserved=reserved if kind == "ACCREC" else None,
+            inclusive_ok=inclusive_ok, kind=kind)
         for row in r:
             row["Kind"] = label
         for row in h:

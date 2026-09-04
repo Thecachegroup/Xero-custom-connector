@@ -568,14 +568,24 @@ def plan_number_change(docs: list[dict], numbers: dict[str, str]) -> list[dict]:
                 continue
             hit = [(d.get("Contact") or {}).get("Name", "").strip()]
             want = str(lower[contact]).strip()
+            by_contact = True
         else:
             want = str(numbers[hit[0]]).strip()
+            by_contact = False
         have = str(d.get("InvoiceNumber") or "").strip()
         if have == want:
             continue
         out.append({"InvoiceID": d.get("InvoiceID"), "Item": hit[0],
                     "Contact": (d.get("Contact") or {}).get("Name", "?"),
-                    "Was": have or "(none)", "Now": want})
+                    "Was": have or "(none)", "Now": want,
+                    # Matched by supplier name, so there is no inventory item
+                    # and no timesheet behind it - a cleaning or subscription
+                    # bill. These suppliers reconcile on THEIR OWN reference,
+                    # so the number goes in the Reference field as well as the
+                    # number field. Andrew, 4 September 2026, on That's
+                    # Sparkling Clean: "that's how that company works out who's
+                    # paid and who hasn't."
+                    "ByContact": by_contact})
     return out
 
 
@@ -758,18 +768,100 @@ def set_invoice_status(client, invoice_id: str, status: str) -> dict:
 # reported rather than held.
 TAX_BASIS_EXPECTED = "Exclusive"
 
+# Tax types that carry no GST. On a line with one of these, Inclusive and
+# Exclusive are arithmetically identical - there is no tax to compute either
+# out of the rate or onto it - so the basis cannot do any harm and must not be
+# reported or held. This is most of TCG's supplier base: the offshore monthly
+# bills post BASEXCLUDED, and Karen Crabb's NZ bill carries no Australian GST.
+_NO_GST_TAX_TYPES = frozenset({
+    "BASEXCLUDED", "NONE", "ZERORATED", "EXEMPTOUTPUT", "EXEMPTINPUT",
+    "EXEMPTEXPENSES", "EXEMPTREVENUE", "GSTONIMPORTS",
+})
+
+
+def carries_gst(doc: dict) -> bool | None:
+    """Does this document actually carry GST?
+
+    True, False, or None when the document does not say enough to tell.
+
+    NONE IS NOT FALSE, and the difference matters: a repeating template read
+    back without tax fields would otherwise be silently treated as GST-free and
+    waved through. Where it cannot be determined the caller keeps its old,
+    stricter behaviour.
+    """
+    lines = doc.get("LineItems") or []
+    if not lines:
+        return None
+
+    amounts = [li.get("TaxAmount") for li in lines]
+    if all(a is not None for a in amounts):
+        try:
+            return any(float(a or 0) != 0.0 for a in amounts)
+        except (TypeError, ValueError):
+            pass
+
+    types = [str(li.get("TaxType") or "").strip().upper() for li in lines]
+    if not all(types):
+        return None                      # at least one line does not say
+    return any(t not in _NO_GST_TAX_TYPES for t in types)
+
+
+def _is_bill(doc: dict, label: str = "") -> bool:
+    """Is this a BILL from a supplier, rather than a sales invoice of TCG's?
+
+    The tax-basis carve-outs below apply to BILLS ONLY. Andrew, 4 September
+    2026. A bill is somebody else's document - they choose the basis and TCG
+    lives with it. A TCG SALES INVOICE is ours, it is contracted ex GST, and
+    Inclusive on one of those is always a fault however the tax happens to
+    fall. There is no carve-out on the sales side and there should never be.
+
+    Xero's Type leads. Where it is absent - a fixture, a trimmed payload - the
+    caller's own label decides, and anything unrecognised is NOT a bill, so the
+    strict rule stands.
+    """
+    typ = str(doc.get("Type") or "").strip().upper()
+    if typ:
+        return typ == "ACCPAY"
+    return str(label or "").strip().lower() in {"bill", "bills", "accpay"}
+
+
+def _inclusive_is_deliberate(doc: dict, inclusive_ok) -> bool:
+    """Is this supplier one whose Inclusive basis is correct and intended?
+
+    That's Sparkling Clean invoices a GST-inclusive total - the $132 IS the
+    number on their invoice, tax and all. Andrew, 4 September 2026: "Sparkling
+    Clean should be tax inclusive. It's one of those rare ones it is." A rule
+    cannot infer that from the document, so it is named in config.
+    """
+    name = str((doc.get("Contact") or {}).get("Name") or "").strip().lower()
+    return bool(name) and name in {
+        str(n).strip().lower() for n in (inclusive_ok or ())}
+
 
 def tax_basis(doc: dict) -> str:
     """Xero's LineAmountTypes on one document. '' when Xero did not send it."""
     return str(doc.get("LineAmountTypes") or "").strip()
 
 
-def tax_basis_problems(docs: list[dict], label: str = "invoice") -> list[dict]:
+def tax_basis_problems(docs: list[dict], label: str = "invoice",
+                       inclusive_ok=frozenset()) -> list[dict]:
     """Documents whose tax basis is not Exclusive. Pure; no network.
 
     INCLUSIVE is the dangerous one and is called out as such. NoTax is listed
     to be looked at, because it is right for the offshore bills and wrong for
     anything carrying GST.
+
+    TWO THINGS ARE NOT REPORTED ON A BILL, both added 4 September 2026 after
+    this fired six times in one run and every one of the six was correct as it
+    stood. Neither carve-out applies to a TCG sales invoice.
+
+    A DOCUMENT CARRYING NO GST. Inclusive and Exclusive are the same number on
+    a zero-rated line, so there is nothing to warn about. A report where nine
+    flags in ten are noise catches nothing.
+
+    A SUPPLIER WHOSE INCLUSIVE BASIS IS DELIBERATE, named in
+    config/tax_inclusive_ok.json. That's Sparkling Clean bills a GST-inclusive
+    total and is right to.
     """
     out: list[dict] = []
     for d in docs:
@@ -778,6 +870,11 @@ def tax_basis_problems(docs: list[dict], label: str = "invoice") -> list[dict]:
             continue
         if not basis:
             continue                      # Xero did not send it; not evidence
+        if _is_bill(d, label):            # BILLS ONLY - see _is_bill
+            if carries_gst(d) is False:
+                continue                  # no tax to put on the wrong side
+            if _inclusive_is_deliberate(d, inclusive_ok):
+                continue                  # named as correct
         out.append({
             "Kind": label,
             "Doc": d.get("InvoiceNumber") or str(d.get("InvoiceID", ""))[:8],
@@ -859,7 +956,9 @@ def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
                     require_attachment: bool = False,
                     stock: dict[str, dict] | None = None,
                     require_stock: bool = True,
-                    reserved: list[dict] | None = None
+                    reserved: list[dict] | None = None,
+                    inclusive_ok=frozenset(),
+                    kind: str = ""
                     ) -> tuple[list[dict], list[dict]]:
     """Which invoices are finished enough to submit, and why the rest are not.
 
@@ -930,7 +1029,18 @@ def plan_submission(docs: list[dict], attachments_by_id: dict[str, set],
             continue
         # An Inclusive document must not go to Awaiting Approval. It bills the
         # wrong number and it takes a credit note to unwind once approved.
-        if tax_basis(d).lower() == "inclusive":
+        #
+        # UNLESS IT IS A BILL with no GST on it, or a bill from a supplier
+        # named in config/tax_inclusive_ok.json. Without those two carve-outs
+        # this holds every offshore bill and the cleaning bill for ever, and the
+        # only way through is to set them Exclusive - wrong for all of them. A
+        # guard that blocks correct work is not a guard, it is a bug.
+        #
+        # BILLS ONLY. A TCG sales invoice set Inclusive is always held: that one
+        # short-invoices the client and takes a credit note to unwind.
+        carved = _is_bill(d, kind) and (
+            carries_gst(d) is False or _inclusive_is_deliberate(d, inclusive_ok))
+        if tax_basis(d).lower() == "inclusive" and not carved:
             held.append({**row, "Why": "TAX INCLUSIVE - must be Exclusive"})
             continue
         has_doc = bool(attachments_by_id.get(d.get("InvoiceID")))

@@ -1,0 +1,6 @@
+{
+  "_why": "Suppliers whose repeating documents are TAX INCLUSIVE on purpose. The house rule is Exclusive - rates are contracted ex GST and the tax goes on top - so anything Inclusive is normally reported and held out of Awaiting Approval. A supplier named here is exempt from both. Andrew, 4 September 2026: 'Sparkling Clean should be tax inclusive. It's one of those rare ones it is.' Their invoice total IS the GST-inclusive figure. Match is on the Xero contact name, case-insensitive. Documents carrying no GST at all (the offshore bills, BASEXCLUDED) need no entry here - they are exempt automatically, because Inclusive and Exclusive are the same number on a zero-rated line.",
+  "names": [
+    "That's Sparkling Clean"
+  ]
+}

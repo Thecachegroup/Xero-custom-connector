@@ -1,67 +1,98 @@
-TCG Xero connector - duplicate invoice number guard
-Built for Andrew Hurnard, 3 September 2026, 16:14 Melbourne.
-Off the deployed package Xero-custom-connector_FULL_templates-and-monthly_2026-09-02_1759.
+XERO CONNECTOR — TAX BASIS ON BILLS, AND BILL NUMBERS ON THEIR OWN
+Built 4 September 2026 Melbourne, off github.com/Thecachegroup/Xero-custom-connector main (17ab1bd).
 
-DO NOT UPLOAD _WHAT-CHANGED.txt. Everything else is the repo.
+214 tests before, 230 after. All pass. The 16 new ones were run against the
+UNFIXED code first and 14 failed. The 2 that passed assert behaviour that
+already existed and must not change.
 
-THREE FILES CHANGED. Nothing else in the repo is touched.
-
-  src/mail_mappers.py   + duplicate helpers, + plan_filing gains
-                          prior_invoice_numbers and returns "duplicates"
-  src/server.py         + _prior_invoice_numbers(), wired into
-                          sweep_timesheets, new DUPLICATE - NOT FILED section
-  tests/test_mail.py    + 10 tests
-
-TESTS: 133 passed (was 123). Run: python -m pytest -q
-
+--------------------------------------------------------------------------
 WHY
-An invoice number already billed in an earlier period is not evidence for this
-one. For the fortnight ending 30 August 2026 Bilal Virk re-sent INV-0016 and
-Jay Jhala re-sent 20260802 - both already billed on the 16 August run. The
-sweep filed both without complaint. Their documents were moved to _QUERY by
-hand, and then a RE-SWEEP on 3 September wrote fresh copies straight back into
-the live folders, because the sweep holds no memory of that move.
-attach_period_files then planned to put the wrong fortnight's timesheets onto
-TCG-21200 and TCG-21195. Caught in the dry run, one step before the client
-would have been sent them.
+--------------------------------------------------------------------------
+list_repeating_templates flagged six BILL templates as TAX INCLUSIVE against
+the house rule: That's Sparkling Clean, DITYA, Logic Lanes, PRAVID, VVR and
+Karen Crabb. Every one of the six is correct as it stands.
 
-This fixes it at the point the decision is made: the file never lands in the
-live folder, so there is nothing to quarantine and nothing to un-quarantine.
+Five carry no GST at all — the offshore monthlies post BASEXCLUDED and Karen
+Crabb's NZ bill has no Australian GST. On a zero-rated line Inclusive and
+Exclusive are the same number, so the basis cannot do any harm.
 
-HOW IT WORKS
-_prior_invoice_numbers() reads every ACCPAY bill dated before this fortnight's
-Monday and builds {item code: {invoice number: period it was billed for}}.
-Keyed on ITEM CODE, never a contact name - Mudassir Ali's bills sit under
-Datacraft Consulting Services Pty Ltd. VOIDED bills excluded: a voided number
-is free to reuse.
+The sixth, That's Sparkling Clean, does carry 10% GST and is Inclusive on
+purpose: the $132 IS the GST-inclusive total on their invoice.
 
-plan_filing() checks each attachment that classifies as an invoice. On a hit
-the WHOLE MESSAGE is refused, timesheets included - they cover the period that
-invoice covers. The person still counts as having sent, so they are not also
-listed under NOT SENT ANYTHING.
+And it was not just noise. plan_submission HELD every Inclusive document out
+of Awaiting Approval, so all six bills would be refused every run and the only
+way through was to set them Exclusive — wrong for all six. A guard that blocks
+correct work is a bug.
 
-THE TWO RULES THAT STOP FALSE POSITIVES
-1. A number of 5+ characters matches anywhere in the filename. A shorter one
-   ("0013", "0025") matches only as a whole token, so it is not found inside a
-   date or a longer number.
-2. The subject line is consulted ONLY when the attachment filename carries no
-   digits at all. A reply on the old INV-0016 thread carrying INV-0017 is
-   judged on the attachment, not the subject.
+--------------------------------------------------------------------------
+BILLS ONLY — read this bit
+--------------------------------------------------------------------------
+Neither carve-out touches a TCG SALES INVOICE. A bill is the supplier's
+document and they choose the basis. A sales invoice is ours, contracted ex
+GST, and Inclusive on one of those short-invoices the client and takes a
+credit note to unwind — so it is still reported and still held, whatever the
+tax on it happens to be, and whoever the customer is. Four tests cover that.
 
-FAILS SOFT
-If the Xero lookup throws, the sweep still runs. It loses the guard and says
-so under "DUPLICATE CHECK DID NOT RUN", which is how it behaved before this
-existed. plan_filing without prior_invoice_numbers behaves exactly as before -
-there is a test for that.
+--------------------------------------------------------------------------
+FILES
+--------------------------------------------------------------------------
+src/writes.py
+  NEW  carries_gst(doc) -> True / False / None
+       TaxAmount across the lines first, then TaxType against a set of
+       zero-rated types. Returns None — NOT False — when the document does not
+       say enough to tell, so a trimmed payload keeps the strict behaviour
+       instead of being waved through as GST-free.
+  NEW  _is_bill(doc, label) — Xero's Type leads; where it is absent the
+       caller's label decides, and anything unrecognised is NOT a bill.
+  NEW  _inclusive_is_deliberate(doc, inclusive_ok) — contact-name match,
+       case and padding insensitive.
+  MOD  tax_basis_problems(docs, label, inclusive_ok=frozenset())
+       On a BILL, skips a document carrying no GST and one whose supplier is
+       named. On a sales invoice, nothing changes.
+  MOD  plan_submission(..., inclusive_ok=frozenset(), kind="")
+       Same two carve-outs, bills only. A real fault — a Linfox day-rate line
+       at 10% set Inclusive — is still held, and there is a test for it.
+  MOD  plan_number_change now marks a row "ByContact" when it matched on the
+       SUPPLIER NAME rather than an item code.
 
-TO DEPLOY
+src/server.py
+  NEW  _tax_inclusive_ok() — reads config/tax_inclusive_ok.json. A missing or
+       unreadable file returns nothing, which RESTORES the strict behaviour
+       rather than silently waiving the check.
+  MOD  wired into list_repeating_templates, fill_period_drafts and
+       submit_period_invoices.
+  MOD  fill_period_drafts no longer refuses a call that passes bill_numbers
+       with no quantities. That is the Sparkling Clean case: a fixed-fee line
+       correctly sitting at quantity 1, needing only their invoice number.
+  MOD  A bill matched by SUPPLIER NAME now gets that number in its REFERENCE
+       field as well as its number field. Andrew, 4 September 2026: "that's
+       how that company works out who's paid and who hasn't." Contractor bills
+       matched by item code are untouched.
+
+config/tax_inclusive_ok.json   NEW — That's Sparkling Clean.
+tests/test_tax_basis.py        16 new tests.
+
+--------------------------------------------------------------------------
+DEPLOY
+--------------------------------------------------------------------------
 GitHub web UI -> Thecachegroup/Xero-custom-connector -> Add file -> Upload
-files. Drag the src and tests FOLDERS from inside this package (not the
-package folder itself, or they land beside the real ones). Commit to main.
-Vercel redeploys.
+files. Drag the src, tests and config folders from INSIDE this package — not
+the package folder itself, or they land beside the real ones. Commit to main.
+Vercel redeploys, two to three minutes.
 
-TO VERIFY AFTER DEPLOY
-  sweep_timesheets(period_end="2026-08-30", dry_run=True)
-Expect Bilal Virk and Jay Jhala under DUPLICATE - NOT FILED, and neither of
-them in the FILING table. The _QUERY folder is then belt and braces, not the
-only thing standing between a duplicate and the client.
+Do not upload _WHAT-CHANGED.txt or _DIFF.txt.
+
+--------------------------------------------------------------------------
+VERIFY AFTER DEPLOY
+--------------------------------------------------------------------------
+1. list_repeating_templates(kinds="bills", include_fixed_fee=True)
+   The TEMPLATE TAX BASIS block should no longer list the six. If one still
+   shows, it is carrying GST and is worth a look.
+
+2. submit_period_invoices("2026-08-30", dry_run=True)
+   No document held for "TAX INCLUSIVE - must be Exclusive".
+
+3. fill_period_drafts("2026-08-30", quantities="", dry_run=True,
+                      bill_numbers="That's Sparkling Clean: <their number>")
+   Should plan the number change AND a REFERENCE set on the same bill,
+   instead of returning "No quantities given".
