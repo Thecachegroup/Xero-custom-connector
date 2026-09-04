@@ -1,0 +1,34 @@
+OneDrive file plumbing - install
+================================
+
+DRAG AND DROP
+  src\graph_files.py          ->  the repo's src\ folder, next to roster.py and writes.py
+  tests\test_graph_files.py   ->  the repo's tests\ folder (optional)
+
+DO NOT DRAG
+  PASTE_THIS_do_not_copy_into_repo.py
+
+  This one is paste-only. Open the repo file that already contains
+  graph_diagnostics and find_documents, then:
+
+    1. At the top, with the other imports, add:
+           from src import graph_files
+       (if the neighbouring imports are bare, e.g. "import roster",
+        then write "import graph_files" instead - match what is there)
+
+    2. Paste the ENTIRE contents of PASTE_THIS_do_not_copy_into_repo.py
+       at the bottom of that file, below the last @mcp.tool().
+
+  Dropping this file into the repo as-is does nothing - the tools have to
+  live in the file the MCP server already loads.
+
+THEN
+    git add .
+    git commit -m "Add OneDrive file plumbing"
+    git push
+
+  Wait for Vercel to go green, then say so in the chat. No new session
+  needed - the connector's tool list can be refreshed from there.
+
+FULL DETAIL
+  README_onedrive_tools.md
