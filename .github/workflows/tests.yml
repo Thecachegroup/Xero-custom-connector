@@ -1,0 +1,60 @@
+yaml
+name: tests
+
+# WHY THIS EXISTS
+#
+# On 3 September 2026 an old copy of src/server.py was uploaded over the live
+# one. It removed inventory_coverage, the stock guard, the cadence filter, the
+# payroll-tax item-code wiring, the dry-run defaults, the tax-basis checks and
+# the monthly reference handling - all of it silently. /healthz returned "ok"
+# throughout, because the app started perfectly well; it was just the wrong app.
+# The regression stood in production for over an hour.
+#
+# The test suite caught it in four seconds: 8 failures across test_coverage,
+# test_monthly and test_repeating. Nothing ran the test suite.
+#
+# This does. Every push to main, before anyone trusts the deployment.
+# A red cross on the commit is the signal /healthz can never give.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:        # lets you run it by hand from the Actions tab
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.12 to match the Vercel runtime. A test passing on a different
+      # version than production runs on is worth less than it looks.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+          # pytest is deliberately NOT in requirements.txt - that file is what
+          # Vercel installs, and the production bundle has no business
+          # carrying a test runner.
+
+      # Catches a truncated or mis-pasted file before pytest even starts, and
+      # gives a clearer error than an import failure halfway through collection.
+      - name: Compile everything
+        run: python -m compileall -q src tests
+
+      - name: Run the suite
+        run: python -m pytest tests/ -q
+        # No secrets, no environment, no network. Every Xero and Graph call in
+        # the tests is stubbed. Verified 4 September 2026: 214 passed with a
+        # completely empty environment. If this step ever starts needing a
+        # credential, something under test has begun reaching the real org and
+        # that is the bug, not the missing secret.
