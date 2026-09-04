@@ -374,3 +374,143 @@ class GraphClient:
                 "Nothing has been written."
             )
         return resp.content
+
+    # ---------- files: pre-authenticated URLs ----------
+
+    def download_url(self, relative_path: str, root: str = "") -> dict:
+        """A pre-authenticated URL for one OneDrive file. Valid about an hour.
+
+        Returns the URL, never the bytes. Graph's @microsoft.graph.downloadUrl
+        needs no Authorization header, so whoever holds it can fetch the file
+        directly - which is the point: bytes that never enter a conversation
+        cost nothing to move and cannot be truncated on the way.
+
+        ROOT defaults to "" - the drive root - not to Contractors/Timesheets.
+        A contract does not live in the timesheet tree, and defaulting to it
+        here would file signed agreements in the wrong place forever.
+        """
+        path = f"{root}/{relative_path}".strip("/") if root else relative_path.strip("/")
+        url = f"{GRAPH}/drives/{self._drive_id()}/root:/{quote(path)}"
+        item = self.get(url, {"$select": "id,name,size,lastModifiedDateTime,"
+                                         "@microsoft.graph.downloadUrl"})
+        link = item.get("@microsoft.graph.downloadUrl")
+        if not link:
+            raise RuntimeError(
+                f"No download URL for {path!r} - a folder rather than a file? "
+                "Nothing has been read."
+            )
+        return {
+            "path": path,
+            "name": item.get("name"),
+            "size": item.get("size"),
+            "last_modified": item.get("lastModifiedDateTime"),
+            "download_url": link,
+        }
+
+    def upload_url(self, relative_path: str, root: str = "",
+                   conflict: str = "replace") -> dict:
+        """A pre-authenticated upload URL. Valid about fifteen minutes.
+
+        upload() is a simple PUT and refuses anything over 4MB. This opens a
+        resumable session instead, so a scanned contract that runs to 12MB goes
+        through the same way a 200KB timesheet does.
+
+        CONFLICT: replace | rename | fail. Use 'fail' for anything signed -
+        quietly overwriting an executed document is not recoverable.
+        """
+        if conflict not in ("replace", "rename", "fail"):
+            raise ValueError(
+                f"conflict must be replace, rename or fail, not {conflict!r}. "
+                "Nothing has been written."
+            )
+        path = f"{root}/{relative_path}".strip("/") if root else relative_path.strip("/")
+        url = f"{GRAPH}/drives/{self._drive_id()}/root:/{quote(path)}:/createUploadSession"
+        resp = self._request(
+            "POST", url,
+            json={"item": {"@microsoft.graph.conflictBehavior": conflict}},
+        )
+        session = resp.json()
+        return {
+            "path": path,
+            "upload_url": session["uploadUrl"],
+            "expires": session.get("expirationDateTime"),
+        }
+
+    # ---------- mail -> files ----------
+
+    def save_mail_attachment(self, message_id: str, dest_path: str,
+                             attachment_id: str | None = None,
+                             mailbox: str | None = None,
+                             root: str = "") -> dict:
+        """Copy an Outlook attachment straight into OneDrive, server-side.
+
+        MAILBOX defaults to self.mailbox - the payroll mailbox - so every
+        existing caller behaves as it always has. Pass a different address to
+        read someone else's, which the Application Access Policy still has to
+        allow: a 403 here means that address is not in the policy's scope
+        group, not that the code is wrong.
+
+        ATTACHMENT_ID may be omitted when the message carries exactly one file
+        attachment. With more than one it raises and lists them rather than
+        picking, because guessing which document to countersign is not a
+        recoverable mistake.
+
+        Inline attachments are skipped. A pasted signature image in a reply is
+        not the contract.
+        """
+        box = mailbox or self.mailbox
+        base = f"{GRAPH}/users/{quote(box)}/messages/{message_id}/attachments"
+
+        if attachment_id is None:
+            items = self.get_all(base)
+            files = [a for a in items
+                     if a.get("@odata.type", "").endswith("fileAttachment")
+                     and not a.get("isInline")]
+            if not files:
+                raise RuntimeError(
+                    f"No file attachments on message {message_id} in {box}. "
+                    "Nothing has been written."
+                )
+            if len(files) > 1:
+                listing = "; ".join(
+                    f"{a.get('name')} ({a.get('size')}B) id={a.get('id')}"
+                    for a in files
+                )
+                raise RuntimeError(
+                    f"{len(files)} attachments - say which one. {listing}. "
+                    "Nothing has been written."
+                )
+            attachment_id = files[0]["id"]
+
+        att = self.get(f"{base}/{attachment_id}")
+        content = att.get("contentBytes")
+        if not content:
+            raise RuntimeError(
+                f"Attachment {att.get('name')!r} returned no contentBytes - an "
+                "item attachment (a forwarded email) rather than a file? "
+                "Nothing has been written."
+            )
+        blob = base64.b64decode(content)
+
+        session = self.upload_url(dest_path, root=root, conflict="replace")
+        put = self._session.put(
+            session["upload_url"], data=blob,
+            headers={
+                "Content-Length": str(len(blob)),
+                "Content-Range": f"bytes 0-{len(blob) - 1}/{len(blob)}",
+            },
+            timeout=300,
+        )
+        if put.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Upload of {att.get('name')!r} failed: {put.status_code} "
+                f"{put.text[:300]}. Nothing has been written."
+            )
+        written = put.json()
+        return {
+            "saved_to": session["path"],
+            "source_name": att.get("name"),
+            "source_mailbox": box,
+            "bytes": len(blob),
+            "web_url": written.get("webUrl"),
+        }
