@@ -2588,3 +2588,170 @@ def set_rate_card(item_code: str, cost_rate: float = None,
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http" if TRANSPORT == "http" else "stdio")
+
+
+@mcp.tool()
+def onedrive_selftest() -> str:
+    """Prove the file plumbing works before trusting anything built on it.
+
+    Run this FIRST after deploying. graph_diagnostics proves the connection can
+    READ; this proves it can WRITE and read back, which is the half that matters
+    for signing a document. Writes one probe file to AI Working Folder and
+    deletes it again.
+    """
+    lines = []
+    try:
+        g = _graph()
+    except RuntimeError as e:
+        return f"FAILED before connecting.\n{e}"
+
+    probe = "AI Working Folder/_onedrive_selftest.txt"
+    payload = b"onedrive selftest - safe to delete"
+
+    try:
+        drive = g._drive_id()
+        lines.append(f"drive           OK ({drive[:24]}...)")
+    except Exception as e:  # noqa: BLE001
+        return "\n".join(lines + [f"drive           FAILED: {e}"])
+
+    try:
+        g.upload(probe, payload, root="")
+        lines.append("write           OK")
+    except Exception as e:  # noqa: BLE001
+        return "\n".join(lines + [f"write           FAILED: {e}"])
+
+    try:
+        got = g.download(probe, root="")
+        lines.append("read back       OK" if got == payload
+                     else f"read back       FAILED: got {got[:40]!r}")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"read back       FAILED: {e}")
+
+    try:
+        d = g.download_url(probe)
+        lines.append(f"download url    OK ({d['size']} bytes)")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"download url    FAILED: {e}")
+
+    try:
+        g.upload_url("AI Working Folder/_onedrive_selftest_session.bin")
+        lines.append("upload session  OK")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"upload session  FAILED: {e}")
+
+    try:
+        from urllib.parse import quote as _q
+        g._request("DELETE", f"https://graph.microsoft.com/v1.0/drives/"
+                             f"{g._drive_id()}/root:/{_q(probe)}")
+        lines.append("cleanup         OK")
+    except Exception:  # noqa: BLE001
+        lines.append(f"cleanup         left {probe} behind - delete it by hand")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def onedrive_list(path: str = "", root: str = "", recursive: bool = False) -> str:
+    """List a OneDrive folder. Read-only.
+
+    PATH is relative to ROOT; ROOT defaults to the drive root, so
+    "CONTRACTOR AGREEMENTS/Devinia Liddelow" works as written - the same form
+    attach_from_onedrive takes. Blank lists the top level.
+
+    Use this to find a contractor's own last brief before editing it, and to
+    confirm a signed document actually landed where it was meant to.
+    """
+    g = _graph()
+    try:
+        items = g.list_files(path, root=root, recursive=recursive)
+    except Exception as e:  # noqa: BLE001
+        return f"Could not list {path or '(root)'}: {e}"
+
+    if not items:
+        return f"{path or '(root)'} is empty."
+
+    rows = []
+    for it in sorted(items, key=lambda i: ("folder" not in i, i.get("name", "").lower())):
+        kind = "dir " if "folder" in it else "file"
+        size = it.get("size") or 0
+        rows.append(f"  {kind}  {size:>10}  {it.get('path') or it.get('name')}")
+    return f"{path or '(root)'} - {len(items)} items\n" + "\n".join(rows)
+
+
+@mcp.tool()
+def onedrive_save_mail_attachment(message_id: str, dest_path: str,
+                                  attachment_id: str = "",
+                                  mailbox: str = "") -> str:
+    """Copy an Outlook attachment straight into OneDrive. Bytes stay server-side.
+
+    THIS IS THE ONE THAT UNBLOCKS UNATTENDED SIGNING. With no laptop awake there
+    is no other route: the Claude M365 connector returns attachments as extracted
+    text, and Outlook refuses to forward a message carrying one.
+
+    DEST_PATH is relative to the drive root, e.g.
+    "CONTRACTOR AGREEMENTS/Bhasker Veela/Consultancy Brief signed.pdf".
+
+    ATTACHMENT_ID may be left blank when the message has exactly one file
+    attachment; with more than one it refuses and lists them rather than
+    guessing which document to countersign.
+
+    MAILBOX defaults to the payroll mailbox. Reading another one needs that
+    address inside the Application Access Policy's scope group - a 403 here
+    means the policy, not the code.
+    """
+    g = _graph()
+    try:
+        r = g.save_mail_attachment(
+            message_id=message_id,
+            dest_path=dest_path,
+            attachment_id=attachment_id or None,
+            mailbox=mailbox or None,
+        )
+    except Exception as e:  # noqa: BLE001
+        return f"FAILED: {e}"
+
+    return (f"Saved {r['source_name']!r} ({r['bytes']} bytes) from "
+            f"{r['source_mailbox']}\n  to: {r['saved_to']}\n"
+            f"  {r['web_url']}\n\n"
+            f"Attach it with send_email(attach_from_onedrive=['{r['saved_to']}']).")
+
+
+@mcp.tool()
+def onedrive_transfer_url(path: str, direction: str = "download",
+                          conflict: str = "replace") -> str:
+    """A pre-authenticated URL for reading or writing one OneDrive file.
+
+    Returns a URL, never file content. The caller fetches or PUTs it directly,
+    so a 5MB contract costs four lines here instead of seven million characters
+    of base64 - and the document work (signing a PDF, editing the real .docx
+    rather than rebuilding it) happens where the tooling for it is tested.
+
+    DIRECTION: 'download' for an existing file, 'upload' for a new or
+    replacement one. CONFLICT applies to uploads only: replace | rename | fail.
+    Use 'fail' for anything already signed.
+
+    Download URLs last about an hour, upload sessions about fifteen minutes.
+    Neither needs an Authorization header - treat both as short-lived
+    credentials and do not write them anywhere they persist.
+    """
+    g = _graph()
+    if direction not in ("download", "upload"):
+        return f"direction must be 'download' or 'upload', not {direction!r}."
+
+    try:
+        if direction == "download":
+            d = g.download_url(path)
+            return (f"{d['name']}  {d['size']} bytes  modified {d['last_modified']}\n"
+                    f"{d['download_url']}\n\n"
+                    "Fetch with: curl -sL '<url>' -o <file>   (no auth header)")
+
+        u = g.upload_url(path, conflict=conflict)
+        return (f"Upload session for {u['path']}, expires {u['expires']}\n"
+                f"{u['upload_url']}\n\n"
+                "PUT with, for a file of N bytes:\n"
+                "  curl -s -X PUT '<url>' \\\n"
+                "    -H 'Content-Length: N' \\\n"
+                "    -H 'Content-Range: bytes 0-<N-1>/N' \\\n"
+                "    --data-binary @file")
+    except Exception as e:  # noqa: BLE001
+        return f"FAILED: {e}"
