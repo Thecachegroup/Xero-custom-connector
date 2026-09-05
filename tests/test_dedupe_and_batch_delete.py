@@ -220,3 +220,50 @@ def test_a_folder_that_does_not_exist_yet_holds_nothing_to_collide_with():
             raise _http_error(404)
 
     assert Missing().find_identical("F", b"AAAAA") == ""
+
+
+# ------------------------------------------------- one home for code packages
+
+from src.server import _package_path_problem, PENDING_UPLOAD, DEPLOYED
+
+
+def test_a_package_in_pending_upload_is_fine():
+    assert _package_path_problem(
+        f"{PENDING_UPLOAD}/thing_cut-against-9386690_2026-09-05_1659.zip") == ""
+
+
+def test_a_deployed_package_is_fine():
+    assert _package_path_problem(f"{DEPLOYED}/thing_cut-against-abc1234_x.zip") == ""
+
+
+def test_a_zip_anywhere_else_is_refused():
+    """The actual failure: four projects, four different folders, and no way
+    to answer 'what do I still have to upload?'."""
+    for where in ("AI Working Folder", "AI Working Folder/connector",
+                  "Contractors", ""):
+        p = f"{where}/thing_cut-against-9386690.zip".strip("/")
+        assert "_PENDING UPLOAD" in _package_path_problem(p)
+
+
+def test_a_package_with_no_base_commit_is_refused():
+    """An upload replaces whole files, so a package is only safe on the commit
+    it was cut from - and the name is the only thing carrying it."""
+    problem = _package_path_problem(f"{PENDING_UPLOAD}/connector-fix.zip")
+    assert "cut-against" in problem
+
+
+def test_a_deployed_zip_needs_no_base_commit():
+    """_deployed is history. The check that matters there has already been
+    made."""
+    assert _package_path_problem(f"{DEPLOYED}/old-thing.zip") == ""
+
+
+def test_anything_that_is_not_a_zip_is_none_of_this_rule_s_business():
+    for p in ("AI Working Folder/notes.md",
+              "CONTRACTOR AGREEMENTS/Devinia Liddelow/brief.docx",
+              "Contractors/Timesheets/Fx/PD/part1.png"):
+        assert _package_path_problem(p) == ""
+
+
+def test_the_check_is_case_insensitive_on_the_extension():
+    assert "_PENDING UPLOAD" in _package_path_problem("AI Working Folder/x.ZIP")

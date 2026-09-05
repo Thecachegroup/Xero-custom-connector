@@ -2778,9 +2778,45 @@ def onedrive_save_mail_attachment(message_id: str, dest_path: str,
             f"Attach it with send_email(attach_from_onedrive=['{r['saved_to']}']).")
 
 
+# Code packages have ONE home, and it is not wherever the session that cut them
+# happened to be working. Andrew works on this connector from several projects
+# at once; before this, each one wrote its zip somewhere else and the answer to
+# "what do I still have to upload?" was a hunt through five near-identically
+# named files. The rule lived in his preferences and was still being missed,
+# because a preference is advice and this needs to be a refusal.
+PENDING_UPLOAD = "AI Working Folder/_PENDING UPLOAD"
+DEPLOYED = "AI Working Folder/_deployed"
+
+
+def _package_path_problem(path: str) -> str:
+    """Why this zip must not be written here. Empty string means it is fine."""
+    p = str(path or "").strip().strip("/")
+    if not p.lower().endswith(".zip"):
+        return ""
+    folder, _, name = p.rpartition("/")
+    if folder not in (PENDING_UPLOAD, DEPLOYED):
+        return (f"A zip belongs in {PENDING_UPLOAD!r} while it is waiting to be "
+                f"uploaded, and {DEPLOYED!r} once it is deployed - not "
+                f"{folder or 'the drive root'!r}.\n"
+                "That folder is the answer to 'what do I still have to "
+                "upload?', and it only works while it is the ONLY place they "
+                "go.\n"
+                "For a zip that is not a code package - a bundle of documents - "
+                "pass force=True.")
+    if folder == PENDING_UPLOAD and "cut-against-" not in name:
+        return (f"{name!r} does not say which commit it was cut against.\n"
+                "An upload REPLACES whole files, so a package is only safe on "
+                "the commit it was cut from, and the filename is the only thing "
+                "that carries it:\n"
+                "  <what-it-does>_cut-against-<sha>_YYYY-MM-DD_HHMM.zip\n"
+                "Pass force=True if this genuinely is not a code package.")
+    return ""
+
+
 @mcp.tool()
 def onedrive_transfer_url(path: str, direction: str = "download",
-                          conflict: str = "replace", drive: str = "") -> str:
+                          conflict: str = "replace", drive: str = "",
+                          force: bool = False) -> str:
     """A pre-authenticated URL for reading or writing one OneDrive file.
 
     Returns a URL, never file content. The caller fetches or PUTs it directly,
@@ -2795,10 +2831,23 @@ def onedrive_transfer_url(path: str, direction: str = "download",
     Download URLs last about an hour, upload sessions about fifteen minutes.
     Neither needs an Authorization header - treat both as short-lived
     credentials and do not write them anywhere they persist.
+
+    A ZIP HAS ONE HOME. Uploading one anywhere but
+    `AI Working Folder/_PENDING UPLOAD` (waiting) or `AI Working Folder/_deployed`
+    (done) is refused, and so is a name in _PENDING UPLOAD that does not say
+    which commit it was cut against. Andrew works on this connector from several
+    projects at once and each one used to write its package somewhere else, so
+    nothing could answer "what do I still have to upload?". FORCE=True is the
+    way past both, for a zip that is not a code package.
     """
     g = _graph()
     if direction not in ("download", "upload"):
         return f"direction must be 'download' or 'upload', not {direction!r}."
+
+    if direction == "upload" and not force:
+        problem = _package_path_problem(path)
+        if problem:
+            return f"REFUSED. Nothing has been written.\n{problem}"
 
     try:
         if direction == "download":
@@ -2817,6 +2866,60 @@ def onedrive_transfer_url(path: str, direction: str = "download",
                 "    --data-binary @file")
     except Exception as e:  # noqa: BLE001
         return f"FAILED: {e}"
+
+
+@mcp.tool()
+def pending_uploads() -> str:
+    """What is still waiting for Andrew to upload to GitHub. Read only.
+
+    Nobody but Andrew can push to the repo - three automated routes were tried
+    on 5 September 2026 and all three are blocked - so every change ends as a
+    zip he drags into GitHub by hand. The gap that creates is knowing which
+    zips are still outstanding, and it was being answered by looking at a folder
+    full of near-identically named files from four different projects.
+
+    `AI Working Folder/_PENDING UPLOAD` is the single answer. It should normally
+    be EMPTY. Anything in it is outstanding.
+
+    A package is only safe to upload onto the commit it was cut from, because an
+    upload replaces whole files - so the base commit is read back out of each
+    name here. CHECK IT AGAINST THE REPO'S CURRENT HEAD BEFORE UPLOADING. If it
+    does not match, stop: the package was cut against something older and will
+    take other people's changes back out with it.
+
+    A zip whose contents are already identical to HEAD has been deployed and
+    never filed - move it to `_deployed` with onedrive_move rather than
+    uploading it again.
+    """
+    import re as _re
+    try:
+        items = _graph().list_children(PENDING_UPLOAD)
+    except Exception as e:  # noqa: BLE001
+        return f"FAILED: {e}"
+
+    files = [it for it in items if "folder" not in it]
+    if not files:
+        return (f"{PENDING_UPLOAD} is empty.\n"
+                "Nothing is waiting to be uploaded.")
+
+    out = [f"{len(files)} package(s) WAITING TO BE UPLOADED in {PENDING_UPLOAD}:",
+           ""]
+    for it in sorted(files, key=lambda x: str(x.get("name"))):
+        name = str(it.get("name"))
+        m = _re.search(r"cut-against-([0-9a-f]{7,40})", name)
+        out.append(f"  {name}   ({it.get('size')} bytes)")
+        if m:
+            out.append(f"      cut against {m.group(1)} - confirm this is the "
+                       "repo's HEAD before uploading")
+        else:
+            out.append("      NO BASE COMMIT IN THE NAME. Do not upload it "
+                       "until you know which commit it was cut from.")
+    out += ["",
+            "Upload: GitHub - Add file - Upload files at the REPO ROOT, "
+            "dragging the whole src and tests folders together.",
+            "Then move the zip to _deployed with onedrive_move, and start a "
+            "fresh chat if any tool was added or removed."]
+    return "\n".join(out)
 
 
 @mcp.tool()
