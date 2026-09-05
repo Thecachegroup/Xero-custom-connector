@@ -62,6 +62,12 @@ KNOWN_REPOS = {
 TIMEOUT = 20
 
 
+def _looks_like_sha(ref: str) -> bool:
+    """A full 40-character commit sha, as opposed to a branch or tag name."""
+    text = (ref or "").strip()
+    return len(text) == 40 and all(c in "0123456789abcdef" for c in text.lower())
+
+
 class BranchProtected(RuntimeError):
     """Raised when a write targets a branch that must only change via a PR."""
 
@@ -262,11 +268,17 @@ class GitHubClient:
 
         The point of the whole exercise: a red cross here is the signal
         /healthz can never give.
+
+        `ref` may be a branch name or a sha. The runs endpoint filters on
+        head_sha and does no resolution of its own, so a branch name matches
+        nothing and comes back as "no runs yet" - which reads as "CI has not
+        started" when the truth may be "CI failed". Resolve it first.
         """
+        sha = ref if _looks_like_sha(ref) else self.head_sha(repo, ref)
         runs = self._request(
             "GET",
             f"{self._repo(repo)}/actions/runs",
-            params={"head_sha": ref, "per_page": 10},
+            params={"head_sha": sha, "per_page": 10},
         )
         out = []
         for run in runs.get("workflow_runs", []):
@@ -279,7 +291,12 @@ class GitHubClient:
                 }
             )
         if not out:
-            return {"ref": ref[:7], "runs": [], "verdict": "no runs yet - check again shortly"}
+            return {
+                "ref": ref,
+                "sha": sha[:7],
+                "runs": [],
+                "verdict": "no runs yet - check again shortly",
+            }
         conclusions = {r["conclusion"] for r in out}
         if None in conclusions or any(r["status"] != "completed" for r in out):
             verdict = "still running"
@@ -287,4 +304,4 @@ class GitHubClient:
             verdict = "passed"
         else:
             verdict = "FAILED - do not merge"
-        return {"ref": ref[:7], "runs": out, "verdict": verdict}
+        return {"ref": ref, "sha": sha[:7], "runs": out, "verdict": verdict}

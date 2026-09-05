@@ -212,6 +212,17 @@ def test_commit_needs_a_message(gh, message):
 
 # ---- CI ------------------------------------------------------------------
 
+SHA = "a" * 40
+
+
+def _runs_stubs(runs):
+    """A branch name has to be resolved to a sha before runs can be queried,
+    so the commits endpoint is stubbed alongside the runs endpoint."""
+    return {
+        "/commits/": FakeResponse({"sha": SHA}),
+        "/actions/runs": FakeResponse({"workflow_runs": runs}),
+    }
+
 
 @pytest.mark.parametrize("runs,expected", [
     ([{"status": "completed", "conclusion": "success"}], "passed"),
@@ -221,16 +232,58 @@ def test_commit_needs_a_message(gh, message):
       {"status": "completed", "conclusion": "failure"}], "FAILED - do not merge"),
 ])
 def test_ci_verdicts(gh, runs, expected):
-    gh._session.responses = {"/actions/runs": FakeResponse({"workflow_runs": runs})}
+    gh._session.responses = _runs_stubs(runs)
     assert gh.checks_for("Xero-custom-connector", "abc")["verdict"] == expected
 
 
 def test_no_runs_yet_is_not_a_pass(gh):
     """The dangerous answer would be 'passed' when nothing has run."""
-    gh._session.responses = {"/actions/runs": FakeResponse({"workflow_runs": []})}
+    gh._session.responses = _runs_stubs([])
     verdict = gh.checks_for("Xero-custom-connector", "abc")["verdict"]
     assert "no runs yet" in verdict
     assert "pass" not in verdict.lower()
+
+
+def test_a_branch_name_is_resolved_before_runs_are_queried(gh):
+    """THE BUG THIS GUARDS.
+
+    head_sha is an exact match on a commit sha. Passing a branch name matched
+    nothing, so a branch whose CI had failed came back "no runs yet" - read as
+    "CI has not started" when the truth was "CI failed". Found on main on
+    05/09/2026 while those failures were actively sending email.
+    """
+    gh._session.responses = _runs_stubs(
+        [{"status": "completed", "conclusion": "failure"}]
+    )
+    result = gh.checks_for("Xero-custom-connector", "test/some-branch")
+
+    assert result["verdict"] == "FAILED - do not merge"
+
+    queried = [c for c in gh._session.calls if "/actions/runs" in c[1]]
+    assert len(queried) == 1
+    assert queried[0][3]["head_sha"] == SHA, (
+        "a branch name was sent as head_sha - it matches nothing and the "
+        "verdict silently becomes 'no runs yet'"
+    )
+
+
+def test_the_ref_is_reported_back_intact(gh):
+    """ref[:7] rendered 'test/connector-check' as 'test/co'."""
+    gh._session.responses = _runs_stubs([])
+    result = gh.checks_for("Xero-custom-connector", "test/connector-check")
+    assert result["ref"] == "test/connector-check"
+    assert result["sha"] == SHA[:7]
+
+
+def test_a_full_sha_is_not_resolved_again(gh):
+    """The common case - checking the commit you just made - costs one call."""
+    gh._session.responses = _runs_stubs(
+        [{"status": "completed", "conclusion": "success"}]
+    )
+    gh.checks_for("Xero-custom-connector", SHA)
+    assert not [c for c in gh._session.calls if "/commits/" in c[1]], (
+        "a 40-character sha was sent back to GitHub to be resolved"
+    )
 
 
 # ---- errors --------------------------------------------------------------
