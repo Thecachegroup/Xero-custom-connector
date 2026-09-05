@@ -245,6 +245,70 @@ class GitHubClient:
             "files": sorted(files),
         }
 
+    def replace_in_file(
+        self,
+        repo: str,
+        branch: str,
+        path: str,
+        old_str: str,
+        new_str: str,
+        message: str,
+        base: str = "main",
+    ) -> dict:
+        """Change one exact passage in a file, without resending the whole file.
+
+        WHY THIS EXISTS. commit_files replaces a path outright, so a one-line
+        change to a 156KB module means reproducing all 156KB by hand. That is
+        slow, and every character is a chance to corrupt a file that deploys
+        straight to production. On 5 September 2026 it meant a one-line auth
+        fix had to be typed into the GitHub web editor by hand instead.
+
+        Same contract as the memory tools: old_str must match EXACTLY ONCE.
+        Zero matches or two matches is a refusal, not a guess - widen old_str
+        with surrounding lines until it is unique. A tool that silently picks
+        one of two matches is worse than no tool.
+
+        Reads from the branch when it already exists, so repeated edits stack
+        instead of each one resetting the branch back to base.
+        """
+        branch = self._guard_branch(branch)
+        if not old_str:
+            raise RuntimeError("old_str is empty - nothing to find.")
+        if old_str == new_str:
+            raise RuntimeError("old_str and new_str are identical - nothing to change.")
+        if not message or not message.strip():
+            raise RuntimeError("A commit message is required.")
+
+        # Build on the branch if it is already there, otherwise on base.
+        try:
+            self.head_sha(repo, branch)
+            source = branch
+        except RuntimeError:
+            source = base
+
+        current = self.read_file(repo, path, source)
+        text = current["text"]
+
+        found = text.count(old_str)
+        if found == 0:
+            raise RuntimeError(
+                f"old_str was not found in {path} on '{source}'. It must match "
+                f"the file exactly, including indentation and line breaks. Read "
+                f"the file with github_read and copy the passage from it."
+            )
+        if found > 1:
+            raise RuntimeError(
+                f"old_str appears {found} times in {path} - refusing to guess "
+                f"which one you meant. Add surrounding lines until it is unique."
+            )
+
+        result = self.commit_files(
+            repo, branch, {path: text.replace(old_str, new_str)}, message, source
+        )
+        result["replaced_in"] = path
+        result["built_on"] = source
+        return result
+
     def open_pr(
         self, repo: str, branch: str, title: str, body: str = "", base: str = "main"
     ) -> dict:
