@@ -231,6 +231,17 @@ def build(items: Iterable[dict], employees: Iterable[dict],
         for n in list(ov.get("contact_names") or []) + list(aliases.get(code) or []):
             if n and n not in entry["contact_names"]:
                 entry["contact_names"].append(n)
+        # THE ITEM NAME CARRIES A ROLE, THE EMAIL DOES NOT. Andrew added the
+        # role to Xero on 5 Sep 2026 so Linfox AP can match a PO, and the item
+        # `Linfox - MAZ` went from "Mazher Ali" to "Mazher Ali - Power
+        # Platforms". The roster name follows the item, name matching looks for
+        # that whole string, and Mazher's invoice stopped being attributed the
+        # same day - it landed in UNMATCHED and he was reported as having sent
+        # nothing. Every peer carries "Name - Role" in the same field, so this
+        # is a trap set for all of them. Keep the bare name as an alias.
+        bare = re.split(r"\s+[-\u2013]\s+", name)[0].strip()
+        if bare and bare != name and bare not in entry["contact_names"]:
+            entry["contact_names"].append(bare)
         # The payroll name too - "Dat Le" where the item says "Dat Tien Le".
         pn = entry.pop("payroll_name", "")
         if pn and pn != name and pn not in entry["contact_names"]:

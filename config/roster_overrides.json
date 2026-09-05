@@ -129,6 +129,16 @@
     "TCG - Nuria Carricondo": {
       "skip": true,
       "_why": "in the pay run for superannuation only, zero earnings - never sends a timesheet"
+    },
+    "Linfox - MAZ": {
+      "emails": [
+        "mdmazherali@gmail.com"
+      ],
+      "contact_names": [
+        "Mazher Ali",
+        "Mazher Mohammed"
+      ],
+      "_why": "His Xero item is named 'Mazher Ali - Power Platforms' since 5 Sep 2026, so the roster name carries the role and nothing in his email matches it. Linfox hold him as 'Mazher Mohammed'. An address on file beats every name test, so this settles it regardless of what the item is called."
     }
   }
 }

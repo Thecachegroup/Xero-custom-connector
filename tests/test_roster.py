@@ -388,3 +388,57 @@ def test_bhaskers_address_cannot_be_matched_by_name_and_needs_an_override():
     who, why = mm.match_message(msg("veerlabhaskar1996@gmail.com"), with_addr)
     assert who is not None and who["item_code"] == "Linfox - BV"
     assert why == "sender address is on file"
+
+
+# ---------------------------------------------------------------------------
+# A ROLE ON THE ITEM NAME MUST NOT LOSE THE PERSON - 5 September 2026.
+#
+# Andrew added the role to Xero so Linfox AP could match a PO, and the item
+# `Linfox - MAZ` went from "Mazher Ali" to "Mazher Ali - Power Platforms". The
+# roster name follows the item, name matching looks for that whole string, and
+# Mazher's invoice stopped being attributed the same day: it landed in
+# UNMATCHED and he was reported as having sent nothing. Every peer carries
+# "Name - Role" in the same field.
+# ---------------------------------------------------------------------------
+def _entry(roster, code):
+    return next(c for c in roster if c["item_code"] == code)
+
+
+_ROLE_ITEMS = [{"Code": "Linfox - ZZZ", "Name": "Wilma Testcase - Power Platforms",
+                "IsSold": True, "IsPurchased": True, "Status": "ACTIVE"}]
+_BARE_ITEMS = [{"Code": "Linfox - YYY", "Name": "Wilma Testcase",
+                "IsSold": True, "IsPurchased": True, "Status": "ACTIVE"}]
+
+
+def _bill(code):
+    return [{"Type": "ACCPAY", "Status": "AUTHORISED",
+             "Contact": {"Name": "Testcase Pty Ltd"},
+             "LineItems": [{"ItemCode": code}]}]
+
+
+def test_role_suffix_leaves_the_bare_name_as_an_alias():
+    people = rst.build(_ROLE_ITEMS, [], _bill("Linfox - ZZZ"),
+                       overrides={}, aliases={})
+    person = _entry(people, "Linfox - ZZZ")
+    assert person["name"] == "Wilma Testcase - Power Platforms"
+    assert "Wilma Testcase" in person["contact_names"]
+
+
+def test_a_plain_name_gains_no_duplicate_alias():
+    people = rst.build(_BARE_ITEMS, [], _bill("Linfox - YYY"),
+                       overrides={}, aliases={})
+    person = _entry(people, "Linfox - YYY")
+    assert person["contact_names"].count("Wilma Testcase") == 0
+
+
+def test_the_message_that_stopped_matching_matches_again():
+    """Mazher's invoice, against an item that now carries his role."""
+    people = rst.build(_ROLE_ITEMS, [], _bill("Linfox - ZZZ"),
+                       overrides={}, aliases={})
+    msg = {"sender": "w@example.com", "sender_name": "Wilma Testcase",
+           "subject": "Invoice for period 24-08-2026 to 30-08-2026",
+           "body": "Please find my invoice attached.\nRegards\nWilma Testcase",
+           "attachments": []}
+    who, why = mm.match_by_name(msg, people)
+    assert who is not None, why
+    assert who["item_code"] == "Linfox - ZZZ"
