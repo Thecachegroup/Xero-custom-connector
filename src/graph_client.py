@@ -77,6 +77,14 @@ class GraphClient:
         self.mailbox = os.environ.get("TCG_PAYROLL_MAILBOX", "payroll@thecachegroup.com.au")
         self.folder = os.environ.get("TCG_PAYROLL_FOLDER", "Payroll - TCG")
         self.files_owner = os.environ.get("TCG_FILES_OWNER", "andrew.hurnard@thecachegroup.com.au")
+        # SharePoint hostname for the team site. Derived from the files owner's
+        # domain so a tenant rename needs one env var, not a code change.
+        self.sp_host = os.environ.get(
+            "TCG_SHAREPOINT_HOST",
+            self.files_owner.split("@")[-1].split(".")[0] + ".sharepoint.com")
+        # Resolving a drive is a network round trip that never changes inside a
+        # request, and _drive_id gets called several times in one tool call.
+        self._drive_cache: dict[str, str] = {}
         self._token: str | None = None
         self._expiry = 0.0
         self._lock = threading.Lock()
@@ -271,8 +279,125 @@ class GraphClient:
 
     # ---------- files ----------
 
-    def _drive_id(self) -> str:
-        return self.get(f"{GRAPH}/users/{quote(self.files_owner)}/drive")["id"]
+    def _drive_id(self, drive: str = "") -> str:
+        """Resolve a drive TARGET to a Graph drive id. Cached for the session.
+
+        Until 5 September 2026 this was hardcoded to the files owner's OneDrive,
+        so the connector could not see the SharePoint team site or anybody
+        else's drive - including Matt's, which holds every interview
+        transcript. The app registration already carries Files.ReadWrite.All
+        tenant-wide, so the permission was never the limit; this line was.
+
+        TARGET accepts:
+          ""  /  "me"        the files owner's OneDrive - the long-standing
+                             default, so every existing caller is unchanged
+          "someone@x.com"    that person's OneDrive
+          "site" / "team"    the root SharePoint site's default library
+          "site:Name"        a named SharePoint site's default library
+          "b!..."            a literal drive id, used as given
+        """
+        key = (drive or "").strip()
+        if key in self._drive_cache:
+            return self._drive_cache[key]
+
+        low = key.lower()
+        if not key or low in ("me", "self", "owner", "default"):
+            url = f"{GRAPH}/users/{quote(self.files_owner)}/drive"
+        elif key.startswith("b!"):
+            self._drive_cache[key] = key      # already an id; nothing to look up
+            return key
+        elif "@" in key:
+            url = f"{GRAPH}/users/{quote(key)}/drive"
+        elif low in ("site", "team", "shared", "sharepoint"):
+            url = f"{GRAPH}/sites/{self.sp_host}/drive"
+        elif low.startswith("site:"):
+            name = key.split(":", 1)[1].strip()
+            hits = self.get(f"{GRAPH}/sites", {"search": name}).get("value") or []
+            if not hits:
+                raise RuntimeError(
+                    f"No SharePoint site matching {name!r}. Nothing has been read."
+                )
+            url = f"{GRAPH}/sites/{hits[0]['id']}/drive"
+        else:
+            raise RuntimeError(
+                f"Unrecognised drive target {key!r}. Use '' for the default "
+                "OneDrive, an email address, 'site', 'site:Name', or a b!... "
+                "drive id. Nothing has been read."
+            )
+
+        did = self.get(url)["id"]
+        self._drive_cache[key] = did
+        return did
+
+    def list_drives(self) -> list[dict]:
+        """Every drive this connector can actually reach, for discovery.
+
+        Exists because the answer used to be guesswork, and a file that could
+        not be found was assumed missing when it was simply on a drive nothing
+        was looking at. A user with no provisioned OneDrive is skipped rather
+        than raised, so one unlicensed account cannot blind the whole listing.
+        """
+        out: list[dict] = []
+        try:
+            d = self.get(f"{GRAPH}/sites/{self.sp_host}/drive")
+            out.append({"target": "site", "kind": "SharePoint site",
+                        "name": d.get("name"), "id": d.get("id"),
+                        "web_url": d.get("webUrl")})
+        except Exception as e:  # noqa: BLE001
+            out.append({"target": "site", "kind": "SharePoint site",
+                        "name": f"UNREACHABLE: {e}", "id": "", "web_url": ""})
+
+        for u in self.get_all(f"{GRAPH}/users",
+                              {"$select": "displayName,mail,userPrincipalName",
+                               "$top": "100"}):
+            who = u.get("mail") or u.get("userPrincipalName")
+            if not who:
+                continue
+            try:
+                d = self.get(f"{GRAPH}/users/{quote(who)}/drive")
+            except Exception:  # noqa: BLE001
+                continue          # no OneDrive provisioned; not an error
+            out.append({"target": who, "kind": "OneDrive",
+                        "name": u.get("displayName") or who,
+                        "id": d.get("id"), "web_url": d.get("webUrl")})
+        return out
+
+    def delete_item(self, relative_path: str, root: str = "",
+                    drive: str = "", allow_folder: bool = False) -> dict:
+        """Delete one file. It goes to the recycle bin, recoverable ~93 days.
+
+        Added 5 September 2026. Nothing in the cloud path could delete anything
+        at all, so every working file a run wrote stayed for ever and had to be
+        cleared by hand.
+
+        A FOLDER IS REFUSED unless ALLOW_FOLDER. Deleting a folder takes its
+        whole contents with it, and the distance between a stale working file
+        and a contractor's signed agreements is one wrong path.
+        """
+        # Whitespace is stripped BEFORE the root check, not after. "   " and
+        # "/" survive a bare strip("/") as truthy strings, and a path that is
+        # really the drive root must never reach a DELETE.
+        raw = f"{root}/{relative_path}" if root else relative_path
+        path = raw.strip().strip("/").strip()
+        if not path:
+            raise RuntimeError(
+                "Refusing to delete the drive root. Nothing has been deleted."
+            )
+        did = self._drive_id(drive)
+        item = self.get(f"{GRAPH}/drives/{did}/root:/{quote(path)}",
+                        {"$select": "id,name,size,folder"})
+        # Presence, not truthiness - Graph sends {"childCount": 0} for an empty
+        # folder, which is falsy.
+        if "folder" in item and not allow_folder:
+            raise RuntimeError(
+                f"{path!r} is a folder. Deleting it would take everything "
+                "inside it with it. Pass allow_folder=True if that is genuinely "
+                "intended. Nothing has been deleted."
+            )
+        self._request("DELETE", f"{GRAPH}/drives/{did}/items/{item['id']}")
+        return {"path": path, "name": item.get("name"),
+                "size": item.get("size"), "was_folder": "folder" in item,
+                "deleted": True}
 
     def upload(self, relative_path: str, content: bytes, root: str = "Contractors/Timesheets") -> dict:
         """Write bytes to OneDrive under `root`, creating folders as needed.
@@ -338,7 +463,7 @@ class GraphClient:
         return walk(relative_path, "")
 
     def list_children(self, path: str = "", root: str = "",
-                      recursive: bool = False) -> list[dict]:
+                      recursive: bool = False, drive: str = "") -> list[dict]:
         """One folder's immediate children - folders AND files.
 
         list_files() is timesheet-shaped: it drops folders entirely and defaults
@@ -350,12 +475,12 @@ class GraphClient:
         the other way gives "root:/:/children", which Graph answers with a 400.
         """
         full = f"{root}/{path}".strip("/") if root else path.strip("/")
-        drive = self._drive_id()
+        did = self._drive_id(drive)
 
         def children_url(rel: str) -> str:
             if not rel:
-                return f"{GRAPH}/drives/{drive}/root/children"
-            return f"{GRAPH}/drives/{drive}/root:/{quote(rel)}:/children"
+                return f"{GRAPH}/drives/{did}/root/children"
+            return f"{GRAPH}/drives/{did}/root:/{quote(rel)}:/children"
 
         def walk(rel: str) -> list[dict]:
             out: list[dict] = []
@@ -413,7 +538,8 @@ class GraphClient:
 
     # ---------- files: pre-authenticated URLs ----------
 
-    def download_url(self, relative_path: str, root: str = "") -> dict:
+    def download_url(self, relative_path: str, root: str = "",
+                     drive: str = "") -> dict:
         """A pre-authenticated URL for one OneDrive file. Valid about an hour.
 
         Returns the URL, never the bytes. Graph's @microsoft.graph.downloadUrl
@@ -426,7 +552,7 @@ class GraphClient:
         here would file signed agreements in the wrong place forever.
         """
         path = f"{root}/{relative_path}".strip("/") if root else relative_path.strip("/")
-        base = f"{GRAPH}/drives/{self._drive_id()}/root:/{quote(path)}"
+        base = f"{GRAPH}/drives/{self._drive_id(drive)}/root:/{quote(path)}"
         item = self.get(base, {"$select": "id,name,size,lastModifiedDateTime,folder"})
 
         # Presence, not truthiness - Graph sends {"childCount": 0} for an empty
@@ -458,7 +584,7 @@ class GraphClient:
         }
 
     def upload_url(self, relative_path: str, root: str = "",
-                   conflict: str = "replace") -> dict:
+                   conflict: str = "replace", drive: str = "") -> dict:
         """A pre-authenticated upload URL. Valid about fifteen minutes.
 
         upload() is a simple PUT and refuses anything over 4MB. This opens a
@@ -474,7 +600,7 @@ class GraphClient:
                 "Nothing has been written."
             )
         path = f"{root}/{relative_path}".strip("/") if root else relative_path.strip("/")
-        url = f"{GRAPH}/drives/{self._drive_id()}/root:/{quote(path)}:/createUploadSession"
+        url = f"{GRAPH}/drives/{self._drive_id(drive)}/root:/{quote(path)}:/createUploadSession"
         resp = self._request(
             "POST", url,
             json={"item": {"@microsoft.graph.conflictBehavior": conflict}},

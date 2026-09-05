@@ -2651,31 +2651,38 @@ def onedrive_selftest() -> str:
 
 
 @mcp.tool()
-def onedrive_list(path: str = "", root: str = "", recursive: bool = False) -> str:
-    """List a OneDrive folder. Read-only.
+def onedrive_list(path: str = "", root: str = "", recursive: bool = False,
+                  drive: str = "") -> str:
+    """List a OneDrive or SharePoint folder. Read-only.
 
     PATH is relative to ROOT; ROOT defaults to the drive root, so
     "CONTRACTOR AGREEMENTS/Devinia Liddelow" works as written - the same form
     attach_from_onedrive takes. Blank lists the top level.
+
+    DRIVE picks whose drive. Blank is Andrew's OneDrive, as it always was.
+    "site" is the SharePoint team library; an email address is that person's
+    OneDrive - matt@thecachegroup.com.au is where the interview transcripts
+    live. Run onedrive_drives() to see what is reachable.
 
     Use this to find a contractor's own last brief before editing it, and to
     confirm a signed document actually landed where it was meant to.
     """
     g = _graph()
     try:
-        items = g.list_children(path, root=root, recursive=recursive)
+        items = g.list_children(path, root=root, recursive=recursive, drive=drive)
     except Exception as e:  # noqa: BLE001
         return f"Could not list {path or '(root)'}: {e}"
 
+    where = f"{path or '(root)'}" + (f"  [{drive}]" if drive else "")
     if not items:
-        return f"{path or '(root)'} is empty."
+        return f"{where} is empty."
 
     rows = []
     for it in sorted(items, key=lambda i: ("folder" not in i, i.get("name", "").lower())):
         kind = "dir " if "folder" in it else "file"
         size = it.get("size") or 0
         rows.append(f"  {kind}  {size:>10}  {it.get('path') or it.get('name')}")
-    return f"{path or '(root)'} - {len(items)} items\n" + "\n".join(rows)
+    return f"{where} - {len(items)} items\n" + "\n".join(rows)
 
 
 @mcp.tool()
@@ -2718,7 +2725,7 @@ def onedrive_save_mail_attachment(message_id: str, dest_path: str,
 
 @mcp.tool()
 def onedrive_transfer_url(path: str, direction: str = "download",
-                          conflict: str = "replace") -> str:
+                          conflict: str = "replace", drive: str = "") -> str:
     """A pre-authenticated URL for reading or writing one OneDrive file.
 
     Returns a URL, never file content. The caller fetches or PUTs it directly,
@@ -2740,12 +2747,12 @@ def onedrive_transfer_url(path: str, direction: str = "download",
 
     try:
         if direction == "download":
-            d = g.download_url(path)
+            d = g.download_url(path, drive=drive)
             return (f"{d['name']}  {d['size']} bytes  modified {d['last_modified']}\n"
                     f"{d['download_url']}\n\n"
                     "Fetch with: curl -sL '<url>' -o <file>   (no auth header)")
 
-        u = g.upload_url(path, conflict=conflict)
+        u = g.upload_url(path, conflict=conflict, drive=drive)
         return (f"Upload session for {u['path']}, expires {u['expires']}\n"
                 f"{u['upload_url']}\n\n"
                 "PUT with, for a file of N bytes:\n"
@@ -2755,3 +2762,56 @@ def onedrive_transfer_url(path: str, direction: str = "download",
                 "    --data-binary @file")
     except Exception as e:  # noqa: BLE001
         return f"FAILED: {e}"
+
+
+@mcp.tool()
+def onedrive_drives() -> str:
+    """Every drive this connector can reach. Read-only. Run it when a file
+    cannot be found before concluding it is not there.
+
+    The connector was hardcoded to one OneDrive until 5 September 2026, so
+    files on the SharePoint team site and in other people's drives read as
+    missing when they were simply somewhere nothing was looking. The TARGET
+    column is what to pass as `drive` to onedrive_list, onedrive_transfer_url
+    and onedrive_delete.
+    """
+    try:
+        drives = _graph().list_drives()
+    except Exception as e:  # noqa: BLE001
+        return f"Could not list drives: {e}"
+    if not drives:
+        return "No drives reachable. That is itself a fault - check Graph credentials."
+
+    rows = ["| Target | Kind | Name | Web URL |", "|:--|:--|:--|:--|"]
+    for d in drives:
+        rows.append(f"| `{d['target']}` | {d['kind']} | {d['name']} | {d['web_url']} |")
+    return (f"{len(drives)} drives reachable\n\n" + "\n".join(rows) +
+            "\n\nPass the target as `drive`, e.g. "
+            "onedrive_list(path='', drive='site').")
+
+
+@mcp.tool()
+def onedrive_delete(path: str, root: str = "", drive: str = "",
+                    allow_folder: bool = False) -> str:
+    """Delete ONE file from OneDrive or SharePoint. It goes to the recycle bin.
+
+    Added because nothing in the cloud path could delete anything, so every
+    working file a run left behind stayed for ever and had to be cleared by
+    hand. Recoverable from the recycle bin for about 93 days.
+
+    A FOLDER IS REFUSED unless ALLOW_FOLDER is set, because deleting one takes
+    its whole contents. Do not use this on anything signed or executed - a
+    contractor agreement is not a working file, and the recycle bin is not a
+    filing system.
+
+    DRIVE works as it does on onedrive_list. Blank is Andrew's OneDrive.
+    """
+    try:
+        d = _graph().delete_item(path, root=root, drive=drive,
+                                 allow_folder=allow_folder)
+    except Exception as e:  # noqa: BLE001
+        return f"FAILED: {e}"
+    kind = "folder" if d["was_folder"] else "file"
+    return (f"Deleted {kind} {d['path']}  ({d['size']} bytes)"
+            + (f"  [{drive}]" if drive else "")
+            + "\nIn the recycle bin, recoverable for about 93 days.")
