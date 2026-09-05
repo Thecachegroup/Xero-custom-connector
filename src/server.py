@@ -3385,3 +3385,34 @@ def github_checks(repo: str, ref: str) -> str:
     has not started - wait ten seconds and ask again.
     """
     return json.dumps(_gh().checks_for(repo, ref), indent=2)
+
+
+@mcp.tool()
+def github_replace(
+    repo: str,
+    branch: str,
+    path: str,
+    old_str: str,
+    new_str: str,
+    message: str,
+    base: str = "main",
+) -> str:
+    """Change ONE exact passage in a file, without resending the whole file.
+
+    Use this instead of github_commit for a small edit to a large file.
+    github_commit replaces a path outright, so a one-line change to a 156KB
+    module means reproducing all 156KB - slow, and every character is a chance
+    to corrupt a file that deploys straight to production.
+
+    old_str must match EXACTLY ONCE, whitespace and line breaks included.
+    Zero matches or two matches is refused rather than guessed: widen old_str
+    with surrounding lines until it is unique. Read the file with github_read
+    first and copy the passage out of it rather than retyping it.
+
+    Lands on a BRANCH like everything else here - main is refused. Repeated
+    edits to the same branch stack instead of resetting it back to base.
+    """
+    return json.dumps(
+        _gh().replace_in_file(repo, branch, path, old_str, new_str, message, base),
+        indent=2,
+    )
