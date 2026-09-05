@@ -3291,3 +3291,97 @@ def onedrive_move(path: str, dest_folder: str = "", root: str = "",
     return (f"Moved {kind} {d['path']} -> {where}"
             + ("  (renamed)" if d["renamed"] else "")
             + (f"  [{drive}]" if drive else ""))
+
+
+# ---------------------------------------------------------------------------
+# GitHub - edit the connector repos directly instead of building zips.
+#
+# Every write here lands on a BRANCH and opens a pull request. Nothing in this
+# section can push to main; github_client refuses before it makes a request.
+# See the module docstring in src/github_client.py for why that rule exists.
+# ---------------------------------------------------------------------------
+
+
+def _gh():
+    from .github_client import GitHubClient
+
+    return GitHubClient()
+
+
+@mcp.tool()
+def github_read(repo: str, path: str = "", ref: str = "main") -> str:
+    """Read a file, or list a directory, from one of Andrew's GitHub repos.
+
+    Read the LIVE repo before changing anything. Notes, state docs and zips in
+    a conversation all go stale; main does not. Leave `path` blank to list the
+    repo root.
+
+    repo: Xero-custom-connector, cats-mcp-server, ms365-mailer, cv-suite,
+          cv-suite-full, CV-Suite-Free
+    ref:  a branch name or a commit sha. Defaults to main.
+    """
+    gh = _gh()
+    try:
+        entry = gh.read_file(repo, path, ref) if path else None
+    except RuntimeError as e:
+        if "is a directory" not in str(e):
+            entry = None
+            if path:
+                raise
+        else:
+            entry = None
+    if path and entry:
+        return json.dumps(entry, indent=2)
+    listing = gh.list_dir(repo, path, ref)
+    return json.dumps({"repo": repo, "ref": ref, "path": path or "/", "entries": listing}, indent=2)
+
+
+@mcp.tool()
+def github_head(repo: str, ref: str = "main") -> str:
+    """The current commit sha of a repo. Check this before and after a change -
+    if it moved when you did not expect it to, someone uploaded something."""
+    return json.dumps({"repo": repo, "ref": ref, "sha": _gh().head_sha(repo, ref)})
+
+
+@mcp.tool()
+def github_commit(
+    repo: str,
+    branch: str,
+    message: str,
+    files: dict,
+    base: str = "main",
+) -> str:
+    """Commit files to a BRANCH in one commit. Never writes to main.
+
+    `files` maps repo-relative path to the file's complete new text, e.g.
+    {"src/writes.py": "<the whole file>"}. Send whole files, not fragments -
+    this replaces each path outright. Set a path to null to delete it.
+
+    Creates the branch from `base` if it does not exist. Follow with
+    github_open_pr, then github_checks once CI has run.
+
+    A branch name of main, master, trunk, release or production is refused.
+    """
+    return json.dumps(_gh().commit_files(repo, branch, files, message, base), indent=2)
+
+
+@mcp.tool()
+def github_open_pr(
+    repo: str, branch: str, title: str, body: str = "", base: str = "main"
+) -> str:
+    """Open a pull request from a branch. Andrew merges it; nothing here does.
+
+    Say in the body what changed and why, and what would break if it is wrong -
+    that text is what he reads before clicking merge.
+    """
+    return json.dumps(_gh().open_pr(repo, branch, title, body, base), indent=2)
+
+
+@mcp.tool()
+def github_checks(repo: str, ref: str) -> str:
+    """Did the test suite pass on this commit or branch?
+
+    'FAILED - do not merge' means exactly that. 'no runs yet' usually means CI
+    has not started - wait ten seconds and ask again.
+    """
+    return json.dumps(_gh().checks_for(repo, ref), indent=2)
