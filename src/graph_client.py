@@ -36,6 +36,7 @@ Without that policy this app can read Andrew's mail, and everyone else's.
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import os
 import threading
@@ -496,6 +497,120 @@ class GraphClient:
                 "size": item.get("size"), "was_folder": "folder" in item,
                 "deleted": True}
 
+    def delete_items(self, paths, root: str = "", drive: str = "",
+                     allow_folder: bool = False) -> list[dict]:
+        """Delete several files in ONE call. Never stops at the first problem.
+
+        Added 5 September 2026. Deleting page by page meant one approval prompt
+        per file, and a run clearing seven timesheet fragments sat waiting on
+        seven separate clicks - one of which was for a file an earlier click had
+        already removed. That stall is the reason this exists.
+
+        A MISSING FILE IS NOT A FAILURE. Graph 404s on a path that is already
+        gone, and "already gone" is the outcome the caller wanted. It is
+        reported as `absent` and the batch carries on.
+
+        Every path is judged on its own. A folder refusal or a bad path stops
+        that one path and nothing else, so a typo in the fourth entry cannot
+        cost the other six.
+        """
+        out: list[dict] = []
+        for raw in paths:
+            p = str(raw or "").strip()
+            if not p:
+                continue
+            try:
+                d = self.delete_item(p, root=root, drive=drive,
+                                     allow_folder=allow_folder)
+                out.append({"path": d["path"], "status": "deleted",
+                            "size": d.get("size"), "detail": ""})
+            except requests.HTTPError as e:
+                code = getattr(getattr(e, "response", None), "status_code", 0)
+                if code == 404:
+                    out.append({"path": p, "status": "absent", "size": None,
+                                "detail": "not there - nothing to do"})
+                else:
+                    out.append({"path": p, "status": "failed", "size": None,
+                                "detail": str(e)[:200]})
+            except Exception as e:  # noqa: BLE001
+                out.append({"path": p, "status": "refused", "size": None,
+                            "detail": str(e)[:200]})
+        return out
+
+    def folder_digests(self, folder: str, root: str = "",
+                       drive: str = "") -> list[dict]:
+        """Every file in one folder with a content digest, for finding repeats.
+
+        Same size is not the same file, so size alone can never be the test -
+        it is only the cheap filter that says which files are worth reading.
+        Files whose size is unique in the folder cannot have a twin and are
+        never downloaded.
+
+        Graph carries `file.hashes.quickXorHash` on OneDrive for Business
+        items, so most of the time nothing is downloaded at all. Where the
+        annotation is absent the bytes are read and hashed here, and the two
+        never get compared against each other - a digest is only ever matched
+        against another digest of the same kind.
+        """
+        items = [it for it in self.list_children(folder, root=root, drive=drive)
+                 if "folder" not in it]
+        by_size: dict[int, int] = {}
+        for it in items:
+            by_size[int(it.get("size") or 0)] = by_size.get(int(it.get("size") or 0), 0) + 1
+
+        base = f"{root}/{folder}".strip("/") if root else folder.strip("/")
+        out: list[dict] = []
+        for it in items:
+            size = int(it.get("size") or 0)
+            rel = it.get("path") or it.get("name")
+            row = {"name": it.get("name"), "path": f"{base}/{rel}".strip("/"),
+                   "size": size, "digest": "", "kind": ""}
+            if by_size.get(size, 0) > 1:
+                qx = (((it.get("file") or {}).get("hashes") or {})
+                      .get("quickXorHash"))
+                if qx:
+                    row["digest"], row["kind"] = str(qx), "quickXor"
+                else:
+                    blob = self.download(rel, root=base, drive=drive)
+                    row["digest"] = hashlib.sha256(blob).hexdigest()
+                    row["kind"] = "sha256"
+            out.append(row)
+        return out
+
+    def find_identical(self, folder: str, blob: bytes, root: str = "",
+                       drive: str = "", listing: list[dict] | None = None) -> str:
+        """The path of an existing file in FOLDER with exactly these bytes.
+
+        Used before writing, so a repeat is never created in the first place.
+        Contractors' inline timesheet images come back a second time inside a
+        reply that quotes the original mail; both copies are real attachments on
+        real messages, they get different part numbers, and nothing downstream
+        can tell that two of the seven pages are the same page twice.
+
+        Only files of exactly the same length are read, and the comparison is
+        the bytes themselves rather than a digest - at one candidate per call
+        there is nothing to be gained by hashing, and a byte comparison cannot
+        be wrong.
+        """
+        try:
+            items = listing if listing is not None else self.list_children(
+                folder, root=root, drive=drive)
+        except Exception:  # noqa: BLE001
+            # A folder that does not exist yet holds nothing to collide with.
+            return ""
+        base = f"{root}/{folder}".strip("/") if root else folder.strip("/")
+        n = len(blob)
+        for it in items:
+            if "folder" in it or int(it.get("size") or 0) != n:
+                continue
+            rel = it.get("path") or it.get("name")
+            try:
+                if self.download(rel, root=base, drive=drive) == blob:
+                    return f"{base}/{rel}".strip("/")
+            except Exception:  # noqa: BLE001
+                continue
+        return ""
+
     def upload(self, relative_path: str, content: bytes, root: str = "Contractors/Timesheets") -> dict:
         """Write bytes to OneDrive under `root`, creating folders as needed.
 
@@ -595,10 +710,16 @@ class GraphClient:
 
         return walk(full)
 
-    def download(self, relative_path: str, root: str = "Contractors/Timesheets") -> bytes:
-        """Read a filed document back out of OneDrive."""
+    def download(self, relative_path: str, root: str = "Contractors/Timesheets",
+                 drive: str = "") -> bytes:
+        """Read a filed document back out of OneDrive.
+
+        DRIVE added 5 Sep 2026 alongside the dedupe tools - without it every
+        read was pinned to Andrew's own OneDrive, so a repeat sitting in the
+        team library could be listed but never opened.
+        """
         path = f"{root}/{relative_path}".strip("/")
-        url = f"{GRAPH}/drives/{self._drive_id()}/root:/{quote(path)}:/content"
+        url = f"{GRAPH}/drives/{self._drive_id(drive)}/root:/{quote(path)}:/content"
         return self._request("GET", url).content
 
     def message_body(self, message_id: str) -> str:

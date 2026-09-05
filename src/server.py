@@ -995,6 +995,15 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
             contractors file into the CURRENT FORTNIGHT folder alongside
             everyone else - Andrew's decision, 2 Sep 2026 - so 'all' is the
             normal way to run this and the other two are for narrowing down.
+
+    REPEATS ARE NOT FILED (5 Sep 2026). A page is compared on its bytes against
+    what is already in the destination folder before it is written. When
+    somebody replies to a timesheet mail the client quotes the original, and
+    every inline image arrives a second time as a real attachment on a real
+    message - filed under a new part number, and identical to a page already
+    there. Prasanthi Dharanikota's fortnight ending 30 August 2026 held seven
+    pages of which two were a page twice. They are reported, not written.
+    Folders that already hold repeats are cleaned with onedrive_dedupe.
     """
     from datetime import timedelta
     from . import mail_mappers as mmap
@@ -1131,13 +1140,45 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
         return "\n".join(head)
 
     written, skipped, failed = [], [], []
+    # A page that arrives twice is filed twice. The second copy comes back
+    # inside a reply that quotes the original mail - a real attachment on a real
+    # message, given its own part number, indistinguishable by name from a page
+    # nobody has seen. Compared on bytes before writing, so the repeat is never
+    # created rather than cleaned up afterwards. Same-length files only; at most
+    # one folder listing per contractor.
+    repeats: list[tuple[str, str]] = []
+    seen_bytes: dict[str, list[tuple[int, bytes, str]]] = {}
+    listings: dict[str, list[dict]] = {}
     for f in plan["files"]:
         try:
             if g.exists(f["path"]):
                 skipped.append(f["path"])
                 continue
             blob = g.attachment_bytes(f["message_id"], f["attachment_id"])
+
+            folder = f["path"].rsplit("/", 1)[0]
+            twin = ""
+            for size, other, where in seen_bytes.get(folder, []):
+                if size == len(blob) and other == blob:
+                    twin = where
+                    break
+            if not twin:
+                if folder not in listings:
+                    try:
+                        listings[folder] = g.list_children(
+                            folder, root="Contractors/Timesheets")
+                    except Exception:                         # noqa: BLE001
+                        listings[folder] = []
+                twin = g.find_identical(folder, blob,
+                                        root="Contractors/Timesheets",
+                                        listing=listings[folder])
+            if twin:
+                repeats.append((f["path"], twin.rsplit("/", 1)[-1]))
+                continue
+
             g.upload(f["path"], blob)
+            seen_bytes.setdefault(folder, []).append(
+                (len(blob), blob, f["path"]))
             written.append(f["path"])
         except Exception as e:                                # noqa: BLE001
             failed.append(f"{f['path']}: {e}")
@@ -1153,7 +1194,13 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
             failed.append(f"{b['path']}: {e}")
 
     head += ["", f"Written: {len(written)}   Already there: {len(skipped)}   "
-                 f"Failed: {len(failed)}"]
+                 f"Repeats: {len(repeats)}   Failed: {len(failed)}"]
+    if repeats:
+        head.append(f"NOT FILED ({len(repeats)}) - byte-for-byte the same as a "
+                    "page already in the folder, almost always the original "
+                    "image quoted back inside a reply:")
+        for path, twin in repeats:
+            head.append(f"  {path.rsplit('/', 1)[-1]:<34} same as {twin}")
     for x in failed:
         head.append(f"  FAILED {x}")
     return "\n".join(head)
@@ -2815,14 +2862,45 @@ def onedrive_drives() -> str:
             "onedrive_list(path='', drive='site').")
 
 
+def _split_paths(raw) -> list[str]:
+    """One path, several paths one per line, or a JSON array. All the same thing.
+
+    Split on NEWLINES ONLY. A comma is a legal character in a OneDrive filename
+    and splitting on it would quietly cut a real path in half; a newline is not,
+    so it is the one separator that cannot be part of the data.
+    """
+    if isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        text = str(raw or "").strip()
+        if text.startswith("["):
+            try:
+                items = json.loads(text)
+            except Exception:  # noqa: BLE001
+                items = text.splitlines()
+        else:
+            items = text.splitlines()
+    return [str(x).strip().strip('"').strip("'") for x in items if str(x).strip()]
+
+
 @mcp.tool()
 def onedrive_delete(path: str, root: str = "", drive: str = "",
                     allow_folder: bool = False) -> str:
-    """Delete ONE file from OneDrive or SharePoint. It goes to the recycle bin.
+    """Delete one file - or a list of them - from OneDrive or SharePoint.
 
-    Added because nothing in the cloud path could delete anything, so every
-    working file a run left behind stayed for ever and had to be cleared by
-    hand. Recoverable from the recycle bin for about 93 days.
+    SEVERAL PATHS GO IN ONE CALL, one per line. That is the whole point of the
+    5 September 2026 change: deleting seven timesheet fragments used to mean
+    seven approval prompts, and a run stalled for 46 minutes on a prompt for a
+    file an earlier prompt had already removed. One call, one approval, one
+    report.
+
+        onedrive_delete("Contractors/.../PD_x_part2.png\nContractors/.../PD_x_part5.png")
+
+    A PATH THAT IS ALREADY GONE IS NOT AN ERROR. It comes back as `absent` and
+    the rest still run. Nothing aborts the batch - a typo in the fourth path
+    costs that path and no other.
+
+    Everything deleted goes to the recycle bin, recoverable for about 93 days.
 
     A FOLDER IS REFUSED unless ALLOW_FOLDER is set, because deleting one takes
     its whole contents. Do not use this on anything signed or executed - a
@@ -2831,15 +2909,106 @@ def onedrive_delete(path: str, root: str = "", drive: str = "",
 
     DRIVE works as it does on onedrive_list. Blank is Andrew's OneDrive.
     """
-    try:
-        d = _graph().delete_item(path, root=root, drive=drive,
+    paths = _split_paths(path)
+    if not paths:
+        return "FAILED: no path given. Nothing has been deleted."
+    rows = _graph().delete_items(paths, root=root, drive=drive,
                                  allow_folder=allow_folder)
+    done = [r for r in rows if r["status"] == "deleted"]
+    gone = [r for r in rows if r["status"] == "absent"]
+    bad = [r for r in rows if r["status"] in ("failed", "refused")]
+
+    if len(rows) == 1 and done:
+        d = done[0]
+        return (f"Deleted {d['path']}  ({d['size']} bytes)"
+                + (f"  [{drive}]" if drive else "")
+                + "\nIn the recycle bin, recoverable for about 93 days.")
+
+    out = [f"Deleted: {len(done)}   Already gone: {len(gone)}   "
+           f"Not deleted: {len(bad)}" + (f"   [{drive}]" if drive else "")]
+    for r in done:
+        out.append(f"  deleted   {r['path']}  ({r['size']} bytes)")
+    for r in gone:
+        out.append(f"  absent    {r['path']}  - nothing to do")
+    for r in bad:
+        out.append(f"  NOT DONE  {r['path']}")
+        out.append(f"            {r['detail']}")
+    if done:
+        out.append("In the recycle bin, recoverable for about 93 days.")
+    return "\n".join(out)
+
+
+@mcp.tool()
+def onedrive_dedupe(folder: str, root: str = "", drive: str = "",
+                    apply: bool = False) -> str:
+    """Find files in one folder that are byte-for-byte the same, and clear them.
+
+    DRY BY DEFAULT. It reports what it would keep and what it would drop, and
+    writes nothing until apply=True.
+
+    WHY. Contractors paste their timesheet pages into the body of an email. When
+    somebody replies and the mail client quotes the original, every one of those
+    images arrives a second time as a real attachment on a real message. The
+    sweep files both, under different part numbers, and the folder ends up
+    holding seven pages of which two are a page twice. Nothing downstream can
+    see it: the names differ, the sizes are buried, and the pages are only
+    identical if you open them.
+
+    Prasanthi Dharanikota's fortnight ending 30 August 2026 is the case this was
+    written for - part4 and part6 were the same page, and the clean-up was being
+    done a file at a time through an approval prompt.
+
+    WHAT IT KEEPS. The first copy by name, which for `_partN` files is the
+    lowest part number - the one that arrived on the original mail rather than
+    in the quoted reply. Only exact byte matches are ever touched; a page that
+    merely looks similar is left alone.
+
+    This is the tidy-up for folders that already hold repeats. The sweep no
+    longer creates them - see sweep_timesheets.
+    """
+    try:
+        rows = _graph().folder_digests(folder, root=root, drive=drive)
     except Exception as e:  # noqa: BLE001
         return f"FAILED: {e}"
-    kind = "folder" if d["was_folder"] else "file"
-    return (f"Deleted {kind} {d['path']}  ({d['size']} bytes)"
-            + (f"  [{drive}]" if drive else "")
-            + "\nIn the recycle bin, recoverable for about 93 days.")
+    if not rows:
+        return f"{folder} - no files. Nothing to do."
+
+    groups: dict[tuple, list[dict]] = {}
+    for r in sorted(rows, key=lambda x: str(x["name"])):
+        if not r["digest"]:
+            continue
+        groups.setdefault((r["kind"], r["digest"], r["size"]), []).append(r)
+
+    dupes = {k: v for k, v in groups.items() if len(v) > 1}
+    head = [f"{folder}" + (f"   [{drive}]" if drive else ""),
+            f"{len(rows)} files, {len(dupes)} set(s) of identical copies."]
+    if not dupes:
+        head.append("Nothing is duplicated. Nothing to do.")
+        return "\n".join(head)
+
+    drop: list[str] = []
+    for _k, v in sorted(dupes.items(), key=lambda kv: str(kv[1][0]["name"])):
+        head.append("")
+        head.append(f"  KEEP  {v[0]['name']}  ({v[0]['size']} bytes)")
+        for r in v[1:]:
+            head.append(f"  DROP  {r['name']}  - identical to {v[0]['name']}")
+            drop.append(r["path"])
+
+    if not apply:
+        head += ["", f"Nothing was deleted. Re-run with apply=True to remove "
+                     f"the {len(drop)} copy(ies) above."]
+        return "\n".join(head)
+
+    res = _graph().delete_items(drop, drive=drive)
+    done = [r for r in res if r["status"] == "deleted"]
+    gone = [r for r in res if r["status"] == "absent"]
+    bad = [r for r in res if r["status"] not in ("deleted", "absent")]
+    head += ["", f"Deleted: {len(done)}   Already gone: {len(gone)}   "
+                 f"Not deleted: {len(bad)}"]
+    for r in bad:
+        head.append(f"  NOT DONE  {r['path']}: {r['detail']}")
+    head.append("In the recycle bin, recoverable for about 93 days.")
+    return "\n".join(head)
 
 
 
