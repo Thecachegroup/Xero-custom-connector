@@ -318,3 +318,5 @@ against someone else's bill, which is not.
 
 `plan_filing()` decides everything **before** a byte is written, so the plan can be
 checked against what you expect rather than audited afterwards.
+
+<!-- connector self-test 05/09/2026 - safe to remove -->
