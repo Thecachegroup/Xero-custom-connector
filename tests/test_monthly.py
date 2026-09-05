@@ -41,14 +41,15 @@ def test_cadence_is_read_from_the_real_overrides_file():
     assert S._is_monthly("nobody at all") is False, "default is fortnightly"
 
 
-def test_an_offset_monthly_invoice_gets_its_own_cycle_reference(monkeypatch):
-    """Andrew, 3 Sep: "the twelfth of August to the eleventh of September
-    would be what you put in her reference." Never the fortnight range."""
-    out = _fill(monkeypatch,
-                [_inv("TCG-21207", "Linfox - PD", "Prasanthi Dharanikota  August Year]")],
-                "Linfox - PD: 22")
-    assert "12 August to 11 September 2026" in out
-    assert "17 August to 30 August 2026" not in out, "the fortnight range must not land"
+def test_an_offset_monthly_invoice_gets_its_own_cycle_reference():
+    """The OFFSET MACHINERY, tested on its own rather than on a live person -
+    which is what broke when Prasanthi turned out to be calendar month. A
+    cycle that turns over on the 12th describes itself as the 12th to the 11th,
+    never as the fortnight range."""
+    from datetime import date
+    from src import writes as w
+    assert w.monthly_reference(date(2026, 8, 30), 12) == "12 August to 11 September 2026"
+    assert "17 August to 30 August 2026" != w.monthly_reference(date(2026, 8, 30), 12)
 
 
 def test_a_calendar_month_person_is_left_alone(monkeypatch):
@@ -74,10 +75,17 @@ def test_the_days_are_still_filled_for_a_monthly_person(monkeypatch):
     assert "8030" in out.replace(",", "")
 
 
-def test_prasanthis_cycle_day_is_on_file():
-    """Her month runs the 12th to the 11th. Anything counting her days or
-    writing her reference has to read this rather than assume a month."""
-    assert roster.load_overrides()["Linfox - PD"]["period_day"] == 12
+def test_no_monthly_person_is_offset_unless_it_is_deliberate():
+    """Prasanthi CARRIED period_day 12 until 5 September 2026, on a reading of
+    "she bills on the 12th" as a 12th-to-11th CYCLE. It is a SEND day. Eight
+    PRAVID bills from January to August are all referenced "<Month> <Year>" and
+    dated the 1st of the following month, and her timesheets run 2-31 August
+    with no part-weeks. Left set, her window started 12 August and an invoice
+    stating 1 August was refused. An offset is a real thing and the machinery
+    below still supports it - but it has to be evidenced, not inferred from
+    when somebody presses send."""
+    ov = roster.load_overrides()
+    assert "period_day" not in ov.get("Linfox - PD", {})
 
 
 def test_the_offset_cycle_is_the_one_containing_period_end():

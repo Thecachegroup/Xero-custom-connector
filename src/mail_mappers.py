@@ -41,9 +41,42 @@ _EXPENSE_HINTS = ("expense", "receipt", "reimburse")
 # Onboarding paperwork. Arrives in the same mailbox but is NOT period paperwork -
 # a passport does not belong in a fortnight folder, and filing one there once
 # means it is copied forward every fortnight afterwards.
+# ONBOARDING PAPERWORK, not money. Matched as WHOLE WORDS - see _has_hint().
+#
+# SUBSTRING MATCHING SILENTLY ATE AN INVOICE. Prasanthi Dharanikota's August
+# 2026 invoice is named "Indian_Contractor_... Invoice.pdf". "contract" sits
+# inside "Contractor", so classify() returned "admin" and the sweep dropped it
+# before the invoice test ever ran - and an admin file is not filed and not
+# reported, so it appeared in no list at all. Found 5 September 2026 only
+# because Andrew knew the invoice existed. "id " was as bad: it matches inside
+# "Pravid Technologies". Anyone whose filename says Contractor, Contractors,
+# subcontractor or contracting loses their invoice the same way.
 _ADMIN_HINTS = ("passport", "banking", "bank detail", "super choice", "tfn",
                 "declaration", "contract", "handbook", "licence", "license",
-                "visa", "id ", "identification")
+                "visa", "id", "identification")
+
+
+def _has_hint(name: str, hints: tuple[str, ...]) -> bool:
+    """Is any hint present as a WHOLE WORD (or whole phrase) in NAME.
+
+    Word characters are letters and digits; every other character is a
+    separator, so "indian_contractor" splits on the underscore and yields
+    "contractor", which is not "contract". A multi-word hint like "bank detail"
+    is matched against the same normalised text.
+    """
+    words = re.split(r"[^a-z0-9]+", str(name or "").lower())
+    text = " ".join(w for w in words if w)
+    have = set(words)
+    for h in hints:
+        h = h.strip().lower()
+        if not h:
+            continue
+        if " " in h:
+            if h in text:
+                return True
+        elif h in have:
+            return True
+    return False
 
 
 def load_contractors(path: str | None = None) -> list[dict]:
@@ -377,7 +410,7 @@ def classify(filename: str, content_type: str = "", is_inline: bool = False,
             and not any(h in name for h in _TIMESHEET_STRONG)):
         return "signature"
 
-    if any(h in name for h in _ADMIN_HINTS):
+    if _has_hint(name, _ADMIN_HINTS):
         return "admin"
     if any(h in name for h in _TIMESHEET_STRONG):
         return "timesheet"

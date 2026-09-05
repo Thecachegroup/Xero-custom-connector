@@ -742,3 +742,46 @@ def test_the_window_must_stay_under_a_fortnight():
     prior_billing_monday = date(2026, 8, 17)
     assert prior_billing_monday < period_end - timedelta(days=10)
     assert not (prior_billing_monday < period_end - timedelta(days=14))
+
+
+# ---------------------------------------------------------------------------
+# ADMIN HINTS MATCH WORDS, NOT SUBSTRINGS - 5 September 2026.
+#
+# Prasanthi Dharanikota's invoice is named
+# "Indian_Contractor_Prasanthi Dharanikota of Pravid Technologies_Apr 2026
+# Invoice.pdf". "contract" sits inside "Contractor" and "id " inside "Pravid ",
+# so classify() returned "admin" and the sweep dropped the file before the
+# invoice test ever ran. An admin file is neither filed nor reported, so it
+# appeared in NO list - it simply vanished, every run, for months.
+# ---------------------------------------------------------------------------
+INV = ("Indian_Contractor_Prasanthi Dharanikota of Pravid Technologies_"
+       "Apr 2026 Invoice.pdf")
+
+
+def test_the_invoice_that_vanished_is_an_invoice():
+    assert mm.classify(INV, "application/pdf", False, "Invoice - Aug 2026",
+                       False, 105400) == "invoice"
+
+
+def test_contractor_is_not_contract():
+    for n in ("Contractor Invoice.pdf", "subcontractor invoice.pdf",
+              "contracting-services-invoice.pdf", "CONTRACTORS_invoice.pdf"):
+        assert mm.classify(n, "application/pdf") == "invoice", n
+
+
+def test_real_onboarding_paperwork_is_still_admin():
+    for n in ("signed contract.pdf", "Contract - Devinia Liddelow.docx",
+              "TFN declaration.pdf", "passport.jpg", "super choice form.pdf",
+              "drivers licence.png", "bank details.pdf"):
+        assert mm.classify(n, "application/pdf") == "admin", n
+
+
+def test_a_hyphen_or_underscore_still_separates_words():
+    assert mm.classify("employment_contract_2026.pdf", "application/pdf") == "admin"
+    assert mm.classify("employment-contract.pdf", "application/pdf") == "admin"
+
+
+def test_id_no_longer_matches_inside_another_word():
+    assert mm.classify("Pravid Technologies invoice.pdf",
+                       "application/pdf") == "invoice"
+    assert mm.classify("photo id.jpg", "image/jpeg") == "admin"

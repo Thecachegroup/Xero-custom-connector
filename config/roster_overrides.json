@@ -75,8 +75,7 @@
       "emails": [
         "prasanthidharanikota362@gmail.com"
       ],
-      "period_day": 12,
-      "_why": "Prasanthi's cycle runs the 12th of the preceding month to the 11th of the current one, not the calendar month - Andrew, 3 Sep 2026. She is the ONLY offset person; Bhasker, Deepti and Vivek are calendar month."
+      "_why": "MONTHLY, CALENDAR MONTH, invoiced in arrears around the 12th. period_day was set to 12 on 3 Sep 2026 reading 'she bills on the 12th' as a 12th-to-11th CYCLE. Every piece of evidence says otherwise: eight PRAVID bills from January to August 2026 are all referenced '<Month> <Year>' and dated the 1st of the following month, and her August timesheets run 2 to 31 August with no part-weeks at either end. The 12th is when she SENDS, not when her period turns over. Left as an offset cycle, her window would have started 12 August and an invoice stating 1 August would have been refused. CONSEQUENCE TO WATCH: sending on the 12th means her invoice usually misses the sweep that closes the month and is picked up by the following fortnight's instead."
     },
     "Linfox - VKC": {
       "name": "Vivek Kumar Choudhary",
