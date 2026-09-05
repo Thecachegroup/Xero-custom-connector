@@ -336,8 +336,17 @@ class GraphClient:
         not be found was assumed missing when it was simply on a drive nothing
         was looking at. A user with no provisioned OneDrive is skipped rather
         than raised, so one unlicensed account cannot blind the whole listing.
+
+        THE TWO DRIVES THAT MATTER ARE LISTED WITHOUT ENUMERATING THE TENANT.
+        The team site and the files owner's own OneDrive each resolve from a
+        single known URL. Only the "everybody else" part needs GET /users,
+        which is a directory read and a separate consent - so on 5 September
+        2026, with Files.ReadWrite.All granted but User.Read.All not, the whole
+        listing died on a 403 and reported nothing, including the two drives it
+        had already found. Each section now fails on its own.
         """
         out: list[dict] = []
+
         try:
             d = self.get(f"{GRAPH}/sites/{self.sp_host}/drive")
             out.append({"target": "site", "kind": "SharePoint site",
@@ -347,12 +356,33 @@ class GraphClient:
             out.append({"target": "site", "kind": "SharePoint site",
                         "name": f"UNREACHABLE: {e}", "id": "", "web_url": ""})
 
-        for u in self.get_all(f"{GRAPH}/users",
-                              {"$select": "displayName,mail,userPrincipalName",
-                               "$top": "100"}):
+        owner = (self.files_owner or "").strip()
+        if owner:
+            try:
+                d = self.get(f"{GRAPH}/users/{quote(owner)}/drive")
+                out.append({"target": "", "kind": "OneDrive (default)",
+                            "name": owner, "id": d.get("id"),
+                            "web_url": d.get("webUrl")})
+            except Exception as e:  # noqa: BLE001
+                out.append({"target": "", "kind": "OneDrive (default)",
+                            "name": f"UNREACHABLE: {e}", "id": "",
+                            "web_url": ""})
+
+        try:
+            users = self.get_all(f"{GRAPH}/users",
+                                 {"$select": "displayName,mail,userPrincipalName",
+                                  "$top": "100"})
+        except Exception as e:  # noqa: BLE001
+            # A directory read, not a files read. Say which permission it wants
+            # rather than leaving a bare 403 to be diagnosed twice.
+            out.append({"target": "-", "kind": "other users",
+                        "name": f"UNAVAILABLE: {e}", "id": "", "web_url": ""})
+            return out
+
+        for u in users:
             who = u.get("mail") or u.get("userPrincipalName")
-            if not who:
-                continue
+            if not who or who.lower() == owner.lower():
+                continue          # the owner is already listed, as the default
             try:
                 d = self.get(f"{GRAPH}/users/{quote(who)}/drive")
             except Exception:  # noqa: BLE001
@@ -361,6 +391,73 @@ class GraphClient:
                         "name": u.get("displayName") or who,
                         "id": d.get("id"), "web_url": d.get("webUrl")})
         return out
+
+    def move_item(self, relative_path: str, dest_folder: str, root: str = "",
+                  drive: str = "", new_name: str = "") -> dict:
+        """Move one file or folder to another folder on the SAME drive.
+
+        Added 6 September 2026. Until then the cloud path could write and it
+        could delete, but it could not move, so filing a finished package away
+        from a working folder meant going through the laptop - a folder grant,
+        a sync wait, and a second copy of the truth. Graph moves by PATCHing
+        parentReference, which keeps the item id, so existing share links and
+        resource URIs survive.
+
+        DEST_FOLDER is a folder path relative to the drive root; blank means
+        the drive root itself. NEW_NAME optionally renames in the same call.
+
+        The drive root cannot be moved, the destination must be a folder, and a
+        folder cannot be moved inside itself. Graph refuses a name that already
+        exists at the destination rather than overwriting, and that refusal is
+        passed straight through - nothing here silently replaces a file.
+
+        Cross-drive is not supported by this operation and is not faked with a
+        copy-then-delete: a half-finished copy that has already deleted the
+        original is the one failure mode worth designing out.
+        """
+        raw = f"{root}/{relative_path}" if root else relative_path
+        path = raw.strip().strip("/").strip()
+        if not path:
+            raise RuntimeError(
+                "Refusing to move the drive root. Nothing has been moved."
+            )
+        dest = (dest_folder or "").strip().strip("/").strip()
+
+        # A folder cannot become its own descendant. Graph reports this as a
+        # generic 400, which reads like a bad path rather than a bad idea.
+        if dest == path or dest.startswith(path + "/"):
+            raise RuntimeError(
+                f"{dest!r} is inside {path!r}. A folder cannot be moved into "
+                "itself. Nothing has been moved."
+            )
+
+        did = self._drive_id(drive)
+        item = self.get(f"{GRAPH}/drives/{did}/root:/{quote(path)}",
+                        {"$select": "id,name,size,folder"})
+
+        if dest:
+            parent = self.get(f"{GRAPH}/drives/{did}/root:/{quote(dest)}",
+                              {"$select": "id,name,folder"})
+            # Presence, not truthiness - Graph sends {"childCount": 0} for an
+            # empty folder, which is falsy.
+            if "folder" not in parent:
+                raise RuntimeError(
+                    f"{dest!r} is a file, not a folder. Nothing has been moved."
+                )
+        else:
+            parent = self.get(f"{GRAPH}/drives/{did}/root", {"$select": "id"})
+
+        body: dict[str, Any] = {"parentReference": {"id": parent["id"]}}
+        if new_name:
+            body["name"] = new_name
+        self._request("PATCH", f"{GRAPH}/drives/{did}/items/{item['id']}",
+                      json=body)
+
+        name = new_name or item.get("name")
+        return {"path": path, "name": name, "size": item.get("size"),
+                "was_folder": "folder" in item,
+                "dest": f"{dest}/{name}" if dest else name,
+                "renamed": bool(new_name), "moved": True}
 
     def delete_item(self, relative_path: str, root: str = "",
                     drive: str = "", allow_folder: bool = False) -> dict:

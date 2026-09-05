@@ -2785,7 +2785,24 @@ def onedrive_drives() -> str:
     rows = ["| Target | Kind | Name | Web URL |", "|:--|:--|:--|:--|"]
     for d in drives:
         rows.append(f"| `{d['target']}` | {d['kind']} | {d['name']} | {d['web_url']} |")
-    return (f"{len(drives)} drives reachable\n\n" + "\n".join(rows) +
+
+    # A partial answer is still an answer. Say plainly which part is missing and
+    # what grants it, rather than leaving a 403 to be diagnosed a second time.
+    bad = [d for d in drives if str(d.get("name", "")).startswith(
+        ("UNREACHABLE:", "UNAVAILABLE:"))]
+    good = len(drives) - len(bad)
+    note = ""
+    if any(d.get("target") == "-" for d in bad):
+        note = ("\n\nOther people's drives could not be listed. Enumerating "
+                "them reads the DIRECTORY, not files, so Files.ReadWrite.All "
+                "does not cover it - the app registration also needs "
+                "`User.Read.All` (application) with admin consent. Naming a "
+                "drive directly still works without it, e.g. "
+                "onedrive_list(path='', drive='matt@thecachegroup.com.au').")
+
+    return (f"{good} drives reachable"
+            + (f", {len(bad)} listing(s) failed" if bad else "")
+            + "\n\n" + "\n".join(rows) + note +
             "\n\nPass the target as `drive`, e.g. "
             "onedrive_list(path='', drive='site').")
 
@@ -2815,3 +2832,36 @@ def onedrive_delete(path: str, root: str = "", drive: str = "",
     return (f"Deleted {kind} {d['path']}  ({d['size']} bytes)"
             + (f"  [{drive}]" if drive else "")
             + "\nIn the recycle bin, recoverable for about 93 days.")
+
+
+
+@mcp.tool()
+def onedrive_move(path: str, dest_folder: str = "", root: str = "",
+                  drive: str = "", new_name: str = "") -> str:
+    """Move ONE file or folder to another folder on the same drive.
+
+    Added because the cloud path could write and delete but not move, so
+    filing a finished package away - a deployed connector zip out of
+    `_PENDING UPLOAD` and into `_deployed` - had to go through the laptop.
+    The item keeps its id, so share links and resource URIs survive the move.
+
+    DEST_FOLDER is a folder path from the drive root; blank moves it to the
+    root. NEW_NAME renames it in the same call.
+
+    Graph refuses rather than overwrites when the destination already holds
+    that name, and the refusal is passed straight through. Moving between
+    drives is not supported - move within a drive, or copy and check before
+    deleting anything.
+
+    DRIVE works as it does on onedrive_list. Blank is Andrew's OneDrive.
+    """
+    try:
+        d = _graph().move_item(path, dest_folder, root=root, drive=drive,
+                               new_name=new_name)
+    except Exception as e:  # noqa: BLE001
+        return f"FAILED: {e}"
+    kind = "folder" if d["was_folder"] else "file"
+    where = d["dest"] if dest_folder else f"the drive root as {d['name']}"
+    return (f"Moved {kind} {d['path']} -> {where}"
+            + ("  (renamed)" if d["renamed"] else "")
+            + (f"  [{drive}]" if drive else ""))
