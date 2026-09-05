@@ -557,8 +557,73 @@ def stated_dates(text: str, year_hint: int) -> list[date]:
     return out
 
 
+def _last_of_month(year: int, month: int) -> date:
+    return date(year + (month == 12), (month % 12) + 1, 1) - timedelta(days=1)
+
+
+def _month_back(year: int, month: int, n: int = 1) -> tuple[int, int]:
+    i = (year * 12 + month - 1) - n
+    return i // 12, i % 12 + 1
+
+
+def monthly_span(period_end: date | str, grace_days: int = 10,
+                 period_day: int | None = None) -> tuple[date, date]:
+    """The cycle a MONTHLY contractor's paperwork belongs to.
+
+    THIS FIXES A LIVE DEFECT, found 5 September 2026. Every document was judged
+    against the FORTNIGHT window. A monthly invoice states a calendar month,
+    which cannot fit inside a fortnight, so it failed the test on every single
+    run and was never filed - while the same person's WEEKLY timesheets passed
+    and filed normally. Prasanthi Dharanikota's four August timesheets were
+    filed and her August invoice was refused; her sales draft TCG-21207 and her
+    PRAVID bill both sat at zero and August went unbilled on both sides.
+
+    The cycle is the one ENDING on or before the end of the run window - so the
+    30 August fortnight, whose window runs to 9 September, picks up AUGUST.
+    Anything stated from the start of that cycle to the end of the window is in.
+    Bounding it at the cycle START is what stops the previous month's paperwork
+    being swept in behind it, which is the failure period_window() was written
+    to prevent for fortnightly people.
+
+    PERIOD_DAY handles an OFFSET cycle. Prasanthi runs the 12th of one month to
+    the 11th of the next - Andrew, 3 Sep 2026 - so her cycle ends the day BEFORE
+    period_day. She is the only offset person; Bhasker, Deepti and Vivek are all
+    calendar month, which is period_day unset.
+    """
+    end = period_end if isinstance(period_end, date) else date.fromisoformat(str(period_end))
+    anchor = end + timedelta(days=grace_days)
+    day = int(period_day or 0)
+    if day > 1:
+        day = min(day, 28)          # a cycle day past the 28th has no February
+        y, m = anchor.year, anchor.month
+        if date(y, m, day) - timedelta(days=1) > anchor:
+            y, m = _month_back(y, m)
+        sy, sm = _month_back(y, m)
+        return date(sy, sm, day), anchor
+    y, m = anchor.year, anchor.month
+    if _last_of_month(y, m) > anchor:
+        y, m = _month_back(y, m)
+    return date(y, m, 1), anchor
+
+
+def contractor_span(contractor: dict, period_end: date | str,
+                    grace_days: int = 10) -> tuple[date, date]:
+    """The period window to judge ONE person's documents against.
+
+    The cadence belongs to the person, not to the run. Deriving the window from
+    the run alone is what refused every monthly invoice ever sent - see
+    monthly_span(). Any future cadence breaks the same way until this is asked
+    per person.
+    """
+    end = period_end if isinstance(period_end, date) else date.fromisoformat(str(period_end))
+    if str((contractor or {}).get("cadence", "")).strip().lower() == "monthly":
+        return monthly_span(end, grace_days, (contractor or {}).get("period_day"))
+    return end - timedelta(days=13), end + timedelta(days=grace_days)
+
+
 def period_verdict(text: str, period_end: date, grace_days: int = 10,
-                   not_after: date | None = None) -> str:
+                   not_after: date | None = None,
+                   span: tuple[date, date] | None = None) -> str:
     """'in' | 'out' | 'unknown' - what the document itself says about its period.
 
     'unknown' means no date was stated and the caller should fall back to the
@@ -573,17 +638,16 @@ def period_verdict(text: str, period_end: date, grace_days: int = 10,
     it was for the same period as the invoice beside it; read as a period date
     it was thrown out of its own fortnight.
     """
-    start = period_end - timedelta(days=13)
+    start, stop = span if span else (period_end - timedelta(days=13),
+                                     period_end + timedelta(days=grace_days))
     found = stated_dates(text, period_end.year)
     if not_after is not None:
         found = [d for d in found if d <= not_after]
     if not found:
         return "unknown"
-    if any(start <= d <= period_end for d in found):
-        return "in"
-    # Dates stated, none in this fortnight. Allow the pay week itself - an
-    # invoice dated the Monday after still belongs to the period it covers.
-    if any(period_end < d <= period_end + timedelta(days=grace_days) for d in found):
+    # STOP runs past the period end on purpose: an invoice dated the Monday
+    # after still belongs to the period it covers.
+    if any(start <= d <= stop for d in found):
         return "in"
     return "out"
 
@@ -773,6 +837,12 @@ def plan_filing(messages: list[dict], period_end: date | str,
         recv = _as_date(msg.get("received"))
         end_d = period_end if isinstance(period_end, date) else date.fromisoformat(str(period_end))
 
+        # The window is the PERSON'S, not the run's. A monthly contractor's
+        # invoice states a month and can never fit a fortnight; judging it
+        # against one refused every monthly invoice ever sent.
+        p_lo, p_hi = contractor_span(who, end_d, grace_days)
+        monthly = (p_lo, p_hi) != (lo, hi)
+
         # What the document SAYS beats when it arrived. Only fall back to the
         # received date when nothing states a period.
         #
@@ -786,9 +856,9 @@ def plan_filing(messages: list[dict], period_end: date | str,
         subject = str(msg.get("subject", "") or "")
         names = " ".join(str(a.get("name", "")) for a in msg.get("attachments", []) or [])
         msg_verdict = period_verdict(f"{subject} {names}", end_d, grace_days,
-                                     not_after=recv)
+                                     not_after=recv, span=(p_lo, p_hi))
         if msg_verdict == "unknown":
-            msg_verdict = "in" if (recv and lo <= recv <= hi) else "out"
+            msg_verdict = "in" if (recv and p_lo <= recv <= p_hi) else "out"
 
         # Does this message carry an invoice as a real, named document? If so its
         # unnamed images are the timesheets behind it. Judged on the filename
@@ -834,7 +904,7 @@ def plan_filing(messages: list[dict], period_end: date | str,
 
             name = str(a.get("name", "") or "")
             verdict = period_verdict(f"{subject} {name}", end_d, grace_days,
-                                     not_after=recv)
+                                     not_after=recv, span=(p_lo, p_hi))
             if verdict == "unknown":
                 verdict = msg_verdict
             if verdict == "out":
@@ -845,7 +915,10 @@ def plan_filing(messages: list[dict], period_end: date | str,
                     "received": recv.isoformat() if recv else "",
                     "stated": ", ".join(d.isoformat() for d in
                                         stated_dates(f"{subject} {name}", end_d.year)[:4]),
-                    "reason": "stated period is a different fortnight",
+                    "reason": ("stated period is outside "
+                               f"{p_lo} to {p_hi}"
+                               + (" (monthly cycle)" if monthly else " (fortnight)")),
+                    "window": f"{p_lo} to {p_hi}",
                 })
                 continue
 

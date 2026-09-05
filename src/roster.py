@@ -209,7 +209,22 @@ def build(items: Iterable[dict], employees: Iterable[dict],
             continue
         name = str(ov.get("name") or entry["name"] or "").strip()
         entry["name"] = name
-        entry["cadence"] = str(ov.get("cadence") or "fortnightly").lower()
+        # CADENCE CAN BE SPLIT. Peter Small is billed fortnightly and invoiced
+        # monthly, so his override carries a dict. str() on a dict produced
+        # "{'sales': 'monthly', ...}", which matched neither cadence and made
+        # in_scope() unable to place him at all. What HE sends is his own
+        # invoice - the bill side - so that is the side the sweep reads.
+        cad = ov.get("cadence") or "fortnightly"
+        if isinstance(cad, dict):
+            cad = cad.get("bills") or cad.get("sales") or "fortnightly"
+        entry["cadence"] = str(cad).lower()
+        # The day a MONTHLY cycle turns over, where it is offset from the
+        # calendar month. Prasanthi runs the 12th to the 11th. Without this on
+        # the roster entry the sweep cannot judge her documents at all.
+        try:
+            entry["period_day"] = int(ov["period_day"])
+        except (KeyError, TypeError, ValueError):
+            entry["period_day"] = None
         entry["kind"] = str(ov.get("kind") or entry["kind"]).upper()
         entry["folder"] = ov.get("folder") or f"{client_of(code)}_{name}"
         entry["emails"] = _emails(*entry["emails"], *(ov.get("emails") or []))

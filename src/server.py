@@ -1092,10 +1092,18 @@ def sweep_timesheets(period_end: str, dry_run: bool = True, lookback_days: int =
                         f"{str(b['subject'])[:40]:<42} -> {b['path'].rsplit('/', 1)[-1]}")
 
     if plan.get("out_of_period"):
-        head += ["", f"OUTSIDE THIS FORTNIGHT ({len(plan['out_of_period'])}) - received "
-                     f"outside {lo} to {hi}, NOT filed:"]
+        # The heading used to read "received outside <window>", which was wrong
+        # far more often than it was right: the reason is almost always the
+        # period the document STATES, and the message itself arrived inside the
+        # window. Six were reported that way on 5 Sep 2026, all received on the
+        # 31st, well inside it - which is exactly what hid the monthly defect.
+        head += ["", f"OUTSIDE THEIR PERIOD ({len(plan['out_of_period'])}) - NOT filed. "
+                     "The window shown is the one that person is judged against;",
+                 "a monthly contractor's is their cycle, not the fortnight:"]
         for o in plan["out_of_period"][:15]:
             head.append(f"  {o['received']}  {o['contractor']:<22} {o['subject'][:45]}")
+            head.append(f"  {'':<12}{'':<22} {o.get('reason', '')}"
+                        + (f"; states {o['stated']}" if o.get("stated") else ""))
 
     if plan["missing"]:
         head += ["", f"NOT SENT ANYTHING ({len(plan['missing'])}): "
