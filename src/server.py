@@ -1588,6 +1588,152 @@ def find_documents(contact: str, kind: str = "bills", months: int = 12,
     return "\n".join(out)
 
 
+def _last_bill_for(c, needle: str, months: int = 24) -> dict | None:
+    """The most recent BILL for a contact matching NEEDLE, whatever its status.
+
+    This is the whole safety model for create_supplier_bill(). A supplier we
+    have paid before gives us three things we would otherwise be guessing:
+    the ContactID, the account code and the tax type. Andrew's standing rule -
+    base a repair on what the LAST ISSUED document actually used, never a
+    guess - applied to a document we are creating rather than fixing.
+    """
+    today = date.today()
+    start = date(today.year - (months // 12 + 1), today.month, 1).isoformat()
+    n = str(needle or "").strip().lower()
+    if not n:
+        return None
+    hits = [d for d in c.iter_invoices(
+        "ACCPAY", start, today.isoformat(),
+        statuses=["DRAFT", "SUBMITTED", "AUTHORISED", "PAID", "VOIDED"])
+        if n in str((d.get("Contact") or {}).get("Name", "")).lower()]
+    if not hits:
+        return None
+    hits.sort(key=lambda d: mappers.parse_xero_date(d.get("Date")) or date.min)
+    return hits[-1]
+
+
+@mcp.tool()
+def create_supplier_bill(contact: str, number: str, total: float,
+                         date_issued: str = "", due_date: str = "",
+                         description: str = "", dry_run: bool = True) -> str:
+    """Raise a bill for a NON-CONTRACTOR supplier straight into Awaiting Approval.
+
+    WHY THIS EXISTS. The sweep only ever knew contractors, so SEEK, Equifax and
+    the MYOB bills landed in UNMATCHED every fortnight and no bill was ever
+    raised for them. SEEK invoice 702078071 - $1,173.15, due 14 September 2026 -
+    sat in the payroll mailbox from 31 August and was in Xero nowhere at all.
+    Nobody was late; it simply was not there.
+
+    THE SAFETY MODEL IS THE SUPPLIER'S OWN HISTORY, NOT A PATTERN. Andrew,
+    5 September 2026: SEEK "isn't regular, it's just been regular recently" -
+    its bills run from $56 to $3,795 - so nothing here checks the amount against
+    what came before, and there is no sanity band to lean on. What IS stable is
+    the CODING: every SEEK bill is account 400 / INPUT, every Equifax bill is
+    470 / INPUT. So the account code and tax type are COPIED FROM THE MOST
+    RECENT BILL for that contact, and the amount is read from the email. A
+    supplier with no prior bill is refused outright - an unknown payee is not
+    something to code by guesswork.
+
+    STATUS IS SUBMITTED - AWAITING APPROVAL, NOT DRAFT. Andrew's call: "that's
+    where I check it in Xero." Drafts is the to-do list of things that did not
+    come through; Awaiting Approval is the queue he actually reads. Landing
+    there means the bill is one click from being paid, which is exactly why the
+    duplicate check below is not tidiness.
+
+    A DUPLICATE NUMBER IS REFUSED. The same invoice number already on that
+    contact, in any status, stops the write. Paying a supplier twice is the
+    failure this prevents, and it is one approval away.
+
+    A STATEMENT IS NOT AN INVOICE. SEEK sends both. The statement summarises
+    invoices already raised, so a bill made from one double-counts every line
+    on it. Only ever pass an invoice number and an invoice total.
+
+    DATE_ISSUED and DUE_DATE are YYYY-MM-DD; both default sensibly if blank.
+    TOTAL is the amount as it appears on the invoice, GST inclusive or not
+    exactly as the prior bills were keyed - the tax type carried over decides
+    how Xero reads it.
+    """
+    c = client()
+    num = str(number or "").strip()
+    if not num:
+        return ("A bill needs the supplier's own invoice number. It is the only "
+                "thing that makes a duplicate visible later.")
+    try:
+        amount = round(float(total), 2)
+    except (TypeError, ValueError):
+        return f"total must be a number, not {total!r}."
+    if amount <= 0:
+        return "total must be greater than zero."
+
+    prior = _last_bill_for(c, contact)
+    if not prior:
+        return (f"No bill has ever been raised for a contact matching "
+                f"{contact!r}. This tool only creates for a supplier already on "
+                f"file, because the account code and tax type are copied from "
+                f"their last bill rather than guessed. Set the first one up by "
+                f"hand in Xero, and this will handle every one after it.")
+
+    pc = prior.get("Contact") or {}
+    contact_id, contact_name = pc.get("ContactID"), pc.get("Name", "")
+    lines = prior.get("LineItems") or []
+    account = str((lines[0] if lines else {}).get("AccountCode") or "").strip()
+    tax = str((lines[0] if lines else {}).get("TaxType") or "").strip()
+    prior_desc = str((lines[0] if lines else {}).get("Description") or "").strip()
+    if not account:
+        return (f"The last bill for {contact_name} carries no account code, so "
+                f"there is nothing to copy. Code this one by hand and the next "
+                f"will follow it.")
+
+    seen = {str(d.get("InvoiceNumber") or "").strip().lower()
+            for d in c.iter_invoices(
+                "ACCPAY", (date.today() - timedelta(days=900)).isoformat(),
+                date.today().isoformat(),
+                statuses=["DRAFT", "SUBMITTED", "AUTHORISED", "PAID", "VOIDED"])
+            if str((d.get("Contact") or {}).get("Name", "")).lower()
+            == str(contact_name).lower()}
+    if num.lower() in seen:
+        return (f"REFUSED - {contact_name} already has a bill numbered {num}. "
+                f"Nothing was written. If this really is a second invoice that "
+                f"reuses a number, raise it by hand so the decision is a "
+                f"person's.")
+
+    issued = str(date_issued or "").strip() or date.today().isoformat()
+    due = str(due_date or "").strip() or (
+        date.fromisoformat(issued) + timedelta(days=14)).isoformat()
+    desc = str(description or "").strip() or prior_desc or contact_name
+
+    plan = [
+        f"Supplier bill for {contact_name}",
+        "",
+        pd.DataFrame([{
+            "Number": num, "Date": issued, "Due": due, "Total": amount,
+            "Account": account, "Tax": tax, "Description": desc[:50],
+            "Status": "SUBMITTED (Awaiting Approval)",
+        }]).to_markdown(index=False),
+        "",
+        f"Coding copied from their last bill, {prior.get('InvoiceNumber') or '(no number)'} "
+        f"dated {mappers.parse_xero_date(prior.get('Date'))}.",
+    ]
+    if dry_run:
+        plan.append("")
+        plan.append("DRY RUN - nothing written. Re-run with dry_run=False.")
+        return "\n".join(plan)
+
+    res = writes.create_draft_invoice(
+        c, contact_id,
+        [{"Description": desc, "Quantity": 1, "UnitAmount": amount,
+          "AccountCode": account, "TaxType": tax}],
+        issued, due, reference="", invoice_type="ACCPAY",
+        status="SUBMITTED", number=num,
+    )
+    made = (res.get("Invoices") or [{}])[0]
+    plan.append("")
+    plan.append(f"WRITTEN. {contact_name} {num}, ${amount:,.2f}, Awaiting "
+                f"Approval. InvoiceID {made.get('InvoiceID', '')}")
+    plan.append("Approving and paying it is yours - nothing here does that.")
+    return "\n".join(plan)
+
+
 @mcp.tool()
 def list_period_drafts(period_end: str, window_days: int = 10) -> str:
     """Every DRAFT invoice and bill dated around a fortnight end, line by line.

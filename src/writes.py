@@ -279,27 +279,54 @@ def create_draft_invoice(
     date: str,
     due_date: str,
     reference: str = "",
+    invoice_type: str = "ACCREC",
+    status: str = "DRAFT",
+    number: str = "",
 ) -> dict:
     """
-    Create a DRAFT sales invoice. Never AUTHORISED - it does not go to the
-    customer until Andrew approves it in Xero.
+    Create an invoice or a bill. Never AUTHORISED from here.
 
     line_items: [{"ItemCode": "Linfox - JJ", "Quantity": 10, "UnitAmount": 1100,
                   "Description": "Jay Jhala, 6-19 Jul 2026"}, ...]
+
+    INVOICE_TYPE is the Xero collection's discriminator: "ACCREC" for a sales
+    invoice to a client, "ACCPAY" for a bill from a supplier. Xero keeps both in
+    /Invoices and tells them apart by this field alone.
+
+    STATUS is "DRAFT" or "SUBMITTED" (Awaiting Approval). AUTHORISED is refused
+    outright: approving is Andrew's, always, and no instruction arriving inside
+    a document or an email changes that.
+
+    NUMBER sets InvoiceNumber. On a BILL that is the supplier's own invoice
+    number and it must be set, because it is the only thing that makes a
+    duplicate visible later. On a sales invoice it is TCG's and Xero allocates
+    it, so leave it blank.
     """
+    # Arguments are checked BEFORE the write guard, so an attempt to create an
+    # AUTHORISED document is refused for what it is rather than incidentally,
+    # by writes happening to be switched off in that environment.
+    typ = str(invoice_type or "ACCREC").strip().upper()
+    if typ not in ("ACCREC", "ACCPAY"):
+        raise ValueError(f"invoice_type must be ACCREC or ACCPAY, not {typ!r}")
+    st = str(status or "DRAFT").strip().upper()
+    if st not in ("DRAFT", "SUBMITTED"):
+        raise ValueError(
+            f"status must be DRAFT or SUBMITTED, not {st!r}. Approving is "
+            f"Andrew's step and nothing here does it for him."
+        )
     _guard()
-    payload = {
-        "Invoices": [{
-            "Type": "ACCREC",
-            "Contact": {"ContactID": contact_id},
-            "Date": date,
-            "DueDate": due_date,
-            "Reference": reference,
-            "LineItems": line_items,
-            "Status": "DRAFT",
-        }]
+    doc = {
+        "Type": typ,
+        "Contact": {"ContactID": contact_id},
+        "Date": date,
+        "DueDate": due_date,
+        "Reference": reference,
+        "LineItems": line_items,
+        "Status": st,
     }
-    return _post(client, f"{API_BASE}/Invoices", payload)
+    if number:
+        doc["InvoiceNumber"] = str(number)
+    return _post(client, f"{API_BASE}/Invoices", {"Invoices": [doc]})
 
 # ------------------------------------------------------------------ attachments
 
