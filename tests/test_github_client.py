@@ -301,3 +301,103 @@ def test_error_body_is_surfaced(gh):
     }
     with pytest.raises(RuntimeError, match="Validation failed"):
         gh.read_file("Xero-custom-connector", "x.py")
+
+
+# ---- targeted replace ----------------------------------------------------
+#
+# commit_files replaces a path outright. For a 156KB module that means
+# reproducing 156KB to change one line, which is how a one-line auth fix ended
+# up being typed into the GitHub web editor by hand on 05/09/2026.
+
+
+FILE_TEXT = (
+    "line one\n"
+    "    if KEY and key != KEY:\n"
+    "        raise HTTPException(401)\n"
+    "line four\n"
+    "line one\n"
+)
+
+
+def _replace_stubs(text=FILE_TEXT, branch_exists=False):
+    stubs = _commit_stubs()
+    stubs["/git/commits"] = FakeResponse({"sha": "commit444", "tree": {"sha": "tree333"}})
+    stubs["/contents/"] = FakeResponse(
+        {"sha": "filesha", "size": len(text),
+         "content": base64.b64encode(text.encode()).decode()}
+    )
+    if not branch_exists:
+        # head_sha on a branch that does not exist yet -> 404 from GitHub
+        def commits(url_seen=[]):
+            url_seen.append(1)
+            if len(url_seen) == 1:
+                return FakeResponse({}, status_code=404)
+            return FakeResponse({"sha": "base111", "tree": {"sha": "tree000"}})
+        stubs["/commits/"] = commits
+    return stubs
+
+
+def test_replace_refuses_main(gh):
+    with pytest.raises(BranchProtected):
+        gh.replace_in_file("Xero-custom-connector", "main", "a.py", "x", "y", "m")
+    assert gh._session.calls == []
+
+
+def test_replace_changes_only_the_matched_passage(gh):
+    gh._session.responses = _replace_stubs()
+    gh.replace_in_file(
+        "Xero-custom-connector", "fix/auth", "api/index.py",
+        "    if KEY and key != KEY:", "    if not KEY or not compare_digest(key, KEY):",
+        "fail closed",
+    )
+    blobs = [c for c in gh._session.calls if c[1].endswith("/git/blobs")]
+    assert len(blobs) == 1
+    sent = blobs[0][2]["content"]
+    assert "if not KEY or not compare_digest(key, KEY):" in sent
+    assert "if KEY and key != KEY:" not in sent
+    assert sent.startswith("line one\n"), "the rest of the file must survive untouched"
+    assert sent.endswith("line four\nline one\n")
+
+
+def test_replace_refuses_when_not_found(gh):
+    gh._session.responses = _replace_stubs()
+    with pytest.raises(RuntimeError, match="not found"):
+        gh.replace_in_file(
+            "Xero-custom-connector", "fix/x", "api/index.py", "nowhere", "y", "m"
+        )
+
+
+def test_replace_refuses_an_ambiguous_match(gh):
+    """Two matches is a refusal. Picking one silently is worse than no tool."""
+    gh._session.responses = _replace_stubs()
+    with pytest.raises(RuntimeError, match="appears 2 times"):
+        gh.replace_in_file(
+            "Xero-custom-connector", "fix/x", "api/index.py", "line one", "y", "m"
+        )
+
+
+def test_replace_writes_nothing_on_an_ambiguous_match(gh):
+    gh._session.responses = _replace_stubs()
+    with pytest.raises(RuntimeError):
+        gh.replace_in_file(
+            "Xero-custom-connector", "fix/x", "api/index.py", "line one", "y", "m"
+        )
+    assert not [c for c in gh._session.calls if c[0] in ("POST", "PATCH")], (
+        "a refused replace still wrote to the repo"
+    )
+
+
+@pytest.mark.parametrize("old,new", [("", "y"), ("same", "same")])
+def test_replace_rejects_pointless_arguments(gh, old, new):
+    with pytest.raises(RuntimeError):
+        gh.replace_in_file("Xero-custom-connector", "fix/x", "a.py", old, new, "m")
+
+
+def test_replace_stacks_on_an_existing_branch(gh):
+    """Second edit must build on the branch, not reset it back to base."""
+    gh._session.responses = _replace_stubs(branch_exists=True)
+    result = gh.replace_in_file(
+        "Xero-custom-connector", "fix/auth", "api/index.py",
+        "line four", "line 4", "second edit",
+    )
+    assert result["built_on"] == "fix/auth"
