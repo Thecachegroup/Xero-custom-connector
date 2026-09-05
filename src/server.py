@@ -2663,7 +2663,7 @@ def onedrive_list(path: str = "", root: str = "", recursive: bool = False) -> st
     """
     g = _graph()
     try:
-        items = g.list_files(path, root=root, recursive=recursive)
+        items = g.list_children(path, root=root, recursive=recursive)
     except Exception as e:  # noqa: BLE001
         return f"Could not list {path or '(root)'}: {e}"
 

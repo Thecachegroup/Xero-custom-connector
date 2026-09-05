@@ -1,0 +1,166 @@
+diff --git a/src/graph_client.py b/src/graph_client.py
+index a21b886..9203d10 100644
+--- a/src/graph_client.py
++++ b/src/graph_client.py
+@@ -337,6 +337,42 @@ class GraphClient:
+ 
+         return walk(relative_path, "")
+ 
++    def list_children(self, path: str = "", root: str = "",
++                      recursive: bool = False) -> list[dict]:
++        """One folder's immediate children - folders AND files.
++
++        list_files() is timesheet-shaped: it drops folders entirely and defaults
++        to the Contractors/Timesheets tree, so CONTRACTOR AGREEMENTS listed as
++        empty when every contractor in it is a folder. This is the plain
++        listing, rooted at the drive.
++
++        "" is the drive root, which needs the /root/children form. Building it
++        the other way gives "root:/:/children", which Graph answers with a 400.
++        """
++        full = f"{root}/{path}".strip("/") if root else path.strip("/")
++        drive = self._drive_id()
++
++        def children_url(rel: str) -> str:
++            if not rel:
++                return f"{GRAPH}/drives/{drive}/root/children"
++            return f"{GRAPH}/drives/{drive}/root:/{quote(rel)}:/children"
++
++        def walk(rel: str) -> list[dict]:
++            out: list[dict] = []
++            for it in self.get_all(children_url(rel), {"$top": "200"}):
++                child = f"{rel}/{it['name']}".strip("/")
++                # Paths relative to the folder that was asked for, matching
++                # list_files - the caller asked about a folder, not the drive.
++                it["path"] = child[len(full):].strip("/") if full else child
++                out.append(it)
++                # Presence, not truthiness. {"childCount": 0} is falsy and an
++                # empty contractor folder is normal.
++                if recursive and "folder" in it:
++                    out += walk(child)
++            return out
++
++        return walk(full)
++
+     def download(self, relative_path: str, root: str = "Contractors/Timesheets") -> bytes:
+         """Read a filed document back out of OneDrive."""
+         path = f"{root}/{relative_path}".strip("/")
+@@ -390,15 +426,29 @@ class GraphClient:
+         here would file signed agreements in the wrong place forever.
+         """
+         path = f"{root}/{relative_path}".strip("/") if root else relative_path.strip("/")
+-        url = f"{GRAPH}/drives/{self._drive_id()}/root:/{quote(path)}"
+-        item = self.get(url, {"$select": "id,name,size,lastModifiedDateTime,"
+-                                         "@microsoft.graph.downloadUrl"})
+-        link = item.get("@microsoft.graph.downloadUrl")
+-        if not link:
++        base = f"{GRAPH}/drives/{self._drive_id()}/root:/{quote(path)}"
++        item = self.get(base, {"$select": "id,name,size,lastModifiedDateTime,folder"})
++
++        # Presence, not truthiness - Graph sends {"childCount": 0} for an empty
++        # folder, which is falsy.
++        if "folder" in item:
+             raise RuntimeError(
+-                f"No download URL for {path!r} - a folder rather than a file? "
++                f"No download URL for {path!r} - that is a folder, not a file. "
+                 "Nothing has been read."
+             )
++
++        # Graph DROPS @microsoft.graph.downloadUrl from any response that carries
++        # a $select - including a $select that names it. Asking for the annotation
++        # is what removes it, so every file came back 200 with no link. Take the
++        # URL off the /content redirect instead: it arrives as the Location header
++        # on a 302, and no $select can strip a header.
++        resp = self._request("GET", f"{base}:/content", allow_redirects=False)
++        link = resp.headers.get("Location")
++        if not link:
++            raise RuntimeError(
++                f"No download URL for {path!r} - Graph answered {resp.status_code} "
++                "with no Location header. Nothing has been read."
++            )
+         return {
+             "path": path,
+             "name": item.get("name"),
+diff --git a/src/graph_files.py b/src/graph_files.py
+index c63a33e..287f73b 100644
+--- a/src/graph_files.py
++++ b/src/graph_files.py
+@@ -160,9 +160,9 @@ def _item_url(path: str) -> str:
+ 
+ def download_url(path: str) -> dict:
+     """Pre-authenticated download URL for a OneDrive file. Valid about an hour."""
++    base = _item_url(path)
+     r = requests.get(
+-        _item_url(path)
+-        + "?select=id,name,size,lastModifiedDateTime,@microsoft.graph.downloadUrl",
++        base + "?$select=id,name,size,lastModifiedDateTime,folder",
+         headers=_headers(),
+         timeout=TIMEOUT,
+     )
+@@ -172,10 +172,22 @@ def download_url(path: str) -> dict:
+         raise RuntimeError(f"Graph {r.status_code} reading '{path}': {r.text[:400]}")
+ 
+     item = r.json()
+-    url = item.get("@microsoft.graph.downloadUrl")
++    if "folder" in item:
++        raise RuntimeError(
++            f"No download URL for '{path}' — that is a folder, not a file."
++        )
++
++    # Graph drops @microsoft.graph.downloadUrl from any response carrying a
++    # $select, including one that names it. Read the /content redirect instead:
++    # the link arrives as the Location header on a 302 and cannot be selected
++    # away. Same bug as GraphClient.download_url carried.
++    c = requests.get(base + ":/content", headers=_headers(),
++                     timeout=TIMEOUT, allow_redirects=False)
++    url = c.headers.get("Location")
+     if not url:
+         raise RuntimeError(
+-            f"No download URL returned for '{path}' — is it a folder rather than a file?"
++            f"No download URL returned for '{path}' — Graph answered "
++            f"{c.status_code} with no Location header."
+         )
+     return {
+         "path": _clean(path),
+diff --git a/src/server.py b/src/server.py
+index 4427f89..58a204f 100644
+--- a/src/server.py
++++ b/src/server.py
+@@ -2663,7 +2663,7 @@ def onedrive_list(path: str = "", root: str = "", recursive: bool = False) -> st
+     """
+     g = _graph()
+     try:
+-        items = g.list_files(path, root=root, recursive=recursive)
++        items = g.list_children(path, root=root, recursive=recursive)
+     except Exception as e:  # noqa: BLE001
+         return f"Could not list {path or '(root)'}: {e}"
+ 
+diff --git a/tests/test_graph_files.py b/tests/test_graph_files.py
+index 7ab24b9..e8467e6 100644
+--- a/tests/test_graph_files.py
++++ b/tests/test_graph_files.py
+@@ -1,5 +1,11 @@
+ """Offline tests for graph_files path handling and guards. No network."""
+-import graph_files as g
++# The module lives at src/graph_files.py. A bare "import graph_files" raised
++# ModuleNotFoundError at COLLECTION time, which aborts the whole pytest run -
++# so from 3 September 2026 the CI ran no tests at all while showing a red cross
++# that read as "tests failed" rather than "tests never started".
++import sys, pathlib
++sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
++from src import graph_files as g
+ 
+ fails = []
+ 
+@@ -62,3 +68,11 @@ finally:
+ 
+ print()
+ print("FAILURES: " + str(len(fails)))
++
++
++def test_no_failures():
++    """This file reports by printing, and pytest never reads stdout.
++
++    Without this, every check above could fail and the run would still be green.
++    """
++    assert not fails, fails

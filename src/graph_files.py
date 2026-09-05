@@ -160,9 +160,9 @@ def _item_url(path: str) -> str:
 
 def download_url(path: str) -> dict:
     """Pre-authenticated download URL for a OneDrive file. Valid about an hour."""
+    base = _item_url(path)
     r = requests.get(
-        _item_url(path)
-        + "?select=id,name,size,lastModifiedDateTime,@microsoft.graph.downloadUrl",
+        base + "?$select=id,name,size,lastModifiedDateTime,folder",
         headers=_headers(),
         timeout=TIMEOUT,
     )
@@ -172,10 +172,22 @@ def download_url(path: str) -> dict:
         raise RuntimeError(f"Graph {r.status_code} reading '{path}': {r.text[:400]}")
 
     item = r.json()
-    url = item.get("@microsoft.graph.downloadUrl")
+    if "folder" in item:
+        raise RuntimeError(
+            f"No download URL for '{path}' — that is a folder, not a file."
+        )
+
+    # Graph drops @microsoft.graph.downloadUrl from any response carrying a
+    # $select, including one that names it. Read the /content redirect instead:
+    # the link arrives as the Location header on a 302 and cannot be selected
+    # away. Same bug as GraphClient.download_url carried.
+    c = requests.get(base + ":/content", headers=_headers(),
+                     timeout=TIMEOUT, allow_redirects=False)
+    url = c.headers.get("Location")
     if not url:
         raise RuntimeError(
-            f"No download URL returned for '{path}' — is it a folder rather than a file?"
+            f"No download URL returned for '{path}' — Graph answered "
+            f"{c.status_code} with no Location header."
         )
     return {
         "path": _clean(path),

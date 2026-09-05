@@ -337,6 +337,42 @@ class GraphClient:
 
         return walk(relative_path, "")
 
+    def list_children(self, path: str = "", root: str = "",
+                      recursive: bool = False) -> list[dict]:
+        """One folder's immediate children - folders AND files.
+
+        list_files() is timesheet-shaped: it drops folders entirely and defaults
+        to the Contractors/Timesheets tree, so CONTRACTOR AGREEMENTS listed as
+        empty when every contractor in it is a folder. This is the plain
+        listing, rooted at the drive.
+
+        "" is the drive root, which needs the /root/children form. Building it
+        the other way gives "root:/:/children", which Graph answers with a 400.
+        """
+        full = f"{root}/{path}".strip("/") if root else path.strip("/")
+        drive = self._drive_id()
+
+        def children_url(rel: str) -> str:
+            if not rel:
+                return f"{GRAPH}/drives/{drive}/root/children"
+            return f"{GRAPH}/drives/{drive}/root:/{quote(rel)}:/children"
+
+        def walk(rel: str) -> list[dict]:
+            out: list[dict] = []
+            for it in self.get_all(children_url(rel), {"$top": "200"}):
+                child = f"{rel}/{it['name']}".strip("/")
+                # Paths relative to the folder that was asked for, matching
+                # list_files - the caller asked about a folder, not the drive.
+                it["path"] = child[len(full):].strip("/") if full else child
+                out.append(it)
+                # Presence, not truthiness. {"childCount": 0} is falsy and an
+                # empty contractor folder is normal.
+                if recursive and "folder" in it:
+                    out += walk(child)
+            return out
+
+        return walk(full)
+
     def download(self, relative_path: str, root: str = "Contractors/Timesheets") -> bytes:
         """Read a filed document back out of OneDrive."""
         path = f"{root}/{relative_path}".strip("/")
@@ -390,14 +426,28 @@ class GraphClient:
         here would file signed agreements in the wrong place forever.
         """
         path = f"{root}/{relative_path}".strip("/") if root else relative_path.strip("/")
-        url = f"{GRAPH}/drives/{self._drive_id()}/root:/{quote(path)}"
-        item = self.get(url, {"$select": "id,name,size,lastModifiedDateTime,"
-                                         "@microsoft.graph.downloadUrl"})
-        link = item.get("@microsoft.graph.downloadUrl")
+        base = f"{GRAPH}/drives/{self._drive_id()}/root:/{quote(path)}"
+        item = self.get(base, {"$select": "id,name,size,lastModifiedDateTime,folder"})
+
+        # Presence, not truthiness - Graph sends {"childCount": 0} for an empty
+        # folder, which is falsy.
+        if "folder" in item:
+            raise RuntimeError(
+                f"No download URL for {path!r} - that is a folder, not a file. "
+                "Nothing has been read."
+            )
+
+        # Graph DROPS @microsoft.graph.downloadUrl from any response that carries
+        # a $select - including a $select that names it. Asking for the annotation
+        # is what removes it, so every file came back 200 with no link. Take the
+        # URL off the /content redirect instead: it arrives as the Location header
+        # on a 302, and no $select can strip a header.
+        resp = self._request("GET", f"{base}:/content", allow_redirects=False)
+        link = resp.headers.get("Location")
         if not link:
             raise RuntimeError(
-                f"No download URL for {path!r} - a folder rather than a file? "
-                "Nothing has been read."
+                f"No download URL for {path!r} - Graph answered {resp.status_code} "
+                "with no Location header. Nothing has been read."
             )
         return {
             "path": path,

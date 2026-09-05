@@ -1,0 +1,24 @@
+XERO CONNECTOR - ONEDRIVE FIX
+Built and verified 5 September 2026. 242 tests pass, compileall clean.
+Cut against HEAD 0989b21.
+
+FOUR FILES CHANGED
+  src/graph_client.py        download_url via /content redirect; new list_children()
+  src/server.py              onedrive_list now calls list_children
+  src/graph_files.py         same $select bug fixed in the orphan implementation
+  tests/test_graph_files.py  import fixed; test_no_failures() added
+
+TO UPLOAD
+1. github.com/Thecachegroup/Xero-custom-connector
+   Confirm HEAD is still 0989b21. If it is not, STOP - this replaces whole files.
+2. Add file -> Upload files. Stay at the REPO ROOT, not inside src.
+3. Drag the "src" and "tests" folders in TOGETHER. GitHub keeps the structure,
+   so all four files land in the right place in one commit.
+4. Commit message:
+   Fix OneDrive download URL (/content redirect) and folder listing
+   Commit directly to main.
+5. Vercel redeploys itself. Wait for Ready + Production.
+6. Actions tab: the run should go green. First green run that has ever meant
+   anything - before this, pytest collected zero tests.
+
+DO NOT add writes.py or anything else to this commit.

@@ -1,5 +1,11 @@
 """Offline tests for graph_files path handling and guards. No network."""
-import graph_files as g
+# The module lives at src/graph_files.py. A bare "import graph_files" raised
+# ModuleNotFoundError at COLLECTION time, which aborts the whole pytest run -
+# so from 3 September 2026 the CI ran no tests at all while showing a red cross
+# that read as "tests failed" rather than "tests never started".
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from src import graph_files as g
 
 fails = []
 
@@ -62,3 +68,11 @@ finally:
 
 print()
 print("FAILURES: " + str(len(fails)))
+
+
+def test_no_failures():
+    """This file reports by printing, and pytest never reads stdout.
+
+    Without this, every check above could fail and the run would still be green.
+    """
+    assert not fails, fails
